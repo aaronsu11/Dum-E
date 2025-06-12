@@ -1,11 +1,10 @@
 import argparse
 import asyncio
 import os
-import httpx
 
+import httpx
 from dotenv import load_dotenv
 from loguru import logger
-
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -14,8 +13,8 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
@@ -149,9 +148,7 @@ async def run_robot_agent(params: FunctionCallParams):
 
             # Camera warmup and robot connection is handled internally by the agent
             # Use async iterator for streaming events
-            async for event in so100_agent.stream_async(
-                params.arguments["instruction"]
-            ):
+            async for event in so100_agent.astream(params.arguments["instruction"]):
                 # Handle different event types for better TTS experience
                 if (
                     "message" in event
@@ -224,7 +221,7 @@ async def run_robot_agent(params: FunctionCallParams):
                 TTSSpeakFrame(f"An error occurred during the robot task: {str(e)}")
             )
 
-    print("Robot agent initiated - running in background")
+    logger.info("Robot agent initiated - running in background")
     task = asyncio.create_task(run_with_timeout())
     _background_tasks.add(task)
     task.add_done_callback(lambda t: _background_tasks.discard(t))
@@ -255,7 +252,7 @@ transport_params = {
 }
 
 
-async def run_assistant(
+async def run_dum_e(
     transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool
 ):
     logger.info(f"Starting bot")
@@ -361,4 +358,4 @@ async def run_assistant(
 if __name__ == "__main__":
     from pipecat.examples.run import main
 
-    main(run_assistant, transport_params=transport_params)
+    main(run_dum_e, transport_params=transport_params)

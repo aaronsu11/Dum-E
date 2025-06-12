@@ -13,10 +13,10 @@ modules to depend on abstractions rather than concrete implementations.
 """
 
 from abc import ABC, abstractmethod
-from enum import Enum
-from typing import Any, AsyncIterator, Dict, List, Optional, Callable, Union
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 
 class TaskStatus(Enum):
@@ -98,7 +98,9 @@ class IRobotAgent(ABC):
     """
 
     @abstractmethod
-    async def execute_instruction(self, instruction: str, task_id: Optional[str] = None) -> Dict[str, Any]:
+    async def execute_instruction(
+        self, instruction: str, task_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Execute a natural language instruction synchronously.
 
@@ -112,7 +114,9 @@ class IRobotAgent(ABC):
         pass
 
     @abstractmethod
-    async def stream_async(self, instruction: str, task_id: Optional[str] = None) -> AsyncIterator[Dict[str, Any]]:
+    async def astream(
+        self, instruction: str, task_id: Optional[str] = None
+    ) -> AsyncIterator[Dict[str, Any]]:
         """
         Execute instruction with streaming progress updates.
 
@@ -172,7 +176,10 @@ class IToolRegistry(ABC):
 
     @abstractmethod
     async def execute_tool(
-        self, name: str, parameters: Dict[str, Any], context: Optional[Dict[str, Any]] = None
+        self,
+        name: str,
+        parameters: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Execute a tool with given parameters and optional context."""
         pass
@@ -187,7 +194,9 @@ class ITaskManager(ABC):
     """
 
     @abstractmethod
-    async def create_task(self, instruction: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+    async def create_task(
+        self, instruction: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
         """Create a new task and return its unique identifier."""
         pass
 
@@ -197,17 +206,23 @@ class ITaskManager(ABC):
         pass
 
     @abstractmethod
-    async def update_task_status(self, task_id: str, status: TaskStatus, error_message: Optional[str] = None) -> None:
+    async def update_task_status(
+        self, task_id: str, status: TaskStatus, error_message: Optional[str] = None
+    ) -> None:
         """Update the status of a task."""
         pass
 
     @abstractmethod
-    async def update_task_progress(self, task_id: str, progress: float, status_message: Optional[str] = None) -> None:
+    async def update_task_progress(
+        self, task_id: str, progress: float, status_message: Optional[str] = None
+    ) -> None:
         """Update task progress (0.0 to 1.0) with optional status message."""
         pass
 
     @abstractmethod
-    async def list_tasks(self, status: Optional[TaskStatus] = None, limit: Optional[int] = None) -> List[TaskInfo]:
+    async def list_tasks(
+        self, status: Optional[TaskStatus] = None, limit: Optional[int] = None
+    ) -> List[TaskInfo]:
         """List tasks, optionally filtered by status."""
         pass
 
@@ -233,7 +248,9 @@ class IEventPublisher(ABC):
 
     @abstractmethod
     async def subscribe(
-        self, event_types: Optional[List[EventType]] = None, task_id: Optional[str] = None
+        self,
+        event_types: Optional[List[EventType]] = None,
+        task_id: Optional[str] = None,
     ) -> AsyncIterator[Event]:
         """
         Subscribe to events with optional filtering.
@@ -248,7 +265,9 @@ class IEventPublisher(ABC):
         pass
 
     @abstractmethod
-    async def get_event_history(self, task_id: Optional[str] = None, limit: Optional[int] = 100) -> List[Event]:
+    async def get_event_history(
+        self, task_id: Optional[str] = None, limit: Optional[int] = 100
+    ) -> List[Event]:
         """Get historical events, optionally filtered by task ID."""
         pass
 

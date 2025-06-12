@@ -12,12 +12,12 @@ utilities for both direct hardware control and remote inference-based control.
 
 This module can be run directly to test/evaluate a policy:
 
-Example usage:
+Example usage (from the root directory):
     # Test with policy inference
-    python so100_client.py --use_policy --lang_instruction "Pick up the blue cube"
+    python -m embodiment.so_arm10x.client --use_policy --host 0.0.0.0  --port 5555 --arm_cam_idx 2 --top_cam_idx 0 --lang_instruction "Pick up the lego block."
 
     # Test with dataset playback
-    python so100_client.py --dataset_path ~/datasets/so100_pick
+    python -m embodiment.so_arm10x.client --dataset_path ~/datasets/so100_pick
 
 Command line arguments:
     --use_policy: Enable policy-based control (default: False, uses dataset playback)
@@ -39,6 +39,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from tqdm import tqdm
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.robot_devices.cameras.configs import OpenCVCameraConfig
 from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
@@ -55,9 +56,6 @@ from lerobot.common.robot_devices.utils import (
 # to their code or do the following line below
 # sys.path.append(os.path.expanduser("~/Isaac-GR00T/gr00t/eval/"))
 from policy.gr00t.service import ExternalRobotInferenceClient
-
-# Import tqdm for progress bar
-from tqdm import tqdm
 
 #################################################################################
 
@@ -249,7 +247,9 @@ class SO100Robot:
         return np.array(interp_actions)
 
     @classmethod
-    def interpolate_actions_with_prev_state(cls, prev_state, action):
+    def interpolate_actions_with_prev_state(
+        cls, prev_state, action, num_interp: int = 3
+    ):
         """
         Interpolates between the previous state and the predicted actions to ensure smooth transitions.
 
@@ -277,9 +277,11 @@ class SO100Robot:
         # Interpolate between predicted actions to smooth out the actions
         if len(single_arm_pred) > 1:
             single_arm_interp_rest = cls.interpolate_actions(
-                single_arm_pred, num_interp=3
+                single_arm_pred, num_interp=num_interp
             )
-            gripper_interp_rest = cls.interpolate_actions(gripper_pred, num_interp=3)
+            gripper_interp_rest = cls.interpolate_actions(
+                gripper_pred, num_interp=num_interp
+            )
             # Concatenate, skipping the first point of the rest to avoid duplicate
             single_arm_interp = np.concatenate(
                 [single_arm_interp_first, single_arm_interp_rest[1:]], axis=0
@@ -467,7 +469,7 @@ if __name__ == "__main__":
 
                 # Interpolate actions for smooth transition
                 single_arm_interp, gripper_interp = (
-                    robot.interpolate_actions_with_prev_state(prev_state, action)
+                    robot.interpolate_actions_with_prev_state(prev_state, action, 1)
                 )
 
                 start_time = time.time()

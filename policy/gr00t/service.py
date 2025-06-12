@@ -70,7 +70,9 @@ class BaseInferenceServer:
         """
         return {"status": "ok", "message": "Server is running"}
 
-    def register_endpoint(self, name: str, handler: Callable, requires_input: bool = True):
+    def register_endpoint(
+        self, name: str, handler: Callable, requires_input: bool = True
+    ):
         """
         Register a new endpoint to the server.
 
@@ -109,7 +111,9 @@ class BaseInferenceServer:
 
 
 class BaseInferenceClient:
-    def __init__(self, host: str = "localhost", port: int = 5555, timeout_ms: int = 15000):
+    def __init__(
+        self, host: str = "localhost", port: int = 5555, timeout_ms: int = 15000
+    ):
         self.context = zmq.Context()
         self.host = host
         self.port = port

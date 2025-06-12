@@ -1,7 +1,7 @@
 """
 Refactored robot agent implementing the IRobotAgent interface.
 
-This module provides an enhanced robot agent that implements the abstract
+This module provides an SO10x robot agent that implements the abstract
 interfaces while maintaining compatibility with the existing voice assistant
 streaming pattern. Key improvements include:
 - Implements IRobotAgent interface for modularity
@@ -9,50 +9,47 @@ streaming pattern. Key improvements include:
 - Enhanced error handling and recovery
 - Task lifecycle management
 - Tool registry integration
+
+Example usage (from the root directory):
+    python -m embodiment.so_arm10x.agent
 """
 
 import asyncio
-from datetime import datetime
 import os
 import time
-from typing import Callable, Dict, Any, List, Optional, AsyncIterator, Literal
-
-from strands import Agent, tool
-from strands.models.anthropic import AnthropicModel
-
-from .client import Gr00tRobotInferenceClient, SO100Robot
-from ..interfaces import (
-    IRobotAgent,
-    ITaskManager,
-    IEventPublisher,
-    IToolRegistry,
-    IHardwareInterface,
-    TaskStatus,
-    EventType,
-    Event,
-    ToolDefinition,
-)
-from .interface import (
-    InMemoryTaskManager,
-    InMemoryEventPublisher,
-    InMemoryToolRegistry,
-    SO100HardwareInterface,
-)
-from ...logging_config import create_clean_callback_handler, setup_robot_logging
-from loguru import logger
+from datetime import datetime
+from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional
 
 import cv2
 import numpy as np
 import torch
+from loguru import logger
+from strands import Agent, tool
+from strands.models.anthropic import AnthropicModel
 from tqdm import tqdm
 
+from embodiment.so_arm10x import (
+    InMemoryEventPublisher,
+    InMemoryTaskManager,
+    InMemoryToolRegistry,
+    SO10xHardwareInterface,
+)
+from embodiment.so_arm10x.client import Gr00tRobotInferenceClient, SO100Robot
+from interfaces import (
+    Event,
+    EventType,
+    IEventPublisher,
+    IHardwareInterface,
+    IRobotAgent,
+    ITaskManager,
+    IToolRegistry,
+    TaskStatus,
+    ToolDefinition,
+)
+from logging_config import create_clean_callback_handler, setup_robot_logging
+
 # Model configuration
-MODEL_ID = "claude-sonnet-4-20250514"
-
-# Setup clean logging only when running directly (not when imported)
-# setup_robot_logging will check if loguru is already configured (by pipecat)
-
-# Removed global instances - using pure dependency injection
+DEFAULT_MODEL_ID = "claude-sonnet-4-20250514"
 
 
 def image_to_jpeg_bytes(
@@ -70,7 +67,7 @@ def image_to_jpeg_bytes(
         raise ValueError("Could not encode image to JPEG")
     if save:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        folder = "so_arm10x/sample_images"
+        folder = "./sample_images"
         if not os.path.exists(folder):
             os.makedirs(folder)
         image_path = f"{folder}/image_{timestamp}.jpg"
@@ -201,9 +198,9 @@ def create_robot_tools(
     return [reset_pose, assess_situation, start_pick, resume_pick, place]
 
 
-class EnhancedRobotAgent(IRobotAgent):
+class SO10xRobotAgent(IRobotAgent):
     """
-    Enhanced robot agent implementing the IRobotAgent interface.
+    SO10x robot agent implementing the IRobotAgent interface.
 
     Maintains compatibility with existing voice assistant integration while
     adding enhanced features for task management, event streaming, and
@@ -214,7 +211,7 @@ class EnhancedRobotAgent(IRobotAgent):
         self,
         robot_instance: SO100Robot,
         gr00t_client_instance: Optional[Gr00tRobotInferenceClient] = None,
-        model_id: str = MODEL_ID,
+        model_id: str = DEFAULT_MODEL_ID,
         region_name: str = "us-west-2",
         callback_handler: Callable = None,
         task_manager: Optional[ITaskManager] = None,
@@ -223,7 +220,7 @@ class EnhancedRobotAgent(IRobotAgent):
         hardware_interface: Optional[IHardwareInterface] = None,
     ):
         """
-        Initialize the enhanced robot agent with explicit dependency injection.
+        Initialize the SO10x robot agent with explicit dependency injection.
 
         Args:
             robot_instance: Required SO100Robot instance for hardware control
@@ -246,7 +243,7 @@ class EnhancedRobotAgent(IRobotAgent):
         self.task_manager = task_manager or InMemoryTaskManager()
         self.event_publisher = event_publisher or InMemoryEventPublisher()
         self.tool_registry = tool_registry or InMemoryToolRegistry()
-        self.hardware_interface = hardware_interface or SO100HardwareInterface(
+        self.hardware_interface = hardware_interface or SO10xHardwareInterface(
             self._robot_instance
         )
 
@@ -322,8 +319,8 @@ class EnhancedRobotAgent(IRobotAgent):
             callback_handler=self.callback_handler,
             trace_attributes={
                 "session.id": time.strftime("%Y-%m-%d"),
-                "user.id": "SO-ARM100-Enhanced",
-                "langfuse.tags": ["GR00T-N1-2B", "Enhanced-Agent"],
+                "user.id": "SO-ARM100",
+                "langfuse.tags": ["GR00T-N1-2B"],
             },
         )
 
@@ -347,10 +344,10 @@ class EnhancedRobotAgent(IRobotAgent):
 
             # Execute with robot hardware context
             with self._robot_instance.activate():
-                # Warm up cameras
-                for _ in range(10):
+                # Warm up cameras for 1 second
+                for _ in range(5):
                     self._robot_instance.get_current_images()
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.2)
 
                 result = agent(instruction)
 
@@ -379,7 +376,7 @@ class EnhancedRobotAgent(IRobotAgent):
                 "timestamp": datetime.now().isoformat(),
             }
 
-    async def stream_async(
+    async def astream(
         self, instruction: str, task_id: Optional[str] = None
     ) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -427,7 +424,7 @@ class EnhancedRobotAgent(IRobotAgent):
                 # This maintains compatibility with existing voice assistant
                 async for event in agent.stream_async(instruction):
                     # Enhance event with task information
-                    enhanced_event = {"task_id": task_id, **event}
+                    enriched_event = {"task_id": task_id, **event}
 
                     # Publish streaming event
                     await self.event_publisher.publish_event(
@@ -435,11 +432,11 @@ class EnhancedRobotAgent(IRobotAgent):
                             event_type=EventType.STREAMING_DATA,
                             task_id=task_id,
                             timestamp=datetime.now(),
-                            data=enhanced_event,
+                            data=enriched_event,
                         )
                     )
 
-                    yield enhanced_event
+                    yield enriched_event
 
                 # Reset to initial pose after completion
                 self._robot_instance.move_to_initial_pose()
@@ -528,10 +525,10 @@ class EnhancedRobotAgent(IRobotAgent):
 def create_robot_agent(
     robot_instance: SO100Robot,
     gr00t_client_instance: Optional[Gr00tRobotInferenceClient] = None,
-    model_id: str = MODEL_ID,
+    model_id: str = DEFAULT_MODEL_ID,
     region_name: str = "us-west-2",
     callback_handler: Optional[Callable] = None,
-) -> EnhancedRobotAgent:
+) -> SO10xRobotAgent:
     """
     Create an enhanced robot agent with explicit dependency injection.
 
@@ -544,7 +541,7 @@ def create_robot_agent(
         region_name: AWS region name
         callback_handler: Optional callback handler for agent events
     """
-    return EnhancedRobotAgent(
+    return SO10xRobotAgent(
         robot_instance=robot_instance,
         gr00t_client_instance=gr00t_client_instance,
         model_id=model_id,
@@ -557,10 +554,10 @@ def create_robot_agent_with_config(
     enable_camera: bool = True,
     arm_cam_idx: int = 2,
     top_cam_idx: int = 0,
-    model_id: str = MODEL_ID,
+    model_id: str = DEFAULT_MODEL_ID,
     region_name: str = "us-west-2",
     callback_handler: Optional[Callable] = None,
-) -> EnhancedRobotAgent:
+) -> SO10xRobotAgent:
     """
     Create a robot agent with customizable hardware configuration.
 
@@ -580,7 +577,7 @@ def create_robot_agent_with_config(
     )
     gr00t_instance = Gr00tRobotInferenceClient()
 
-    return EnhancedRobotAgent(
+    return SO10xRobotAgent(
         robot_instance=robot_instance,
         gr00t_client_instance=gr00t_instance,
         model_id=model_id,
@@ -592,10 +589,10 @@ def create_robot_agent_with_config(
 def create_mock_robot_agent(
     mock_robot: Optional[SO100Robot] = None,
     mock_gr00t: Optional[Gr00tRobotInferenceClient] = None,
-    model_id: str = MODEL_ID,
+    model_id: str = DEFAULT_MODEL_ID,
     region_name: str = "us-west-2",
     callback_handler: Optional[Callable] = None,
-) -> EnhancedRobotAgent:
+) -> SO10xRobotAgent:
     """
     Create a robot agent with mock instances for testing.
 
@@ -620,7 +617,7 @@ def create_mock_robot_agent(
     if mock_gr00t is None:
         mock_gr00t = Mock(spec=Gr00tRobotInferenceClient)
 
-    return EnhancedRobotAgent(
+    return SO10xRobotAgent(
         robot_instance=mock_robot,
         gr00t_client_instance=mock_gr00t,
         model_id=model_id,
@@ -639,12 +636,12 @@ if __name__ == "__main__":
 
         # Create agent with default configuration
         robot_instance = SO100Robot(enable_camera=True, arm_cam_idx=2, top_cam_idx=0)
-        enhanced_agent = create_robot_agent(robot_instance=robot_instance)
+        so10x_agent = create_robot_agent(robot_instance=robot_instance)
 
         logger.info(f"🎯 Processing query: {user_query}")
 
         # Use the streaming interface with clean output
-        async for event in enhanced_agent.stream_async(user_query):
+        async for event in so10x_agent.astream(user_query):
             event_type = event.get("type", "unknown")
 
             if event_type == "warmup_progress":

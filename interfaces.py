@@ -98,7 +98,7 @@ class IRobotAgent(ABC):
     """
 
     @abstractmethod
-    async def execute_instruction(
+    async def arun(
         self, instruction: str, task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """

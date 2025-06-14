@@ -12,14 +12,12 @@ from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import FunctionCallParams
-from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMContext
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
-from pipecat.transports.services.daily import DailyParams
 
 from embodiment.so_arm10x.agent import create_robot_agent_with_config
 
@@ -46,8 +44,8 @@ def get_robot_agent():
 
         _robot_agent = create_robot_agent_with_config(
             enable_camera=True,
-            arm_cam_idx=2,
-            top_cam_idx=0,
+            wrist_cam_idx=2,
+            front_cam_idx=0,
             callback_handler=callback_handler,
         )
     return _robot_agent
@@ -122,24 +120,9 @@ async def run_robot_agent(params: FunctionCallParams):
     Execute robot agent tasks in the background with real-time audio feedback.
     Uses async iterators for streaming updates with clean logging.
     """
-    import logging
-
-    logger = logging.getLogger("voice_assistant.robot")
-
-    await params.llm.queue_frame(TTSSpeakFrame("OK!"))
 
     async def _run_robot_agent_background():
         try:
-            # Setup clean logging for robot components only (without conflicting with pipecat)
-            import logging
-
-            # Only setup robot-specific loggers, don't touch loguru
-            logging.getLogger("urllib3").setLevel(logging.WARNING)
-            logging.getLogger("botocore").setLevel(logging.WARNING)
-            logging.getLogger("boto3").setLevel(logging.WARNING)
-            logging.getLogger("anthropic").setLevel(logging.WARNING)
-            logging.getLogger("httpx").setLevel(logging.WARNING)
-
             # Use shared robot agent for better resource management
             so100_agent = get_robot_agent()
             logger.info(
@@ -234,11 +217,6 @@ async def run_robot_agent(params: FunctionCallParams):
 # instantiated. The function will be called when the desired transport gets
 # selected.
 transport_params = {
-    "daily": lambda: DailyParams(
-        audio_in_enabled=True,
-        audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(),
-    ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
@@ -250,6 +228,14 @@ transport_params = {
         vad_analyzer=SileroVADAnalyzer(),
     ),
 }
+
+
+system_prompt = """You are a helpful robot assistant. \
+Your goal is to demonstrate your capabilities in a succinct way. 
+
+Your output will be converted to audio so don't include special characters and be concise in your answers. 
+
+Respond to what the user said in a professional and helpful way."""
 
 
 async def run_dum_e(
@@ -266,7 +252,11 @@ async def run_dum_e(
         params=ElevenLabsTTSService.InputParams(language=Language.EN),
     )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
+    llm = AnthropicLLMService(
+        api_key=os.getenv("ANTHROPIC_API_KEY"),
+        model="claude-3-5-haiku-20241022",
+        params=AnthropicLLMService.InputParams(temperature=0.7, max_tokens=500),
+    )
 
     # You can also register a function_name of None to get all functions
     # sent to the same callback with an additional function_name parameter.
@@ -296,7 +286,7 @@ async def run_dum_e(
 
     robot_function = FunctionSchema(
         name="run_robot_agent",
-        description="Run the robot agent to execute physical actions based on the given instruction. Confirm the action with the user before executing it.",
+        description="Run the robot agent to execute physical actions based on the given instruction.",
         properties={
             "instruction": {
                 "type": "string",
@@ -307,14 +297,7 @@ async def run_dum_e(
     )
     tools = ToolsSchema(standard_tools=[weather_function, robot_function])
 
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful robot assistant. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters and be concise in your answers. Respond to what the user said in a professional and helpful way.",
-        },
-    ]
-
-    context = OpenAILLMContext(messages, tools)
+    context = AnthropicLLMContext(messages=[], tools=tools, system=system_prompt)
     context_aggregator = llm.create_context_aggregator(context)
 
     pipeline = Pipeline(
@@ -343,7 +326,8 @@ async def run_dum_e(
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
         # Kick off the conversation.
-        await task.queue_frames([context_aggregator.user().get_context_frame()])
+        # await task.queue_frames([context_aggregator.user().get_context_frame()])
+        await task.queue_frames([TTSSpeakFrame(f"Hello there!")])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

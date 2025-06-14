@@ -490,15 +490,15 @@ class SO10xHardwareInterface(IHardwareInterface):
 
             return {
                 "cameras": {
-                    "arm_camera": {
-                        "shape": images["arm_camera"].shape,
-                        "dtype": str(images["arm_camera"].dtype),
+                    "wrist": {
+                        "shape": images["wrist"].shape,
+                        "dtype": str(images["wrist"].dtype),
                         # Note: Not including actual image data to avoid large payloads
                         # Applications can call get_current_images directly for image data
                     },
-                    "top_camera": {
-                        "shape": images["top_camera"].shape,
-                        "dtype": str(images["top_camera"].dtype),
+                    "front": {
+                        "shape": images["front"].shape,
+                        "dtype": str(images["front"].dtype),
                     },
                 },
                 "timestamp": datetime.now().isoformat(),

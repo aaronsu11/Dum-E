@@ -97,14 +97,14 @@ def create_robot_tools(
     def assess_situation() -> dict:
         """Assess the situation at the current state"""
         images = robot_instance.get_current_images()
-        top_image_bytes = image_to_jpeg_bytes(images["top_camera"], silent=True)
-        arm_image_bytes = image_to_jpeg_bytes(images["arm_camera"], silent=True)
+        top_image_bytes = image_to_jpeg_bytes(images["front"], silent=True)
+        arm_image_bytes = image_to_jpeg_bytes(images["wrist"], silent=True)
 
         return {
             "status": "success",
             "content": [
                 {
-                    "text": f"Taken picture from the top camera and arm camera as follows:"
+                    "text": f"Taken picture from the front camera and wrist camera as follows:"
                 },
                 {"image": {"format": "jpeg", "source": {"bytes": top_image_bytes}}},
                 {"image": {"format": "jpeg", "source": {"bytes": arm_image_bytes}}},
@@ -131,9 +131,6 @@ def create_robot_tools(
             )
 
             for i in range(len(single_arm_interp)):
-                # manual offset to lift up the arm
-                single_arm_interp[i][1] += 2
-                single_arm_interp[i][2] -= 2
                 concat_action = np.concatenate(
                     [
                         np.atleast_1d(single_arm_interp[i]),
@@ -153,7 +150,7 @@ def create_robot_tools(
         """Start picking up a block from a given location"""
         gr00t_client_instance.set_lang_instruction(f"Pick up a lego block")
         latest_images = pick(pose="initial" if location == "table" else "remote")
-        image_bytes = image_to_jpeg_bytes(latest_images["top_camera"], silent=True)
+        image_bytes = image_to_jpeg_bytes(latest_images["front"], silent=True)
 
         return {
             "status": "success",
@@ -169,7 +166,7 @@ def create_robot_tools(
     def resume_pick():
         """Resume picking up a block from a given location"""
         latest_images = pick(actions_to_execute=15, pose="resume")
-        image_bytes = image_to_jpeg_bytes(latest_images["top_camera"], silent=True)
+        image_bytes = image_to_jpeg_bytes(latest_images["front"], silent=True)
 
         return {
             "status": "success",
@@ -303,7 +300,7 @@ class SO10xRobotAgent(IRobotAgent):
 
             Guidelines for task execution:
             - Always assess the situation and create a step-by-step plan first
-            - Be very concise in responses (max 20 words) since output is converted to audio
+            - Be very concise in responses (max 15 words) as the output will be converted to audio
             - Don't use special characters in responses  
             - Examine results of each tool call during picking
             - Resume picking if object is not firmly grasped and lifted
@@ -328,7 +325,7 @@ class SO10xRobotAgent(IRobotAgent):
 
     # IRobotAgent interface implementation
 
-    async def execute_instruction(
+    async def arun(
         self, instruction: str, task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Execute instruction synchronously and return final result."""
@@ -408,15 +405,15 @@ class SO10xRobotAgent(IRobotAgent):
             # Execute with robot hardware context and streaming
             with self._robot_instance.activate():
                 # Warm up cameras with progress updates
-                for i in range(10):
+                for i in range(5):
                     self._robot_instance.get_current_images()
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.2)
 
                     # Yield camera warmup progress
                     yield {
                         "task_id": task_id,
                         "type": "warmup_progress",
-                        "progress": (i + 1) / 10,
+                        "progress": (i + 1) / 5,
                         "message": "Warming up robot cameras...",
                     }
 
@@ -530,7 +527,7 @@ def create_robot_agent(
     callback_handler: Optional[Callable] = None,
 ) -> SO10xRobotAgent:
     """
-    Create an enhanced robot agent with explicit dependency injection.
+    Create an SO10x robot agent with explicit dependency injection.
 
     Requires explicit robot instance for better resource management and testability.
 
@@ -552,8 +549,8 @@ def create_robot_agent(
 
 def create_robot_agent_with_config(
     enable_camera: bool = True,
-    arm_cam_idx: int = 2,
-    top_cam_idx: int = 0,
+    wrist_cam_idx: int = 2,
+    front_cam_idx: int = 0,
     model_id: str = DEFAULT_MODEL_ID,
     region_name: str = "us-west-2",
     callback_handler: Optional[Callable] = None,
@@ -566,14 +563,16 @@ def create_robot_agent_with_config(
 
     Args:
         enable_camera: Whether to enable camera support
-        arm_cam_idx: Arm camera index
-        top_cam_idx: Top camera index
+        wrist_cam_idx: Wrist camera index
+        front_cam_idx: Front camera index
         model_id: The model ID to use for the agent
         region_name: AWS region name
         callback_handler: Optional callback handler for agent events
     """
     robot_instance = SO100Robot(
-        enable_camera=enable_camera, arm_cam_idx=arm_cam_idx, top_cam_idx=top_cam_idx
+        enable_camera=enable_camera,
+        wrist_cam_idx=wrist_cam_idx,
+        front_cam_idx=front_cam_idx,
     )
     gr00t_instance = Gr00tRobotInferenceClient()
 
@@ -635,7 +634,9 @@ if __name__ == "__main__":
         user_query = input("Enter your instruction: ")
 
         # Create agent with default configuration
-        robot_instance = SO100Robot(enable_camera=True, arm_cam_idx=2, top_cam_idx=0)
+        robot_instance = SO100Robot(
+            enable_camera=True, wrist_cam_idx=2, front_cam_idx=0
+        )
         so10x_agent = create_robot_agent(robot_instance=robot_instance)
 
         logger.info(f"🎯 Processing query: {user_query}")

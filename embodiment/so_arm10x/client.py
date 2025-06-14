@@ -14,7 +14,7 @@ This module can be run directly to test/evaluate a policy:
 
 Example usage (from the root directory):
     # Test with policy inference
-    python -m embodiment.so_arm10x.client --use_policy --host 0.0.0.0  --port 5555 --arm_cam_idx 2 --top_cam_idx 0 --lang_instruction "Pick up the lego block."
+    python -m embodiment.so_arm10x.client --use_policy --host 0.0.0.0  --port 5555 --wrist_cam_idx 2 --front_cam_idx 0 --lang_instruction "Pick up the lego block."
 
     # Test with dataset playback
     python -m embodiment.so_arm10x.client --dataset_path ~/datasets/so100_pick
@@ -26,8 +26,8 @@ Command line arguments:
     --port: Inference server port (default: 5555)
     --action_horizon: Number of actions to execute per chunk (default: 12)
     --actions_to_execute: Total number of actions to execute (default: 350)
-    --arm_cam_idx: Camera index for arm camera (default: 0)
-    --top_cam_idx: Camera index for top camera (default: 2)
+    --wrist_cam_idx: Camera index for wrist camera (default: 0)
+    --front_cam_idx: Camera index for front camera (default: 2)
     --lang_instruction: Natural language instruction for the policy (default: "Pick up the lego block")
     --record_imgs: Save camera images during execution (default: False)
 """
@@ -62,7 +62,7 @@ from policy.gr00t.service import ExternalRobotInferenceClient
 
 class SO100Robot:
     def __init__(
-        self, calibrate=False, enable_camera=False, arm_cam_idx=0, top_cam_idx=2
+        self, calibrate=False, enable_camera=False, wrist_cam_idx=0, front_cam_idx=2
     ):
         self.config = So100RobotConfig()
         self.calibrate = calibrate
@@ -72,8 +72,8 @@ class SO100Robot:
             self.config.cameras = {}
         else:
             self.config.cameras = {
-                "arm_camera": OpenCVCameraConfig(arm_cam_idx, 30, 640, 480, "rgb"),
-                "top_camera": OpenCVCameraConfig(top_cam_idx, 30, 640, 480, "rgb"),
+                "wrist": OpenCVCameraConfig(wrist_cam_idx, 30, 640, 480, "rgb"),
+                "front": OpenCVCameraConfig(front_cam_idx, 30, 640, 480, "rgb"),
             }
         self.config.leader_arms = {}
 
@@ -127,16 +127,12 @@ class SO100Robot:
         # print("robot present position:", self.motor_bus.read("Present_Position"))
         self.robot.is_connected = True
 
-        self.arm_camera = (
-            self.robot.cameras["arm_camera"] if self.enable_camera else None
-        )
-        self.top_camera = (
-            self.robot.cameras["top_camera"] if self.enable_camera else None
-        )
-        if self.arm_camera is not None:
-            self.arm_camera.connect()
-        if self.top_camera is not None:
-            self.top_camera.connect()
+        self.wrist = self.robot.cameras["wrist"] if self.enable_camera else None
+        self.front = self.robot.cameras["front"] if self.enable_camera else None
+        if self.wrist is not None:
+            self.wrist.connect()
+        if self.front is not None:
+            self.front.connect()
         # Suppress verbose connection logging
         # print("================> SO100 Robot is fully connected =================")
 
@@ -162,17 +158,18 @@ class SO100Robot:
         # print("current_state", current_state)
         # print all keys of the observation
         # print("observation keys:", self.robot.capture_observation().keys())
-        target_state = torch.tensor([0.0, 190.0, 177.0, 72.0, -90.0, 1.0])
+        target_state = torch.tensor([0.0, 190.0, 165.0, 60.0, -90.0, 50.0])
+        self.robot.send_action(target_state)
+        time.sleep(1)
+        target_state = torch.tensor([0.0, 190.0, 177.0, 72.0, -90.0, 0.0])
         # current_state = torch.tensor([90, 90, 90, 90, -70, 30])
         self.robot.send_action(target_state)
-        time.sleep(2)
-        # print("-------------------------------- moving to initial pose")
+        time.sleep(1)
 
     def move_to_remote_pose(self):
         target_state = torch.tensor([0.0, 90.0, 90.0, 50.0, -90.0, 1.0])
         self.robot.send_action(target_state)
         time.sleep(2)
-        print("-------------------------------- moving to remote pose")
 
     def release_at_remote_pose(self):
         # get the gripper state value
@@ -185,16 +182,15 @@ class SO100Robot:
         self.robot.send_action(target_state)
         time.sleep(1)
         target_state = torch.tensor(
-            [random_offset, 50.0, 50.0, 50.0, -90.0, gripper_state]
+            [random_offset, 60.0, 50.0, 50.0, -90.0, gripper_state]
         )
         self.robot.send_action(target_state)
         time.sleep(1)
         target_state = torch.tensor(
-            [random_offset, 50.0, 50.0, 50.0, -90.0, min(gripper_state + 10, 60)]
+            [random_offset, 60.0, 50.0, 50.0, -90.0, min(gripper_state + 10, 60)]
         )
         self.robot.send_action(target_state)
         time.sleep(1)
-        print("-------------------------------- releasing the object")
         target_state = torch.tensor(
             [random_offset, 90.0, 90.0, 50.0, -90.0, min(gripper_state + 10, 60)]
         )
@@ -204,7 +200,6 @@ class SO100Robot:
 
     def go_home(self):
         # [ 88.0664, 156.7090, 135.6152,  83.7598, -89.1211,  16.5107]
-        print("-------------------------------- moving to home pose")
         home_state = torch.tensor(
             [88.0664, 156.7090, 135.6152, 83.7598, -89.1211, 16.5107]
         )
@@ -218,12 +213,12 @@ class SO100Robot:
         return self.get_observation()["observation.state"].data.numpy()
 
     def get_current_images(self) -> dict[str, np.ndarray]:
-        arm_img = self.get_observation()["observation.images.arm_camera"].data.numpy()
-        top_img = self.get_observation()["observation.images.top_camera"].data.numpy()
+        wrist_img = self.get_observation()["observation.images.wrist"].data.numpy()
+        front_img = self.get_observation()["observation.images.front"].data.numpy()
         # convert bgr to rgb
-        # arm_img = cv2.cvtColor(arm_img, cv2.COLOR_BGR2RGB)
-        # top_img = cv2.cvtColor(top_img, cv2.COLOR_BGR2RGB)
-        return {"arm_camera": arm_img, "top_camera": top_img}
+        # wrist_img = cv2.cvtColor(wrist_img, cv2.COLOR_BGR2RGB)
+        # front_img = cv2.cvtColor(front_img, cv2.COLOR_BGR2RGB)
+        return {"wrist": wrist_img, "front": front_img}
 
     @staticmethod
     def interpolate_actions(actions, num_interp=5):
@@ -337,8 +332,8 @@ class Gr00tRobotInferenceClient:
 
     def get_action(self, images: dict[str, np.ndarray], state: np.ndarray):
         obs_dict = {
-            "video.arm_camera": images["arm_camera"][np.newaxis, :, :, :],
-            "video.top_camera": images["top_camera"][np.newaxis, :, :, :],
+            "video.wrist": images["wrist"][np.newaxis, :, :, :],
+            "video.front": images["front"][np.newaxis, :, :, :],
             "state.single_arm": state[:5][np.newaxis, :].astype(np.float64),
             "state.gripper": state[5:6][np.newaxis, :].astype(np.float64),
             "annotation.human.task_description": [self.language_instruction],
@@ -420,8 +415,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--action_horizon", type=int, default=12)
     parser.add_argument("--actions_to_execute", type=int, default=350)
-    parser.add_argument("--arm_cam_idx", type=int, default=0)
-    parser.add_argument("--top_cam_idx", type=int, default=2)
+    parser.add_argument("--wrist_cam_idx", type=int, default=0)
+    parser.add_argument("--front_cam_idx", type=int, default=2)
     parser.add_argument(
         "--lang_instruction", type=str, default="Pick up the lego block."
     )
@@ -453,8 +448,8 @@ if __name__ == "__main__":
         robot = SO100Robot(
             calibrate=False,
             enable_camera=True,
-            arm_cam_idx=args.arm_cam_idx,
-            top_cam_idx=args.top_cam_idx,
+            wrist_cam_idx=args.wrist_cam_idx,
+            front_cam_idx=args.front_cam_idx,
         )
         image_count = 0
         with robot.activate():
@@ -476,8 +471,8 @@ if __name__ == "__main__":
 
                 # Use interpolated actions (skip the first, which is prev_state)
                 for j in range(1, len(single_arm_interp)):
-                    single_arm_interp[j][1] += 2
-                    single_arm_interp[j][2] -= 2
+                    # single_arm_interp[j][1] += 2
+                    # single_arm_interp[j][2] -= 2
                     concat_action = np.concatenate(
                         [
                             np.atleast_1d(single_arm_interp[j]),
@@ -496,7 +491,7 @@ if __name__ == "__main__":
                     if args.record_imgs:
                         # resize the image to 320x240
                         img = cv2.resize(
-                            cv2.cvtColor(images["top_camera"], cv2.COLOR_RGB2BGR),
+                            cv2.cvtColor(images["front"], cv2.COLOR_RGB2BGR),
                             (320, 240),
                         )
                         cv2.imwrite(f"eval_images/img_{image_count}.jpg", img)
@@ -522,8 +517,8 @@ if __name__ == "__main__":
         robot = SO100Robot(
             calibrate=False,
             enable_camera=True,
-            arm_cam_idx=args.arm_cam_idx,
-            top_cam_idx=args.top_cam_idx,
+            wrist_cam_idx=args.wrist_cam_idx,
+            front_cam_idx=args.front_cam_idx,
         )
 
         with robot.activate():
@@ -531,12 +526,12 @@ if __name__ == "__main__":
             actions = []
             for i in tqdm(range(ACTIONS_TO_EXECUTE), desc="Loading actions"):
                 action = dataset[i]["action"]
-                img = dataset[i]["observation.images.top_camera"].data.numpy()
+                img = dataset[i]["observation.images.front"].data.numpy()
                 # original shape (3, 480, 640) for image data
                 realtime_img = robot.get_current_images()
 
                 img = img.transpose(1, 2, 0)
-                view_img(img, realtime_img["top_camera"])
+                view_img(img, realtime_img["front"])
                 actions.append(action)
                 robot.set_target_state(action)
                 time.sleep(0.05)

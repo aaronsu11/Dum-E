@@ -51,63 +51,29 @@ def get_robot_agent():
     return _robot_agent
 
 
-async def fetch_weather_from_api(params: FunctionCallParams):
+async def order_food(params: FunctionCallParams):
     """
-    Fetch current weather using Open-Meteo and Nominatim for geocoding.
+    Order food from a restaurant.
     """
-    location = params.arguments.get("location")
-    temp_unit = params.arguments.get("format", "celsius")
+    # Use these to call the actual APIs
+    restaurant = params.arguments.get("restaurant")
+    food = params.arguments.get("food")
 
     async def _speak_status_update(delay: float = 2):
         await asyncio.sleep(delay)
-        await params.llm.queue_frame(TTSSpeakFrame("Let me check on that."))
+        await params.llm.queue_frame(TTSSpeakFrame("Working on that."))
 
     status_update_task = asyncio.create_task(_speak_status_update(1))
 
     try:
-        # 1. Geocode location to lat/lon
-        async with httpx.AsyncClient() as client:
-            geo_resp = await client.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": location, "format": "json", "limit": 1},
-                headers={"User-Agent": "robot-assistant/1.0"},
-            )
-            geo_resp.raise_for_status()
-            geo_data = geo_resp.json()
-            if not geo_data:
-                await params.result_callback({"error": "location not found"})
-                status_update_task.cancel()
-                return
-
-            lat = geo_data[0]["lat"]
-            lon = geo_data[0]["lon"]
-
-            # 2. Query Open-Meteo for current weather
-            weather_url = "https://api.open-meteo.com/v1/forecast"
-            weather_params = {
-                "latitude": lat,
-                "longitude": lon,
-                "current_weather": True,
-                "temperature_unit": (
-                    "celsius" if temp_unit == "celsius" else "fahrenheit"
-                ),
+        await asyncio.sleep(5)
+        # Sample response
+        await params.result_callback(
+            {
+                "status": "order delivered",
+                "response": "Items are available at the user's table",
             }
-            weather_resp = await client.get(weather_url, params=weather_params)
-            weather_resp.raise_for_status()
-            weather_data = weather_resp.json()
-            current = weather_data.get("current_weather", {})
-
-            if not current:
-                await params.result_callback({"error": "weather not found"})
-                status_update_task.cancel()
-                return
-
-            # 3. Return weather info
-            conditions = f"{current.get('weathercode', 'unknown')}"
-            temperature = current.get("temperature", "unknown")
-            await params.result_callback(
-                {"conditions": conditions, "temperature": temperature}
-            )
+        )
 
     except Exception as e:
         await params.result_callback({"error": str(e)})
@@ -230,11 +196,11 @@ transport_params = {
 }
 
 
-system_prompt = """You are a helpful robot assistant. \
-Your goal is to demonstrate your capabilities in a succinct way. 
+system_prompt = """You are a helpful robot assistant that assists the user with their requests.
 
-Your output will be converted to audio so don't include special characters and be concise in your answers. 
+You have access to public APIs as well as a physical robot to perform your tasks.
 
+Your output will be converted to audio so don't include special characters and be concise in your answers. \
 Respond to what the user said in a professional and helpful way."""
 
 
@@ -260,33 +226,32 @@ async def run_dum_e(
 
     # You can also register a function_name of None to get all functions
     # sent to the same callback with an additional function_name parameter.
-    llm.register_function("get_current_weather", fetch_weather_from_api)
+    llm.register_function("order_food", order_food)
     llm.register_function("run_robot_agent", run_robot_agent)
 
     # @llm.event_handler("on_function_calls_started")
     # async def on_function_calls_started(service, function_calls):
     #     await tts.queue_frame(TTSSpeakFrame("Let me check on that."))
 
-    weather_function = FunctionSchema(
-        name="get_current_weather",
-        description="Get the current weather",
+    food_function = FunctionSchema(
+        name="order_food",
+        description="Order food from a restaurant",
         properties={
-            "location": {
+            "restaurant": {
                 "type": "string",
-                "description": "The city and state, e.g. San Francisco, CA",
+                "description": "The name of the restaurant",
             },
-            "format": {
+            "food": {
                 "type": "string",
-                "enum": ["celsius", "fahrenheit"],
-                "description": "The temperature unit to use. Infer this from the user's location.",
+                "description": "The food to order",
             },
         },
-        required=["location", "format"],
+        required=["restaurant", "food"],
     )
 
     robot_function = FunctionSchema(
         name="run_robot_agent",
-        description="Run the robot agent to execute physical actions based on the given instruction.",
+        description="Run the robot agent to physically assist the user and execute actions based on the given instruction.",
         properties={
             "instruction": {
                 "type": "string",
@@ -295,7 +260,7 @@ async def run_dum_e(
         },
         required=["instruction"],
     )
-    tools = ToolsSchema(standard_tools=[weather_function, robot_function])
+    tools = ToolsSchema(standard_tools=[food_function, robot_function])
 
     context = AnthropicLLMContext(messages=[], tools=tools, system=system_prompt)
     context_aggregator = llm.create_context_aggregator(context)
@@ -327,7 +292,9 @@ async def run_dum_e(
         logger.info(f"Client connected")
         # Kick off the conversation.
         # await task.queue_frames([context_aggregator.user().get_context_frame()])
-        await task.queue_frames([TTSSpeakFrame(f"Hello there!")])
+        await task.queue_frames(
+            [TTSSpeakFrame(f"Hi, Dummy is here! How can I help you?")]
+        )
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

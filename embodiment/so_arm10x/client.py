@@ -16,6 +16,9 @@ Example usage (from the root directory):
     # Test with policy inference
     python -m embodiment.so_arm10x.client --use_policy --host 0.0.0.0  --port 5555 --wrist_cam_idx 2 --front_cam_idx 0 --lang_instruction "Pick up the lego block."
 
+    # Print out the state of the robot
+    python -m embodiment.so_arm10x.client --print_state --wrist_cam_idx 2 --front_cam_idx 0
+
     # Test with dataset playback
     python -m embodiment.so_arm10x.client --dataset_path ~/datasets/so100_pick
 
@@ -30,6 +33,7 @@ Command line arguments:
     --front_cam_idx: Camera index for front camera (default: 2)
     --lang_instruction: Natural language instruction for the policy (default: "Pick up the lego block")
     --record_imgs: Save camera images during execution (default: False)
+    --print_state: Connect to robot, print state, show images, and exit on 'q' press
 """
 
 import time
@@ -162,12 +166,23 @@ class SO100Robot:
         self.robot.send_action(target_state)
         time.sleep(1)
         target_state = torch.tensor([0.0, 190.0, 177.0, 72.0, -90.0, 0.0])
+        self.robot.send_action(target_state)
+        time.sleep(1)
+        # kick-off pose
+        target_state = torch.tensor([0.0, 175.0, 165.0, 72.0, -90.0, 0.0])
         # current_state = torch.tensor([90, 90, 90, 90, -70, 30])
         self.robot.send_action(target_state)
         time.sleep(1)
 
     def move_to_remote_pose(self):
-        target_state = torch.tensor([0.0, 90.0, 90.0, 50.0, -90.0, 1.0])
+        gripper_state = self.get_current_state()[-1]
+        target_state = torch.tensor([0.0, 130.0, 90.0, 50.0, -90.0, gripper_state])
+        self.robot.send_action(target_state)
+        time.sleep(1)
+        target_state = torch.tensor([70.0, 130.0, 90.0, 70.0, -90.0, gripper_state])
+        self.robot.send_action(target_state)
+        time.sleep(1)
+        target_state = torch.tensor([70.0, 75.0, 40.0, 70.0, -90.0, gripper_state])
         self.robot.send_action(target_state)
         time.sleep(2)
 
@@ -196,10 +211,8 @@ class SO100Robot:
         )
         self.robot.send_action(target_state)
         time.sleep(1)
-        self.move_to_remote_pose()
 
     def go_home(self):
-        # [ 88.0664, 156.7090, 135.6152,  83.7598, -89.1211,  16.5107]
         home_state = torch.tensor(
             [88.0664, 156.7090, 135.6152, 83.7598, -89.1211, 16.5107]
         )
@@ -421,6 +434,11 @@ if __name__ == "__main__":
         "--lang_instruction", type=str, default="Pick up the lego block."
     )
     parser.add_argument("--record_imgs", action="store_true")
+    parser.add_argument(
+        "--print_state",
+        action="store_true",
+        help="Connect to robot, print state, show images, and exit on 'q' press",
+    )
     args = parser.parse_args()
 
     # print lang_instruction
@@ -432,7 +450,61 @@ if __name__ == "__main__":
         args.action_horizon
     )  # we will execute only some actions from the action_chunk of 16
     MODALITY_KEYS = ["single_arm", "gripper"]
-    if USE_POLICY:
+
+    if args.print_state:
+        print("Starting print state mode...")
+        robot = SO100Robot(
+            calibrate=False,
+            enable_camera=True,
+            wrist_cam_idx=args.wrist_cam_idx,
+            front_cam_idx=args.front_cam_idx,
+        )
+
+        with robot.activate():
+            print("Robot State:", robot.get_current_state())
+
+            # Set up matplotlib for key press detection
+            fig = plt.figure(figsize=(10, 5))
+            plt.suptitle("Press 'q' to quit", fontsize=14)
+
+            def on_key(event):
+                if event.key == "q":
+                    plt.close("all")
+                    return
+
+            fig.canvas.mpl_connect("key_press_event", on_key)
+
+            print("Showing camera images. Press 'q' in the image window to exit...")
+
+            try:
+                while plt.get_fignums():  # Continue while matplotlib windows are open
+                    images = robot.get_current_images()
+
+                    # Clear and update the display
+                    fig.clear()
+                    plt.suptitle("Press 'q' to quit", fontsize=14)
+
+                    # Show wrist camera
+                    ax1 = fig.add_subplot(1, 2, 1)
+                    ax1.imshow(images["wrist"])
+                    ax1.set_title("Wrist Camera")
+                    ax1.axis("off")
+
+                    # Show front camera
+                    ax2 = fig.add_subplot(1, 2, 2)
+                    ax2.imshow(images["front"])
+                    ax2.set_title("Front Camera")
+                    ax2.axis("off")
+
+                    plt.tight_layout()
+                    plt.pause(0.1)  # Update display and check for events
+
+            except KeyboardInterrupt:
+                print("\nInterrupted by user")
+
+            print("Exiting print state mode...")
+
+    elif USE_POLICY:
         client = Gr00tRobotInferenceClient(
             host=args.host,
             port=args.port,

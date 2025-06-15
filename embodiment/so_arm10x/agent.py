@@ -77,6 +77,79 @@ def image_to_jpeg_bytes(
     return buffer.tobytes()
 
 
+def create_orange_yellow_mask(frame):
+    """Create a mask for orange/yellow colors in HSV color space, optimized for pale yellow objects."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+
+    # Define range for orange color in HSV
+    orange_lower = np.array([8, 80, 80])  # Slightly reduced saturation
+    orange_upper = np.array([25, 255, 255])
+
+    # Define range for yellow color in HSV - very permissive for pale yellow fries
+    yellow_lower = np.array(
+        [15, 20, 60]
+    )  # Very low saturation and value for pale objects
+    yellow_upper = np.array([50, 180, 255])  # Wider hue range, moderate saturation cap
+
+    # Create masks for both colors
+    orange_mask = cv2.inRange(hsv, orange_lower, orange_upper)
+    yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+
+    # Combine masks
+    combined_mask = cv2.bitwise_or(orange_mask, yellow_mask)
+
+    # Very lenient brightness filter - only exclude extremely bright pixels
+    _, _, v = cv2.split(hsv)
+    bright_mask = v > 250  # Only exclude truly white pixels
+    combined_mask = cv2.bitwise_and(combined_mask, ~bright_mask.astype(np.uint8) * 255)
+
+    return combined_mask
+
+
+def detect_block_in_gripper_region(frame, roi_height_ratio=0.4, roi_width_ratio=0.15):
+    """
+    Detect orange/yellow block in the region between the gripper at bottom center.
+
+    Args:
+        frame: Input video frame
+        roi_height_ratio: Height of ROI as ratio of frame height (from bottom) - reduced from 0.5 to 0.4
+        roi_width_ratio: Width of ROI as ratio of frame width (centered) - reduced from 0.25 to 0.15
+
+    Returns:
+        bool: True if block detected, False otherwise
+        tuple: (x, y, w, h) of ROI for visualization
+    """
+    height, width = frame.shape[:2]
+
+    # Define ROI (Region of Interest) - bottom center area where gripper would be
+    # Now much narrower (15% width) and slightly shorter (40% height) for more precise detection
+    roi_width = int(width * roi_width_ratio)
+    roi_height = int(height * roi_height_ratio)
+    roi_x = (width - roi_width) // 2
+    roi_y = height - roi_height
+
+    # Extract ROI
+    roi = frame[roi_y : roi_y + roi_height, roi_x : roi_x + roi_width]
+
+    # Create mask for orange/yellow colors in ROI
+    mask = create_orange_yellow_mask(roi)
+
+    # Apply morphological operations to reduce noise
+    kernel = np.ones((3, 3), np.uint8)  # Reduced kernel size from 5x5 to 3x3
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    # Count non-zero pixels (orange/yellow pixels)
+    non_zero_pixels = cv2.countNonZero(mask)
+
+    # Reduced threshold since we have a smaller ROI
+    detection_threshold = 200  # Reduced from 500 to 200 due to smaller detection area
+
+    block_detected = non_zero_pixels > detection_threshold
+
+    return block_detected, (roi_x, roi_y, roi_width, roi_height)
+
+
 def create_robot_tools(
     robot_instance: SO100Robot, gr00t_client_instance: Gr00tRobotInferenceClient
 ):
@@ -112,7 +185,7 @@ def create_robot_tools(
         }
 
     def pick(
-        actions_to_execute: int = 10,
+        actions_to_execute: int = 15,
         pose: Literal["initial", "remote", "resume"] = "resume",
     ) -> dict:
         if pose == "initial":
@@ -146,10 +219,10 @@ def create_robot_tools(
         return robot_instance.get_current_images()
 
     @tool
-    def start_pick(location: Literal["plate", "table"]) -> dict:
+    def start_pick(location: Literal["carton", "table"]) -> dict:
         """Start picking up a block from a given location"""
-        gr00t_client_instance.set_lang_instruction(f"Pick up a lego block")
-        latest_images = pick(pose="initial" if location == "table" else "remote")
+        gr00t_client_instance.set_lang_instruction(f"Grab a fry")
+        latest_images = pick(pose="initial" if location == "table" else "initial")
         image_bytes = image_to_jpeg_bytes(latest_images["front"], silent=True)
 
         return {
@@ -165,34 +238,77 @@ def create_robot_tools(
     @tool
     def resume_pick():
         """Resume picking up a block from a given location"""
-        latest_images = pick(actions_to_execute=15, pose="resume")
+        latest_images = pick(actions_to_execute=20, pose="resume")
         image_bytes = image_to_jpeg_bytes(latest_images["front"], silent=True)
 
         return {
             "status": "success",
             "content": [
                 {
-                    "text": f"Resumed pick-up with 15 steps. Current state:",
+                    "text": f"Resumed pick-up with 20 steps. Current state:",
                 },
                 {"image": {"format": "jpeg", "source": {"bytes": image_bytes}}},
             ],
         }
 
+    def wait_for_object_collection(timeout: int = 10):
+        """Wait for the object to be collected by the user"""
+        start_time = time.time()
+        consecutive_frames_without_block = 0
+        required_consecutive_frames = (
+            5  # Number of consecutive frames without block to confirm collection
+        )
+
+        logger.info("Waiting for object collection...")
+
+        while time.time() - start_time < timeout:
+            # Get current wrist camera image
+            wrist_img = robot_instance.get_current_images()["wrist"]
+
+            # Detect if block is still in gripper region
+            block_detected, _ = detect_block_in_gripper_region(wrist_img)
+
+            if not block_detected:
+                consecutive_frames_without_block += 1
+                logger.info(
+                    f"No block detected: {consecutive_frames_without_block}/{required_consecutive_frames}"
+                )
+
+                if consecutive_frames_without_block >= required_consecutive_frames:
+                    logger.info("Object successfully collected!")
+                    # Save image before resetting pose
+                    image_to_jpeg_bytes(wrist_img, save=True)
+                    return True
+            else:
+                # Reset counter if block is still detected
+                consecutive_frames_without_block = 0
+                logger.info("Block still detected in gripper area")
+
+            time.sleep(0.2)  # Check every 200ms
+
+        logger.warning(
+            f"Timeout reached after {timeout} seconds - object may not have been collected"
+        )
+        return
+
     @tool
-    def place(location: str):
-        """Place a block at a given location"""
-        robot_instance.release_at_remote_pose()
+    def deliver(location: str):
+        """Deliver the object to a given position"""
+        robot_instance.move_to_remote_pose()
+        wait_for_object_collection()
+
+        time.sleep(1)
 
         return {
             "status": "success",
             "content": [
                 {
-                    "text": f"Attempted to place the block on {location}.",
+                    "text": f"Object delivered to {location} and collected by user.",
                 }
             ],
         }
 
-    return [reset_pose, assess_situation, start_pick, resume_pick, place]
+    return [reset_pose, assess_situation, start_pick, resume_pick, deliver]
 
 
 class SO10xRobotAgent(IRobotAgent):
@@ -291,12 +407,12 @@ class SO10xRobotAgent(IRobotAgent):
             model=model,
             tools=self._robot_tools,
             system_prompt="""
-            You are a robot assistant that performs pick and place tasks given a desired state.
+            You are a robot assistant that performs pick and place tasks of various objects.
             You have access to tools for:
             1. Assessing the current situation by taking pictures from cameras
-            2. Starting to pick up blocks from given locations  
+            2. Starting to pick up objects from given locations  
             3. Resuming pick operations from current location
-            4. Placing blocks at given locations (only when firmly grasped)
+            4. Placing objects at given locations (only when firmly grasped)
 
             Guidelines for task execution:
             - Always assess the situation and create a step-by-step plan first
@@ -304,7 +420,7 @@ class SO10xRobotAgent(IRobotAgent):
             - Don't use special characters in responses  
             - Examine results of each tool call during picking
             - Resume picking if object is not firmly grasped and lifted
-            - Only use place tool when object is securely held
+            - Deliver the object to the user when it is securely held by the gripper
             - After each successful pick and place:
               * Assess current state vs desired state
               * Summarize what was accomplished
@@ -639,7 +755,7 @@ if __name__ == "__main__":
         )
         so10x_agent = create_robot_agent(robot_instance=robot_instance)
 
-        logger.info(f"🎯 Processing query: {user_query}")
+        logger.info(f"🎯 Processing instruction: {user_query}")
 
         # Use the streaming interface with clean output
         async for event in so10x_agent.astream(user_query):

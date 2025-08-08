@@ -11,7 +11,7 @@ streaming pattern. Key improvements include:
 - Tool registry integration
 
 Example usage (from the root directory):
-    python -m embodiment.so_arm10x.agent
+    python -m embodiment.so_arm10x.agent --port /dev/tty.usbmodem5A680102371 --wrist_cam_idx 0 --front_cam_idx 1
 """
 
 import asyncio
@@ -34,7 +34,7 @@ from embodiment.so_arm10x import (
     InMemoryToolRegistry,
     SO10xHardwareInterface,
 )
-from embodiment.so_arm10x.client import Gr00tRobotInferenceClient, SO100Robot
+from embodiment.so_arm10x.client import Gr00tRobotInferenceClient, SO10xRobot
 from interfaces import (
     Event,
     EventType,
@@ -78,7 +78,7 @@ def image_to_jpeg_bytes(
 
 
 def create_robot_tools(
-    robot_instance: SO100Robot, gr00t_client_instance: Gr00tRobotInferenceClient
+    robot_instance: SO10xRobot, gr00t_client_instance: Gr00tRobotInferenceClient
 ):
     """Create robot tools that use the specific robot instance."""
 
@@ -120,27 +120,17 @@ def create_robot_tools(
         elif pose == "remote":
             robot_instance.move_to_remote_pose()
 
-        for i in tqdm(range(actions_to_execute), desc="Executing actions"):
-            images = robot_instance.get_current_images()
-            prev_state = robot_instance.get_current_state()
-            action = gr00t_client_instance.get_action(images=images, state=prev_state)
-
-            # Interpolate actions for smooth transition
-            single_arm_interp, gripper_interp = (
-                robot_instance.interpolate_actions_with_prev_state(prev_state, action)
+        for _ in tqdm(range(actions_to_execute), desc="Executing actions"):
+            # New observation -> policy -> action flow using updated interfaces
+            observation_dict = robot_instance.get_observation()
+            action_list = gr00t_client_instance.get_action(
+                observation_dict, gr00t_client_instance.language_instruction
             )
 
-            for i in range(len(single_arm_interp)):
-                concat_action = np.concatenate(
-                    [
-                        np.atleast_1d(single_arm_interp[i]),
-                        np.atleast_1d(gripper_interp[i]),
-                    ],
-                    axis=0,
-                )
-                assert concat_action.shape == (6,), concat_action.shape
-                robot_instance.set_target_state(torch.from_numpy(concat_action))
-                time.sleep(0.005)  # or a smaller value for smoother motion
+            # Execute a short horizon for stability
+            for action_dict in action_list[:8]:
+                robot_instance.set_target_state(action_dict)
+                time.sleep(0.01)
 
         time.sleep(0.5)
         return robot_instance.get_current_images()
@@ -206,7 +196,7 @@ class SO10xRobotAgent(IRobotAgent):
 
     def __init__(
         self,
-        robot_instance: SO100Robot,
+        robot_instance: SO10xRobot,
         gr00t_client_instance: Optional[Gr00tRobotInferenceClient] = None,
         model_id: str = DEFAULT_MODEL_ID,
         region_name: str = "us-west-2",
@@ -520,7 +510,7 @@ class SO10xRobotAgent(IRobotAgent):
 
 
 def create_robot_agent(
-    robot_instance: SO100Robot,
+    robot_instance: SO10xRobot,
     gr00t_client_instance: Optional[Gr00tRobotInferenceClient] = None,
     model_id: str = DEFAULT_MODEL_ID,
     region_name: str = "us-west-2",
@@ -551,6 +541,7 @@ def create_robot_agent_with_config(
     enable_camera: bool = True,
     wrist_cam_idx: int = 2,
     front_cam_idx: int = 0,
+    port: Optional[str] = None,
     model_id: str = DEFAULT_MODEL_ID,
     region_name: str = "us-west-2",
     callback_handler: Optional[Callable] = None,
@@ -565,14 +556,19 @@ def create_robot_agent_with_config(
         enable_camera: Whether to enable camera support
         wrist_cam_idx: Wrist camera index
         front_cam_idx: Front camera index
+        port: Serial port for the arm
         model_id: The model ID to use for the agent
         region_name: AWS region name
         callback_handler: Optional callback handler for agent events
     """
-    robot_instance = SO100Robot(
+    if port is None:
+        raise ValueError("`port` is required for create_robot_agent_with_config")
+
+    robot_instance = SO10xRobot(
         enable_camera=enable_camera,
         wrist_cam_idx=wrist_cam_idx,
         front_cam_idx=front_cam_idx,
+        robot_port=port,
     )
     gr00t_instance = Gr00tRobotInferenceClient()
 
@@ -586,7 +582,7 @@ def create_robot_agent_with_config(
 
 
 def create_mock_robot_agent(
-    mock_robot: Optional[SO100Robot] = None,
+    mock_robot: Optional[SO10xRobot] = None,
     mock_gr00t: Optional[Gr00tRobotInferenceClient] = None,
     model_id: str = DEFAULT_MODEL_ID,
     region_name: str = "us-west-2",
@@ -607,7 +603,7 @@ def create_mock_robot_agent(
     from unittest.mock import Mock
 
     if mock_robot is None:
-        mock_robot = Mock(spec=SO100Robot)
+        mock_robot = Mock(spec=SO10xRobot)
         mock_robot.activate.return_value.__enter__ = Mock(return_value=mock_robot)
         mock_robot.activate.return_value.__exit__ = Mock(return_value=None)
         mock_robot.get_current_images.return_value = None
@@ -631,11 +627,22 @@ if __name__ == "__main__":
     setup_robot_logging(log_level="INFO", include_timestamps=False)
 
     async def main():
+        import argparse
+
+        parser = argparse.ArgumentParser(description="Run SO-ARM10x agent")
+        parser.add_argument("--port", type=str, required=True, help="Serial port for the arm (e.g., /dev/tty.usbmodemXXXX)")
+        parser.add_argument("--wrist_cam_idx", type=int, default=0)
+        parser.add_argument("--front_cam_idx", type=int, default=1)
+        args = parser.parse_args()
+
         user_query = input("Enter your instruction: ")
 
-        # Create agent with default configuration
-        robot_instance = SO100Robot(
-            enable_camera=True, wrist_cam_idx=2, front_cam_idx=0
+        # Create agent with provided configuration
+        robot_instance = SO10xRobot(
+            enable_camera=True,
+            wrist_cam_idx=args.wrist_cam_idx,
+            front_cam_idx=args.front_cam_idx,
+            robot_port=args.port,
         )
         so10x_agent = create_robot_agent(robot_instance=robot_instance)
 

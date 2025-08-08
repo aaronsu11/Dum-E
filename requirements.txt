@@ -2,6 +2,8 @@ python-dotenv
 loguru
 uvicorn
 fastapi
+matplotlib
+pyzmq
 pipecat-ai[webrtc,daily,silero,deepgram,anthropic,elevenlabs]==0.0.71
 pipecat-ai-small-webrtc-prebuilt
 strands-agents[anthropic]==0.1.7

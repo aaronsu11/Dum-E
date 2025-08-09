@@ -22,7 +22,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Literal, Optional
 
 import cv2
 import numpy as np
-import torch
+from dotenv import load_dotenv
 from loguru import logger
 from strands import Agent, tool
 from strands.models.anthropic import AnthropicModel
@@ -48,12 +48,14 @@ from interfaces import (
 )
 from logging_config import create_clean_callback_handler, setup_robot_logging
 
+load_dotenv()
+
 # Model configuration
 DEFAULT_MODEL_ID = "claude-sonnet-4-20250514"
 
 
 def image_to_jpeg_bytes(
-    image: np.ndarray, save: bool = True, silent: bool = False
+    image: np.ndarray, save: bool = False, verbose: bool = False
 ) -> bytes:
     """Convert a numpy image (HWC, RGB or BGR) to JPEG bytes."""
     # If image is RGB, convert to BGR for OpenCV
@@ -72,7 +74,7 @@ def image_to_jpeg_bytes(
             os.makedirs(folder)
         image_path = f"{folder}/image_{timestamp}.jpg"
         cv2.imwrite(image_path, img_bgr)
-        if not silent:
+        if verbose:
             logger.info(f"📷 Saved image: {image_path}")
     return buffer.tobytes()
 
@@ -97,8 +99,8 @@ def create_robot_tools(
     def assess_situation() -> dict:
         """Assess the situation at the current state"""
         images = robot_instance.get_current_images()
-        top_image_bytes = image_to_jpeg_bytes(images["front"], silent=True)
-        arm_image_bytes = image_to_jpeg_bytes(images["wrist"], silent=True)
+        front_image_bytes = image_to_jpeg_bytes(images["front"], verbose=False)
+        wrist_image_bytes = image_to_jpeg_bytes(images["wrist"], verbose=False)
 
         return {
             "status": "success",
@@ -106,47 +108,49 @@ def create_robot_tools(
                 {
                     "text": f"Taken picture from the front camera and wrist camera as follows:"
                 },
-                {"image": {"format": "jpeg", "source": {"bytes": top_image_bytes}}},
-                {"image": {"format": "jpeg", "source": {"bytes": arm_image_bytes}}},
+                {"image": {"format": "jpeg", "source": {"bytes": front_image_bytes}}},
+                {"image": {"format": "jpeg", "source": {"bytes": wrist_image_bytes}}},
             ],
         }
 
     def pick(
         actions_to_execute: int = 10,
-        pose: Literal["initial", "remote", "resume"] = "resume",
+        pose: Literal["initial", "resume"] = "resume",
+        language_instruction: Optional[str] = None,
     ) -> dict:
         if pose == "initial":
             robot_instance.move_to_initial_pose()
-        elif pose == "remote":
-            robot_instance.move_to_remote_pose()
+            robot_instance.move_to_ready_pose()
 
         for _ in tqdm(range(actions_to_execute), desc="Executing actions"):
             # New observation -> policy -> action flow using updated interfaces
             observation_dict = robot_instance.get_observation()
             action_list = gr00t_client_instance.get_action(
-                observation_dict, gr00t_client_instance.language_instruction
+                observation_dict,
+                language_instruction or gr00t_client_instance.language_instruction,
             )
 
             # Execute a short horizon for stability
-            for action_dict in action_list[:8]:
+            for action_dict in action_list:
                 robot_instance.set_target_state(action_dict)
-                time.sleep(0.01)
+                time.sleep(0.05)
 
         time.sleep(0.5)
         return robot_instance.get_current_images()
 
     @tool
-    def start_pick(location: Literal["plate", "table"]) -> dict:
-        """Start picking up a block from a given location"""
-        gr00t_client_instance.set_lang_instruction(f"Pick up a lego block")
-        latest_images = pick(pose="initial" if location == "table" else "remote")
-        image_bytes = image_to_jpeg_bytes(latest_images["front"], silent=True)
+    def start_pick(item: Literal["a banana", "an apple", "an orange"]) -> dict:
+        """Start picking up an item and put it on the plate"""
+        language_instruction = f"Grab {item} and put it on the plate"
+        gr00t_client_instance.set_lang_instruction(language_instruction)
+        latest_images = pick(pose="initial", language_instruction=language_instruction)
+        image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
 
         return {
             "status": "success",
             "content": [
                 {
-                    "text": f"Attempted pick-up from {location} with 10 steps. Current state:",
+                    "text": f"Attempted picking up {item} with 10 steps. Current state:",
                 },
                 {"image": {"format": "jpeg", "source": {"bytes": image_bytes}}},
             ],
@@ -154,9 +158,9 @@ def create_robot_tools(
 
     @tool
     def resume_pick():
-        """Resume picking up a block from a given location"""
+        """Resume picking up an item from a given location"""
         latest_images = pick(actions_to_execute=15, pose="resume")
-        image_bytes = image_to_jpeg_bytes(latest_images["front"], silent=True)
+        image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
 
         return {
             "status": "success",
@@ -169,16 +173,19 @@ def create_robot_tools(
         }
 
     @tool
-    def place(location: str):
-        """Place a block at a given location"""
-        robot_instance.release_at_remote_pose()
+    def place(location: Literal["left", "right"]):
+        """Place an item at a given location"""
+        robot_instance.release_at_remote_pose(location)
+        latest_images = robot_instance.get_current_images()
+        image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
 
         return {
             "status": "success",
             "content": [
                 {
-                    "text": f"Attempted to place the block on {location}.",
-                }
+                    "text": f"Attempted to place the item on {location}.",
+                },
+                {"image": {"format": "jpeg", "source": {"bytes": image_bytes}}},
             ],
         }
 
@@ -284,30 +291,29 @@ class SO10xRobotAgent(IRobotAgent):
             You are a robot assistant that performs pick and place tasks given a desired state.
             You have access to tools for:
             1. Assessing the current situation by taking pictures from cameras
-            2. Starting to pick up blocks from given locations  
-            3. Resuming pick operations from current location
-            4. Placing blocks at given locations (only when firmly grasped)
+            2. Starting to pick up a specific item
+            3. Resuming pick and place operations from current pose
+            4. Placing items at a given location (only when firmly grasped)
 
             Guidelines for task execution:
-            - Always assess the situation and create a step-by-step plan first
-            - Be very concise in responses (max 15 words) as the output will be converted to audio
-            - Don't use special characters in responses  
-            - Examine results of each tool call during picking
-            - Resume picking if object is not firmly grasped and lifted
-            - Only use place tool when object is securely held
-            - After each successful pick and place:
-              * Assess current state vs desired state
-              * Summarize what was accomplished
+            - Always assess the situation and create a plan first
+            - Examine results of each tool call during picking carefully and resume picking if target item is not yet delivered
+            - If you failed to grasp an item after 2 resume attempts and there is another item in the list, switch to the other item; if there is no other item, reset the robot to the initial pose and report the failure
+            - If you firmly grasped the item but failed to deliver it after 2 resume attempts, use the place tool to forcefully place the item on the plate
+            - After each pick and place attempt:
+              * Assess current situation very carefully against the desired state
+              * Briefly describe what was accomplished
               * Determine next steps if needed
               * Continue until desired state is achieved
+            - Be very concise in responses (max 15 words) and don't use special characters  
             
             Note: Colors in images may appear different due to reflections.
             """,
             callback_handler=self.callback_handler,
             trace_attributes={
                 "session.id": time.strftime("%Y-%m-%d"),
-                "user.id": "SO-ARM100",
-                "langfuse.tags": ["GR00T-N1-2B"],
+                "user.id": "SO-ARM101",
+                "langfuse.tags": ["GR00T-N1.5-3B"],
             },
         )
 
@@ -630,21 +636,44 @@ if __name__ == "__main__":
         import argparse
 
         parser = argparse.ArgumentParser(description="Run SO-ARM10x agent")
-        parser.add_argument("--port", type=str, required=True, help="Serial port for the arm (e.g., /dev/tty.usbmodemXXXX)")
+        parser.add_argument(
+            "--port",
+            type=str,
+            required=True,
+            help="Serial port for the arm (e.g., /dev/tty.usbmodemXXXX)",
+        )
+        parser.add_argument("--id", type=str, default="my_awesome_follower_arm")
         parser.add_argument("--wrist_cam_idx", type=int, default=0)
         parser.add_argument("--front_cam_idx", type=int, default=1)
+
+        parser.add_argument(
+            "--policy_host",
+            type=str,
+            default="localhost",
+            help="Host for the GR00T policy server",
+        )
+
+        parser.add_argument(
+            "--instruction",
+            type=str,
+            help="Robot instruction (will prompt for input if not provided)",
+        )
         args = parser.parse_args()
 
-        user_query = input("Enter your instruction: ")
+        user_query = args.instruction or input("Enter your instruction: ")
 
         # Create agent with provided configuration
         robot_instance = SO10xRobot(
-            enable_camera=True,
+            robot_port=args.port,
+            robot_id=args.id,
             wrist_cam_idx=args.wrist_cam_idx,
             front_cam_idx=args.front_cam_idx,
-            robot_port=args.port,
         )
-        so10x_agent = create_robot_agent(robot_instance=robot_instance)
+
+        gr00t_client_instance = Gr00tRobotInferenceClient(host=args.policy_host)
+        so10x_agent = create_robot_agent(
+            robot_instance=robot_instance, gr00t_client_instance=gr00t_client_instance
+        )
 
         logger.info(f"🎯 Processing query: {user_query}")
 

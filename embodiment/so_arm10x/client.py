@@ -31,14 +31,20 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pprint import pformat
 
 import draccus
 import matplotlib.pyplot as plt
 import numpy as np
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
-from lerobot.robots import Robot, RobotConfig, make_robot_from_config, so100_follower, so101_follower  # noqa: F401
+from lerobot.robots import (
+    Robot,
+    RobotConfig,
+    make_robot_from_config,
+    so100_follower,
+    so101_follower,
+)  # noqa: F401
 from lerobot.utils.utils import init_logging, log_say
 
 from policy.gr00t.service import ExternalRobotInferenceClient
@@ -63,7 +69,7 @@ class Gr00tRobotInferenceClient:
         camera_keys: Optional[List[str]] = None,
         robot_state_keys: Optional[List[str]] = None,
         show_images: bool = False,
-        language_instruction: str = "Grab a banana and put it on the plate",
+        language_instruction: Optional[str] = None,
     ) -> None:
         self.policy = ExternalRobotInferenceClient(host=host, port=port)
         self.camera_keys = camera_keys or ["wrist", "front"]
@@ -77,17 +83,21 @@ class Gr00tRobotInferenceClient:
         ]
         self.show_images = show_images
         self.language_instruction = language_instruction
-        assert len(self.robot_state_keys) == 6, (
-            f"robot_state_keys should be size 6, but got {len(self.robot_state_keys)}"
-        )
+        assert (
+            len(self.robot_state_keys) == 6
+        ), f"robot_state_keys should be size 6, but got {len(self.robot_state_keys)}"
         self.modality_keys = ["single_arm", "gripper"]
 
     def set_lang_instruction(self, lang_instruction: str) -> None:
         self.language_instruction = lang_instruction
 
-    def get_action(self, observation_dict: Dict[str, Any], lang: Optional[str] = None) -> List[Dict[str, float]]:
+    def get_action(
+        self, observation_dict: Dict[str, Any], lang: Optional[str] = None
+    ) -> List[Dict[str, float]]:
         # Build obs for policy
-        obs_dict: Dict[str, Any] = {f"video.{key}": observation_dict[key] for key in self.camera_keys}
+        obs_dict: Dict[str, Any] = {
+            f"video.{key}": observation_dict[key] for key in self.camera_keys
+        }
 
         if self.show_images:
             view_img({k: v for k, v in obs_dict.items() if k.startswith("video.")})
@@ -96,7 +106,9 @@ class Gr00tRobotInferenceClient:
         state = np.array([observation_dict[k] for k in self.robot_state_keys])
         obs_dict["state.single_arm"] = state[:5].astype(np.float64)
         obs_dict["state.gripper"] = state[5:6].astype(np.float64)
-        obs_dict["annotation.human.task_description"] = lang or self.language_instruction
+        obs_dict["annotation.human.task_description"] = (
+            lang or self.language_instruction
+        )
 
         # Add batch dim
         for k in list(obs_dict.keys()):
@@ -113,12 +125,18 @@ class Gr00tRobotInferenceClient:
         horizon = action_chunk[f"action.{self.modality_keys[0]}"].shape[0]
         for i in range(horizon):
             concat_action = np.concatenate(
-                [np.atleast_1d(action_chunk[f"action.{key}"][i]) for key in self.modality_keys],
+                [
+                    np.atleast_1d(action_chunk[f"action.{key}"][i])
+                    for key in self.modality_keys
+                ],
                 axis=0,
             )
             assert len(concat_action) == len(self.robot_state_keys)
             lerobot_actions.append(
-                {key: float(concat_action[idx]) for idx, key in enumerate(self.robot_state_keys)}
+                {
+                    key: float(concat_action[idx])
+                    for idx, key in enumerate(self.robot_state_keys)
+                }
             )
         return lerobot_actions
 
@@ -126,19 +144,46 @@ class Gr00tRobotInferenceClient:
 #################################################################################
 
 
+# Global figure and axis for continuous streaming
+_fig = None
+_ax = None
+
+
 def view_img(img, overlay_img=None):
     """
-    This is a matplotlib viewer since cv2.imshow can be flaky in lerobot env
+    This is a matplotlib viewer since cv2.imshow can be flaky in lerobot env.
+    Continuously streams images in the same window without creating new ones.
     """
+    global _fig, _ax
+
     if isinstance(img, dict):
         # stack the images horizontally
         img = np.concatenate([img[k] for k in img], axis=1)
 
-    plt.imshow(img)
-    plt.title("Camera View")
-    plt.axis("off")
-    plt.pause(0.001)  # Non-blocking show
-    plt.clf()  # Clear the figure for the next frame
+    # Calculate new dimensions while maintaining aspect ratio
+    h, w = img.shape[:2]
+    scale = max(720 / w, 720 / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    # Create figure and axis only once
+    if _fig is None or _ax is None:
+        _fig, _ax = plt.subplots(figsize=(new_w / 100, new_h / 100))
+        _ax.set_title("Camera View")
+        _ax.axis("off")
+        plt.ion()  # Turn on interactive mode
+        plt.show(block=False)
+
+    # Clear previous image and display new one
+    _ax.clear()
+    _ax.imshow(img)
+    _ax.set_title("Camera View")
+    _ax.axis("off")
+
+    # Update the display
+    _fig.canvas.draw()
+    _fig.canvas.flush_events()
+    plt.pause(0.001)  # Small pause to allow GUI to update
 
 
 # ============================================================================
@@ -157,13 +202,12 @@ class SO10xRobot:
         self,
         robot_type: str = "so101_follower",
         robot_port: Optional[str] = None,
+        robot_id: str = "my_awesome_follower_arm",
         *,
-        enable_camera: bool = True,
         wrist_cam_idx: int = 0,
         front_cam_idx: int = 1,
         use_degrees: bool = True,
         max_relative_target: Optional[int] = None,
-        robot_id: str = "my_awesome_follower_arm",
     ) -> None:
         if robot_port is None:
             robot_port = os.getenv("SO_ARM_PORT")
@@ -172,14 +216,14 @@ class SO10xRobot:
                     "Robot serial port is required. Set `port` or env `SO_ARM_PORT`."
                 )
 
-        cameras = (
-            {
-                "wrist": OpenCVCameraConfig(index_or_path=wrist_cam_idx, fps=30, width=640, height=480),
-                "front": OpenCVCameraConfig(index_or_path=front_cam_idx, fps=30, width=640, height=480),
-            }
-            if enable_camera
-            else {}
-        )
+        cameras = {
+            "wrist": OpenCVCameraConfig(
+                index_or_path=wrist_cam_idx, fps=30, width=640, height=480
+            ),
+            "front": OpenCVCameraConfig(
+                index_or_path=front_cam_idx, fps=30, width=640, height=480
+            ),
+        }
 
         # Build the appropriate config subclass for the chosen robot type
         if robot_type == "so101_follower":
@@ -257,29 +301,43 @@ class SO10xRobot:
 
     def move_to_initial_pose(self) -> None:
         # These target degrees mirror legacy behavior
-        self.set_target_state(np.array([0.0, -102, 96.0, 76.0, -90.0, 0.0], dtype=np.float64))
+        self.set_target_state(
+            np.array([0.0, -102, 96.0, 76.0, -90.0, 0.0], dtype=np.float64)
+        )
         time.sleep(1.0)
 
     def move_to_ready_pose(self) -> None:
-        self.set_target_state(np.array([0.0, -90, 75.0, 75.0, -90.0, 0.0], dtype=np.float64))
+        self.set_target_state(
+            np.array([0.0, -90, 75.0, 75.0, -90.0, 0.0], dtype=np.float64)
+        )
         time.sleep(1.0)
 
     def move_to_remote_pose(self) -> None:
-        self.set_target_state(np.array([0.0, 90.0, 90.0, 50.0, -90.0, 1.0], dtype=np.float64))
+        self.set_target_state(
+            np.array([0.0, 0.0, 0.0, 50.0, -90.0, 60.0], dtype=np.float64)
+        )
         time.sleep(1.0)
 
-    def release_at_remote_pose(self) -> None:
+    def release_at_remote_pose(self, location: Literal["left", "right"]) -> None:
+        """
+        This is a pre-defined sequence of poses that the robot will move to release the item relative to the front camera.
+        """
         gripper_state = float(self.get_current_state()[-1])
         random_offset = float(np.random.uniform(-5.0, 5.0))
+        if location == "left":
+            random_offset += 45.0
+        else:
+            random_offset -= 45.0
+
         sequence = [
-            [random_offset, 90.0, 90.0, 50.0, -90.0, gripper_state],
-            [random_offset, 60.0, 50.0, 50.0, -90.0, gripper_state],
-            [random_offset, 60.0, 50.0, 50.0, -90.0, min(gripper_state + 10.0, 60.0)],
-            [random_offset, 90.0, 90.0, 50.0, -90.0, min(gripper_state + 10.0, 60.0)],
+            [random_offset, 0.0, 0.0, 50.0, -90.0, gripper_state],
+            [random_offset, 45.0, -45.0, 50.0, -90.0, gripper_state],
+            [random_offset, 45.0, -45.0, 50.0, -90.0, min(gripper_state + 10.0, 60.0)],
+            [random_offset, 0.0, 0.0, 50.0, -90.0, min(gripper_state + 10.0, 60.0)],
         ]
         for state in sequence:
             self.set_target_state(np.array(state, dtype=np.float64))
-            time.sleep(0.6)
+            time.sleep(0.5)
         self.move_to_remote_pose()
 
     def get_observation(self) -> Dict[str, Any]:
@@ -307,12 +365,12 @@ class SO10xRobot:
                 target_state = target_state.detach().cpu().numpy()
             target_state = np.asarray(target_state, dtype=np.float64).reshape(-1)
             assert target_state.shape[0] == 6, "Expected 6-dof target state"
-            action_dict = {k: float(target_state[i]) for i, k in enumerate(self._state_keys)}
+            action_dict = {
+                k: float(target_state[i]) for i, k in enumerate(self._state_keys)
+            }
 
         sent = self.robot.send_action(action_dict)
         return {k: float(v) for k, v in sent.items()}
-def print_yellow(text):
-    print("\033[93m {}\033[00m".format(text))
 
 
 @dataclass
@@ -323,7 +381,7 @@ class EvalConfig:
     robot_port: str = "/dev/tty.usbmodem5A680102371"
     wrist_cam_idx: int = 0
     front_cam_idx: int = 1
-    
+
     # Policy/eval parameters
     policy_host: str = "localhost"
     policy_port: int = 5555
@@ -342,9 +400,8 @@ def eval(cfg: EvalConfig):
     # Step 1: Initialize the robot (wrapper)
     robot = SO10xRobot(
         robot_type=cfg.robot_type,
-        robot_id=cfg.robot_id,
         robot_port=cfg.robot_port,
-        enable_camera=True,
+        robot_id=cfg.robot_id,
         wrist_cam_idx=cfg.wrist_cam_idx,
         front_cam_idx=cfg.front_cam_idx,
     )
@@ -369,6 +426,7 @@ def eval(cfg: EvalConfig):
         port=cfg.policy_port,
         camera_keys=camera_keys,
         robot_state_keys=robot_state_keys,
+        show_images=cfg.show_images,
     )
     log_say(
         "Initializing policy client with language instruction: " + language_instruction,
@@ -391,11 +449,13 @@ def eval(cfg: EvalConfig):
                 horizon = min(cfg.action_horizon, len(action_list))
                 for i in range(horizon):
                     action_dict = action_list[i]
-                    print("action_dict", action_dict.keys())
+                    print("action_dict", action_dict.values())
                     robot.set_target_state(action_dict)
                     time.sleep(0.05)
     except KeyboardInterrupt:
-        logging.info("KeyboardInterrupt received. Disconnecting robot and exiting eval.")
+        logging.info(
+            "KeyboardInterrupt received. Disconnecting robot and exiting eval."
+        )
         # Context manager handles disconnect
 
 

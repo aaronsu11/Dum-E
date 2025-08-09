@@ -11,7 +11,13 @@ streaming pattern. Key improvements include:
 - Tool registry integration
 
 Example usage (from the root directory):
-    python -m embodiment.so_arm10x.agent --port /dev/tty.usbmodem5A680102371 --wrist_cam_idx 0 --front_cam_idx 1
+python -m embodiment.so_arm10x.agent \
+    --port /dev/ttyACM0 \
+    --id so101_follower_arm \
+    --wrist_cam_idx 0 \
+    --front_cam_idx 1 \
+    --policy_host localhost \
+    --instruction "I want one banana and one apple on the plate"
 """
 
 import asyncio
@@ -97,7 +103,7 @@ def create_robot_tools(
 
     @tool
     def assess_situation() -> dict:
-        """Assess the situation at the current state"""
+        """Assess the situation of the current state"""
         images = robot_instance.get_current_images()
         front_image_bytes = image_to_jpeg_bytes(images["front"], verbose=False)
         wrist_image_bytes = image_to_jpeg_bytes(images["wrist"], verbose=False)
@@ -287,28 +293,27 @@ class SO10xRobotAgent(IRobotAgent):
         agent = Agent(
             model=model,
             tools=self._robot_tools,
-            system_prompt="""
-            You are a robot assistant that performs pick and place tasks given a desired state.
-            You have access to tools for:
-            1. Assessing the current situation by taking pictures from cameras
-            2. Starting to pick up a specific item
-            3. Resuming pick and place operations from current pose
-            4. Placing items at a given location (only when firmly grasped)
+            system_prompt="""\
+You are a robot assistant that performs pick and place tasks given a desired state.
+You have access to tools for:
+1. Assessing the current situation by taking pictures from cameras
+2. Starting to pick up a specific item
+3. Resuming pick and place operations from current pose
+4. Placing items at a given location (only when firmly grasped)
 
-            Guidelines for task execution:
-            - Always assess the situation and create a plan first
-            - Examine results of each tool call during picking carefully and resume picking if target item is not yet delivered
-            - If you failed to grasp an item after 2 resume attempts and there is another item in the list, switch to the other item; if there is no other item, reset the robot to the initial pose and report the failure
-            - If you firmly grasped the item but failed to deliver it after 2 resume attempts, use the place tool to forcefully place the item on the plate
-            - After each pick and place attempt:
-              * Assess current situation very carefully against the desired state
-              * Briefly describe what was accomplished
-              * Determine next steps if needed
-              * Continue until desired state is achieved
-            - Be very concise in responses (max 15 words) and don't use special characters  
-            
-            Note: Colors in images may appear different due to reflections.
-            """,
+Guidelines for task execution:
+- Always assess the situation and create a plan first
+- Examine results of each tool call during picking carefully and resume picking if target item is not yet delivered
+- If you failed to grasp an item after 2 resume attempts and there is another item in the list, switch to the other item; if there is no other item, reset the robot to the initial pose and report the failure
+- If you firmly grasped the item but failed to deliver it after 2 resume attempts, use the place tool to forcefully place the item on the plate
+- After each pick and place attempt:
+    * Assess the current situation carefully against the desired state
+    * Briefly describe what was accomplished
+    * Determine next steps if needed
+    * Continue or repeat until desired state is achieved
+- Be very concise in responses (max 15 words) and don't use special characters  
+
+Note: Colors in images may appear different due to reflections.""",
             callback_handler=self.callback_handler,
             trace_attributes={
                 "session.id": time.strftime("%Y-%m-%d"),
@@ -432,7 +437,14 @@ class SO10xRobotAgent(IRobotAgent):
                     yield enriched_event
 
                 # Reset to initial pose after completion
-                self._robot_instance.move_to_initial_pose()
+                try:
+                    self._robot_instance.move_to_initial_pose()
+                    time.sleep(1.0)
+                except Exception as pose_error:
+                    # Log the error but don't fail the task - it already completed successfully
+                    logger.warning(
+                        f"⚠️  Failed to reset to initial pose in time after task completion: {pose_error}"
+                    )
 
             await self.task_manager.update_task_status(task_id, TaskStatus.COMPLETED)
 

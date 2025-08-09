@@ -90,8 +90,8 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
     ```bash
     # conda activate dum-e
     cd lerobot
-    # use the stable version up to 5th June 2025 before hardware API redesign
-    git checkout b536f47e3ff8c3b340fc5efa52f0ece0a7212a57
+    # use the tested version on 9th August 2025
+    git checkout 0878c6880fa4fbadf0742751cf7b015f2d63a769
     # install with the feetech extension (for SO-ARM10x)
     pip install -e ".[feetech]"
     ```
@@ -102,13 +102,15 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
     ```bash
     # conda activate dum-e
     cd ../Isaac-GR00T
+    # use the tested version on 7th Aug 2025
+    git checkout ae7d46f02cdca5d9c80efc446fe41fe2b58e94c7
     pip install --upgrade setuptools
     pip install -e .[base]
     pip install --no-build-isolation flash-attn==2.7.1.post4
     ```
-    Download a fine-tuned GR00T model from Hugging Face for the task you want to perform. For example, to pick up an orange lego block as shown in our demo, you can download our checkpoint by running:
+    Download a fine-tuned GR00T model from Hugging Face for the task you want to perform. For example, to pick up a fruit (apple, banana, orange, etc.) and put it on the plate, you can download our checkpoint by running:
     ```bash
-    huggingface-cli download aaronsu11/GR00T-N1.5-3B-FT-PICK-0613 --local-dir ./GR00T-N1.5-3B-FT-PICK --exclude "optimizer.pt"
+    hf download aaronsu11/GR00T-N1.5-3B-FT-FRUIT-0809 --local-dir ./GR00T-N1.5-3B-FT --exclude "optimizer.pt"
     ```
 
 #### 🦾 Dum-E
@@ -134,7 +136,7 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
     cd <path-to-Isaac-GR00T>
     python scripts/inference_service.py \
     --server \
-    --model_path ./GR00T-N1.5-3B-FT-PICK \
+    --model_path ./GR00T-N1.5-3B-FT \
     --embodiment_tag new_embodiment \
     --data_config so100_dualcam
     ```
@@ -142,15 +144,16 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
 
 4. **Test policy execution**
     
-    Back in the Dum-E terminal/repository, run the following command by replacing the `<wrist_cam_idx>` and `<front_cam_idx>` with your own actual camera indices:
+    Back in the Dum-E terminal/repository, run the following command by replacing `<robot_serial_port>`, `<wrist_cam_idx>` and `<front_cam_idx>` with your own port and camera indices:
     ```bash
     python -m embodiment.so_arm10x.client \
-    --use_policy \
-    --host 0.0.0.0 \
-    --port 5555 \
-    --wrist_cam_idx <wrist_cam_idx> \
-    --front_cam_idx <front_cam_idx> \
-    --lang_instruction "Pick up the lego block."
+        --robot_port <robot_serial_port> \
+        --robot_type so101_follower \
+        --robot_id so101_follower_arm \
+        --wrist_cam_idx <wrist_cam_idx> \
+        --front_cam_idx <front_cam_idx> \
+        --policy_host localhost \
+        --lang_instruction "Grab a banana and put it on the plate"
     ```
 
 5. **Environment Configuration**
@@ -168,7 +171,13 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
 
     Once the policy is working, you can test the robot agent with text instructions by running the following command:
     ```bash
-    python -m embodiment.so_arm10x.agent
+    python -m embodiment.so_arm10x.agent \
+        --port <robot_serial_port> \
+        --id so101_follower_arm \
+        --wrist_cam_idx <wrist_cam_idx> \
+        --front_cam_idx <front_cam_idx> \
+        --policy_host localhost \
+        --instruction "<your-instruction>"
     ```
 
 7. **Start Dum-E**
@@ -223,7 +232,7 @@ graph TB
 
 1. **Voice Interaction** → Voice / Vision Streams → Pipecat → Conversation and Task Delegation
 2. **Task Planning** → Task Manager → Reasoning VLM → Multi-step Instruction Breakdown  
-3. **Task Execution** → Tool Registry → Hardware Interface → SO100Robot
+3. **Task Execution** → Tool Registry → Hardware Interface → SO10xRobot
 4. **Robot Control** → Camera Images → DL Policy / Classical Control → Joint Commands
 5. **Feedback Loop** → Progress Events → Model Context → Voice Updates
 
@@ -241,8 +250,8 @@ graph TB
 - [ ] **Local Model Support**
   - [ ] Integration with Ollama for local language model inference
 
-- [ ] **Upgrade Dependency**
-  - [ ] LeRobot new hardware APIs
+- [x] **Upgrade Dependency**
+  - [x] LeRobot new hardware APIs
 
 ### Q4 2025
 

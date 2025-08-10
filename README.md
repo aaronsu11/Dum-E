@@ -40,20 +40,35 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
 
 ## 🚀 Get Started
 
-### ⚙️ Recommended System Requirements
+This project supports two deployment patterns:
 
-#### Hardware
-- **Robot**: SO100/101 robotic arm assembled with a wrist camera
-- **Webcam**: External 1080p USB webcam for flexible vision input
-- **GPU**: RTX 3060 (12GB VRAM) or better for local policy inference
+1. **Single Workstation**: Run everything locally on a single machine with GPU
+2. **Client-Server**: Run policy server on a remote GPU machine while keeping lightweight client components local, useful when your local machine doesn't meet the GPU requirements
 
-#### Software
+Choose the setup that best matches your needs and hardware availability. The following sections will guide you through the installation process.
+
+### ⚙️ System Requirements 
+
+#### Common
+
+- **Robot**: SO100/101 robotic arm assembled with wrist camera
+- **Webcam**: 640p+ USB webcam for additional vision input
+
+#### For Single Workstation
+
+- **GPU**: Nvidia RTX 3060 (12GB VRAM) or better for local policy inference
 - **OS**: Linux (Ubuntu 22.04+) or Windows with WSL2
-- **Python**: 3.10
+
+#### For Client-Server
+
+- **Server**: Any machine with 12GB+ VRAM Nvidia GPU, e.g. EC2 g4dn/g5/g6
+- **Client**: Any machine with 4GB+ RAM
+- **OS**: Any OS (MacOS/Windows/Linux)
 
 ### 🔧 Installation
 
-#### 📦 Prerequisites
+#### 📦 For Single Workstation and Server
+> Requires 1) Nvidia GPU 2) Linux or WSL2
 
 1. Install required system dependencies
 
@@ -71,39 +86,27 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
     sudo apt-get -y install cuda-toolkit-12-4
     ```
 
-3. Create a new [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.10, for example:
+3. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.10 for policy server:
 
     ```bash
-    conda create -n dum-e python=3.10
-    conda activate dum-e
+    conda create -y -n dum-e-server python=3.10
+    conda activate dum-e-server
     ```
 
-4. Download LeRobot and Isaac-GR00T source code:
+4. Clone Isaac-GR00T repository:
 
     ```bash
-    git clone https://github.com/huggingface/lerobot.git
     git clone https://github.com/NVIDIA/Isaac-GR00T
     ```
 
-5. Make sure you are in the conda / venv environment and install LeRobot:
+5. Install Isaac-GR00T:
 
     ```bash
-    # conda activate dum-e
-    cd lerobot
-    # use the tested version on 9th August 2025
-    git checkout 0878c6880fa4fbadf0742751cf7b015f2d63a769
-    # install with the feetech extension (for SO-ARM10x)
-    pip install -e ".[feetech]"
-    ```
-    Calibrate the robot following the instructions for [SO-100](https://github.com/huggingface/lerobot/blob/b536f47e3ff8c3b340fc5efa52f0ece0a7212a57/examples/10_use_so100.md) or [SO-101](https://github.com/huggingface/lerobot/blob/b536f47e3ff8c3b340fc5efa52f0ece0a7212a57/examples/12_use_so101.md). If you already calibrated the robot before, you can simply copy and paste the `.cache` folder that includes `main_follower.json` to the root of the Dum-E repository later.
-
-6. Install Isaac-GR00T:
-
-    ```bash
-    # conda activate dum-e
-    cd ../Isaac-GR00T
+    cd Isaac-GR00T
     # use the tested version on 7th Aug 2025
     git checkout ae7d46f02cdca5d9c80efc446fe41fe2b58e94c7
+
+    # conda activate dum-e-server
     pip install --upgrade setuptools
     pip install -e .[base]
     pip install --no-build-isolation flash-attn==2.7.1.post4
@@ -113,50 +116,66 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
     hf download aaronsu11/GR00T-N1.5-3B-FT-FRUIT-0809 --local-dir ./GR00T-N1.5-3B-FT --exclude "optimizer.pt"
     ```
 
-#### 🦾 Dum-E
-
-1. **Clone the Repository**
-
-    ```bash
-    git clone https://github.com/aaronsu11/Dum-E.git
-    cd Dum-E
-    ```
-
-2. **Install Dum-E Dependencies**
+6. Start policy server
     
+    Run the following command to start the policy server:
     ```bash
-    # conda activate dum-e
-    pip install -r requirements.txt
-    ```
-
-3. **Start policy server**
-    
-    In a new terminal, run the following command to start a local policy server from the Isaac-GR00T repository:
-    ```bash
-    cd <path-to-Isaac-GR00T>
     python scripts/inference_service.py \
     --server \
     --model_path ./GR00T-N1.5-3B-FT \
     --embodiment_tag new_embodiment \
     --data_config so100_dualcam
     ```
-    This needs to be running in the background as long as you are using the policy for inference.
+    This needs to be running as long as you are using the policy for inference. Note down the IP address of the policy server (`<policy_server_ip>`) and make sure port 5555 is accessible from the client.
 
-4. **Test policy execution**
+#### For Single Workstation and Client
+
+1. Clone the Repository
+
+    ```bash
+    git clone https://github.com/aaronsu11/Dum-E.git
+    ```
+
+2. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.10 for dum-e client:
+    ```bash
+    conda create -y -n dum-e python=3.12
+    conda activate dum-e
+    ```
+
+3. Install Dum-E Dependencies
     
-    Back in the Dum-E terminal/repository, run the following command by replacing `<robot_serial_port>`, `<wrist_cam_idx>` and `<front_cam_idx>` with your own port and camera indices:
+    ```bash
+    cd Dum-E
+    # conda activate dum-e
+    pip install -r requirements.txt
+    ```
+
+    > If you have never set up SO-ARM before:
+    > - Find the `<wrist_cam_idx>` and `<front_cam_idx>` by running `lerobot-find-cameras`
+    > - Find the `<robot_serial_port>` of by running `lerobot-find-port`
+    > - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `<robot_id>`. For example with SO-101, run: `lerobot-calibrate --robot.type=so101_follower --robot.port=<robot_serial_port> --robot.id=<robot_id>`
+    
+
+4. Test policy execution
+    
+    > Default uses SO-ARM101 for the robot type.
+    Run the following command by replacing `<robot_serial_port>`, `<robot_id>`, `<wrist_cam_idx>`, `<front_cam_idx>` and `<policy_server_ip>` with your own serial port, robot id, wrist camera index, front camera index and policy server IP (use `localhost` for single workstation):
     ```bash
     python -m embodiment.so_arm10x.client \
         --robot_port <robot_serial_port> \
         --robot_type so101_follower \
-        --robot_id so101_follower_arm \
+        --robot_id <robot_id> \
         --wrist_cam_idx <wrist_cam_idx> \
         --front_cam_idx <front_cam_idx> \
-        --policy_host localhost \
+        --policy_host <policy_server_ip> \
         --lang_instruction "Grab a banana and put it on the plate"
     ```
 
-5. **Environment Configuration**
+    > If the robot is not moving, check if the policy server is running and the port is accessible from the client by running 
+    > * `nc -zv <policy_server_ip> 5555` (on MacOS/Linux) or 
+    > * `Test-NetConnection -ComputerName <policy_server_ip> -Port 5555` (on Windows PowerShell).
+
+5. Environment configuration for agent and voice
 
     Sign up for free accounts at [ElevenLabs](https://elevenlabs.io/), [Deepgram](https://deepgram.com/), [Anthropic](https://www.anthropic.com/api) and obtain the API keys. Then copy the environment template and update the `.env` file with your credentials:
     ```bash
@@ -167,20 +186,20 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
     - ElevenLabs API key for TTS  
     - Deepgram API key for STT
 
-6. **Test the robot agent**
+6. Test the robot agent
 
     Once the policy is working, you can test the robot agent with text instructions by running the following command:
     ```bash
     python -m embodiment.so_arm10x.agent \
         --port <robot_serial_port> \
-        --id so101_follower_arm \
+        --id <robot_id> \
         --wrist_cam_idx <wrist_cam_idx> \
         --front_cam_idx <front_cam_idx> \
-        --policy_host localhost \
+        --policy_host <policy_server_host> \
         --instruction "<your-instruction>"
     ```
 
-7. **Start Dum-E**
+7. Start Dum-E
 
     Finally, let's start Dum-E!
     ```bash

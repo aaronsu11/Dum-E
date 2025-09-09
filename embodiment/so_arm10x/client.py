@@ -1,545 +1,463 @@
 """
-This module provides client interfaces for interacting with the SO100 robot system.
+Unified client interfaces for interacting with the SO-ARM10x robots using the
+new LeRobot `robots` API, while preserving the legacy helper methods expected by
+the Dum-E agent. This module provides:
 
-It contains:
-- SO100Robot: A class for controlling the physical SO100 robot hardware, including camera
-  integration and motor control
-- Gr00tRobotInferenceClient: A client for connecting to the Gr00t robot inference service
-- Helper functions for visualizing robot camera feeds using matplotlib
+- SO10xRobot: thin wrapper around LeRobot's follower robots (SO-100/101) that
+  exposes convenience methods like `move_to_initial_pose`, `move_to_remote_pose`,
+  `release_at_remote_pose`, `get_current_images`, and `set_target_state`, built
+  on top of the new `Robot` API.
+- Gr00tRobotInferenceClient: policy client compatible with the new observation
+  schema but keeping a convenient `set_lang_instruction` and stable return
+  format.
 
-The module handles robot initialization, camera setup, movement control, and provides
-utilities for both direct hardware control and remote inference-based control.
+A lightweight eval entrypoint is kept for manual testing with the new API.
 
-This module can be run directly to test/evaluate a policy:
-
-Example usage (from the root directory):
-    # Test with policy inference
-    python -m embodiment.so_arm10x.client --use_policy --host 0.0.0.0  --port 5555 --wrist_cam_idx 2 --front_cam_idx 0 --lang_instruction "Pick up the lego block."
-
-    # Test with dataset playback
-    python -m embodiment.so_arm10x.client --dataset_path ~/datasets/so100_pick
-
-Command line arguments:
-    --use_policy: Enable policy-based control (default: False, uses dataset playback)
-    --dataset_path: Path to dataset for playback (default: ~/datasets/so100_pick)
-    --host: Inference server host (default: 10.110.17.183)
-    --port: Inference server port (default: 5555)
-    --action_horizon: Number of actions to execute per chunk (default: 12)
-    --actions_to_execute: Total number of actions to execute (default: 350)
-    --wrist_cam_idx: Camera index for wrist camera (default: 0)
-    --front_cam_idx: Camera index for front camera (default: 2)
-    --lang_instruction: Natural language instruction for the policy (default: "Pick up the lego block")
-    --record_imgs: Save camera images during execution (default: False)
+Example usage:
+```shell
+python -m embodiment.so_arm10x.client \
+    --robot_port /dev/tty.usbmodem5A680102371 \
+    --robot_type so101_follower \
+    --robot_id so101_follower_arm \
+    --wrist_cam_idx 0 \
+    --front_cam_idx 1 \
+    --policy_host 127.0.0.1 \
+    --lang_instruction "Grab a banana and put it on the plate"
+```
 """
 
+import logging
+import os
 import time
 from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Literal, Optional
+from pprint import pformat
 
-import cv2
+import draccus
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-from tqdm import tqdm
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.robot_devices.cameras.configs import OpenCVCameraConfig
-from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
-from lerobot.common.robot_devices.robots.configs import So100RobotConfig
-from lerobot.common.robot_devices.robots.utils import make_robot_from_config
-from lerobot.common.robot_devices.utils import (
-    RobotDeviceAlreadyConnectedError,
-    RobotDeviceNotConnectedError,
-)
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+from lerobot.robots import (
+    Robot,
+    RobotConfig,
+    make_robot_from_config,
+    so100_follower,
+    so101_follower,
+)  # noqa: F401
+from lerobot.utils.utils import init_logging, log_say
 
-# NOTE:
-# Sometimes we would like to abstract different env, or run this on a separate machine
-# User can just move this single python class method gr00t/eval/service.py
-# to their code or do the following line below
-# sys.path.append(os.path.expanduser("~/Isaac-GR00T/gr00t/eval/"))
 from policy.gr00t.service import ExternalRobotInferenceClient
 
 #################################################################################
 
 
-class SO100Robot:
+class Gr00tRobotInferenceClient:
+    """Wrapper for the Isaac-GR00T inference service compatible with the new
+    observation schema and Dum-E's expectations.
+
+    - Accepts `camera_keys` and `robot_state_keys` to build observations.
+    - Provides `set_lang_instruction` and stores `language_instruction`.
+    - `get_action` accepts a raw observation dict and returns a list of action dicts.
+    - `get_action_from_images_state` is a convenience for legacy flows.
+    """
+
     def __init__(
-        self, calibrate=False, enable_camera=False, wrist_cam_idx=0, front_cam_idx=2
-    ):
-        self.config = So100RobotConfig()
-        self.calibrate = calibrate
-        self.enable_camera = enable_camera
-        # self.cam_idx = cam_idx
-        if not enable_camera:
-            self.config.cameras = {}
-        else:
-            self.config.cameras = {
-                "wrist": OpenCVCameraConfig(wrist_cam_idx, 30, 640, 480, "rgb"),
-                "front": OpenCVCameraConfig(front_cam_idx, 30, 640, 480, "rgb"),
-            }
-        self.config.leader_arms = {}
+        self,
+        host: str = "localhost",
+        port: int = 5555,
+        camera_keys: Optional[List[str]] = None,
+        robot_state_keys: Optional[List[str]] = None,
+        show_images: bool = False,
+        language_instruction: Optional[str] = None,
+    ) -> None:
+        self.policy = ExternalRobotInferenceClient(host=host, port=port)
+        self.camera_keys = camera_keys or ["wrist", "front"]
+        self.robot_state_keys = robot_state_keys or [
+            "shoulder_pan.pos",
+            "shoulder_lift.pos",
+            "elbow_flex.pos",
+            "wrist_flex.pos",
+            "wrist_roll.pos",
+            "gripper.pos",
+        ]
+        self.show_images = show_images
+        self.language_instruction = language_instruction
+        assert (
+            len(self.robot_state_keys) == 6
+        ), f"robot_state_keys should be size 6, but got {len(self.robot_state_keys)}"
+        self.modality_keys = ["single_arm", "gripper"]
 
-        # remove the .cache/calibration/so100 folder
-        if self.calibrate:
-            import os
-            import shutil
+    def set_lang_instruction(self, lang_instruction: str) -> None:
+        self.language_instruction = lang_instruction
 
-            calibration_folder = os.path.join(
-                os.getcwd(), ".cache", "calibration", "so100"
+    def get_action(
+        self, observation_dict: Dict[str, Any], lang: Optional[str] = None
+    ) -> List[Dict[str, float]]:
+        # Build obs for policy
+        obs_dict: Dict[str, Any] = {
+            f"video.{key}": observation_dict[key] for key in self.camera_keys
+        }
+
+        if self.show_images:
+            view_img({k: v for k, v in obs_dict.items() if k.startswith("video.")})
+
+        # Pack state into arrays
+        state = np.array([observation_dict[k] for k in self.robot_state_keys])
+        obs_dict["state.single_arm"] = state[:5].astype(np.float64)
+        obs_dict["state.gripper"] = state[5:6].astype(np.float64)
+        obs_dict["annotation.human.task_description"] = (
+            lang or self.language_instruction
+        )
+
+        # Add batch dim
+        for k in list(obs_dict.keys()):
+            if isinstance(obs_dict[k], np.ndarray):
+                obs_dict[k] = obs_dict[k][np.newaxis, ...]
+            else:
+                obs_dict[k] = [obs_dict[k]]
+
+        # Query policy
+        action_chunk = self.policy.get_action(obs_dict)
+
+        # Convert to list of dict[str, float]
+        lerobot_actions: List[Dict[str, float]] = []
+        horizon = action_chunk[f"action.{self.modality_keys[0]}"].shape[0]
+        for i in range(horizon):
+            concat_action = np.concatenate(
+                [
+                    np.atleast_1d(action_chunk[f"action.{key}"][i])
+                    for key in self.modality_keys
+                ],
+                axis=0,
             )
-            print("========> Deleting calibration_folder:", calibration_folder)
-            if os.path.exists(calibration_folder):
-                shutil.rmtree(calibration_folder)
+            assert len(concat_action) == len(self.robot_state_keys)
+            lerobot_actions.append(
+                {
+                    key: float(concat_action[idx])
+                    for idx, key in enumerate(self.robot_state_keys)
+                }
+            )
+        return lerobot_actions
 
-        # Create the robot
-        self.robot = make_robot_from_config(self.config)
-        self.motor_bus = self.robot.follower_arms["main"]
+
+#################################################################################
+
+
+# Global figure and axis for continuous streaming
+_fig = None
+_ax = None
+
+
+def view_img(img, overlay_img=None):
+    """
+    This is a matplotlib viewer since cv2.imshow can be flaky in lerobot env.
+    Continuously streams images in the same window without creating new ones.
+    """
+    global _fig, _ax
+
+    if isinstance(img, dict):
+        # stack the images horizontally
+        img = np.concatenate([img[k] for k in img], axis=1)
+
+    # Calculate new dimensions while maintaining aspect ratio
+    h, w = img.shape[:2]
+    scale = max(720 / w, 720 / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    # Create figure and axis only once
+    if _fig is None or _ax is None:
+        _fig, _ax = plt.subplots(figsize=(new_w / 100, new_h / 100))
+        _ax.set_title("Camera View")
+        _ax.axis("off")
+        plt.ion()  # Turn on interactive mode
+        plt.show(block=False)
+
+    # Clear previous image and display new one
+    _ax.clear()
+    _ax.imshow(img)
+    _ax.set_title("Camera View")
+    _ax.axis("off")
+
+    # Update the display
+    _fig.canvas.draw()
+    _fig.canvas.flush_events()
+    plt.pause(0.001)  # Small pause to allow GUI to update
+
+
+# ============================================================================
+# Hardware wrapper built on new LeRobot API, exposing legacy helper methods
+# ============================================================================
+
+
+class SO10xRobot:
+    """Thin wrapper for SO-100/101 follower arms using the new LeRobot API.
+
+    Exposes convenience methods used by Dum-E while delegating to the underlying
+    `Robot` implementation.
+    """
+
+    def __init__(
+        self,
+        robot_type: str = "so101_follower",
+        robot_port: Optional[str] = None,
+        robot_id: str = "my_awesome_follower_arm",
+        *,
+        wrist_cam_idx: int = 0,
+        front_cam_idx: int = 1,
+        use_degrees: bool = True,
+        max_relative_target: Optional[int] = None,
+    ) -> None:
+        if robot_port is None:
+            robot_port = os.getenv("SO_ARM_PORT")
+            if not robot_port:
+                raise ValueError(
+                    "Robot serial port is required. Set `port` or env `SO_ARM_PORT`."
+                )
+
+        cameras = {
+            "wrist": OpenCVCameraConfig(
+                index_or_path=wrist_cam_idx, fps=30, width=640, height=480
+            ),
+            "front": OpenCVCameraConfig(
+                index_or_path=front_cam_idx, fps=30, width=640, height=480
+            ),
+        }
+
+        # Build the appropriate config subclass for the chosen robot type
+        if robot_type == "so101_follower":
+            from lerobot.robots.so101_follower import SO101FollowerConfig
+
+            self.config = SO101FollowerConfig(
+                id=robot_id,
+                port=robot_port,
+                cameras=cameras,
+                use_degrees=use_degrees,
+                max_relative_target=max_relative_target,
+            )
+        elif robot_type == "so100_follower":
+            # Fall back to SO-100 if desired
+            from lerobot.robots.so100_follower import SO100FollowerConfig  # type: ignore
+
+            self.config = SO100FollowerConfig(
+                id=robot_id,
+                port=robot_port,
+                cameras=cameras,
+                use_degrees=use_degrees,
+                max_relative_target=max_relative_target,
+            )
+        else:
+            raise ValueError(f"Unsupported robot_type: {robot_type}")
+
+        self.robot: Robot = make_robot_from_config(self.config)
+
+        # Cache ordering used for vector<->dict conversions
+        self._state_keys: List[str] = [
+            "shoulder_pan.pos",
+            "shoulder_lift.pos",
+            "elbow_flex.pos",
+            "wrist_flex.pos",
+            "wrist_roll.pos",
+            "gripper.pos",
+        ]
+
+    @property
+    def camera_keys(self) -> List[str]:
+        return list(self.robot.cameras.keys())
+
+    @property
+    def robot_state_keys(self) -> List[str]:
+        return list(self._state_keys)
 
     @contextmanager
     def activate(self):
+        self.connect()
         try:
-            self.connect()
-            # self.move_to_initial_pose()
-            # self.move_to_remote_pose()
-            yield
+            yield self
         finally:
             self.disconnect()
 
-    def connect(self):
-        if self.robot.is_connected:
-            raise RobotDeviceAlreadyConnectedError(
-                "ManipulatorRobot is already connected. Do not run `robot.connect()` twice."
-            )
+    def connect(self, calibrate: bool = True) -> None:
+        self.robot.connect(calibrate=calibrate)
+        # Apply our preferred preset on connect
+        self.set_so10x_robot_preset()
 
-        # Connect the arms
-        self.motor_bus.connect()
+    def disconnect(self) -> None:
+        self.robot.disconnect()
 
-        # We assume that at connection time, arms are in a rest position, and torque can
-        # be safely disabled to run calibration and/or set robot preset configurations.
-        self.motor_bus.write("Torque_Enable", TorqueMode.DISABLED.value)
+    # ------------------------ Convenience methods ------------------------
+    def set_so10x_robot_preset(self) -> None:
+        """Adjust controller gains to reduce shakiness. Best-effort with new API."""
+        try:
+            with self.robot.bus.torque_disabled():
+                for motor in self.robot.bus.motors:
+                    self.robot.bus.write("P_Coefficient", motor, 10)
+                    self.robot.bus.write("I_Coefficient", motor, 0)
+                    self.robot.bus.write("D_Coefficient", motor, 5)
+        except Exception:
+            # Keep silent if firmware/register names differ
+            pass
 
-        # Calibrate the robot
-        self.robot.activate_calibration()
-
-        self.set_so100_robot_preset()
-
-        # Enable torque on all motors of the follower arms
-        self.motor_bus.write("Torque_Enable", TorqueMode.ENABLED.value)
-        # Suppress verbose position logging
-        # print("robot present position:", self.motor_bus.read("Present_Position"))
-        self.robot.is_connected = True
-
-        self.wrist = self.robot.cameras["wrist"] if self.enable_camera else None
-        self.front = self.robot.cameras["front"] if self.enable_camera else None
-        if self.wrist is not None:
-            self.wrist.connect()
-        if self.front is not None:
-            self.front.connect()
-        # Suppress verbose connection logging
-        # print("================> SO100 Robot is fully connected =================")
-
-    def set_so100_robot_preset(self):
-        # Mode=0 for Position Control
-        self.motor_bus.write("Mode", 0)
-        # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-        # self.motor_bus.write("P_Coefficient", 16)
-        self.motor_bus.write("P_Coefficient", 10)
-        # Set I_Coefficient and D_Coefficient to default value 0 and 32
-        self.motor_bus.write("I_Coefficient", 0)
-        self.motor_bus.write("D_Coefficient", 32)
-        # Close the write lock so that Maximum_Acceleration gets written to EPROM address,
-        # which is mandatory for Maximum_Acceleration to take effect after rebooting.
-        self.motor_bus.write("Lock", 0)
-        # Set Maximum_Acceleration to 254 to speedup acceleration and deceleration of
-        # the motors. Note: this configuration is not in the official STS3215 Memory Table
-        self.motor_bus.write("Maximum_Acceleration", 254)
-        self.motor_bus.write("Acceleration", 254)
-
-    def move_to_initial_pose(self):
-        # current_state = self.robot.capture_observation()["observation.state"]
-        # print("current_state", current_state)
-        # print all keys of the observation
-        # print("observation keys:", self.robot.capture_observation().keys())
-        target_state = torch.tensor([0.0, 190.0, 165.0, 60.0, -90.0, 50.0])
-        self.robot.send_action(target_state)
-        time.sleep(1)
-        target_state = torch.tensor([0.0, 190.0, 177.0, 72.0, -90.0, 0.0])
-        # current_state = torch.tensor([90, 90, 90, 90, -70, 30])
-        self.robot.send_action(target_state)
-        time.sleep(1)
-
-    def move_to_remote_pose(self):
-        target_state = torch.tensor([0.0, 90.0, 90.0, 50.0, -90.0, 1.0])
-        self.robot.send_action(target_state)
-        time.sleep(2)
-
-    def release_at_remote_pose(self):
-        # get the gripper state value
-        gripper_state = self.get_current_state()[-1]
-        # random offset to avoid stacking the same object
-        random_offset = np.random.uniform(-5.0, 5.0)
-        target_state = torch.tensor(
-            [random_offset, 90.0, 90.0, 50.0, -90.0, gripper_state]
+    def move_to_initial_pose(self) -> None:
+        # These target degrees mirror legacy behavior
+        self.set_target_state(
+            np.array([0.0, -102, 96.0, 76.0, -90.0, 0.0], dtype=np.float64)
         )
-        self.robot.send_action(target_state)
-        time.sleep(1)
-        target_state = torch.tensor(
-            [random_offset, 60.0, 50.0, 50.0, -90.0, gripper_state]
+        time.sleep(1.0)
+
+    def move_to_ready_pose(self) -> None:
+        self.set_target_state(
+            np.array([0.0, -90, 75.0, 75.0, -90.0, 0.0], dtype=np.float64)
         )
-        self.robot.send_action(target_state)
-        time.sleep(1)
-        target_state = torch.tensor(
-            [random_offset, 60.0, 50.0, 50.0, -90.0, min(gripper_state + 10, 60)]
+        time.sleep(1.0)
+
+    def move_to_remote_pose(self) -> None:
+        self.set_target_state(
+            np.array([0.0, 0.0, 0.0, 50.0, -90.0, 60.0], dtype=np.float64)
         )
-        self.robot.send_action(target_state)
-        time.sleep(1)
-        target_state = torch.tensor(
-            [random_offset, 90.0, 90.0, 50.0, -90.0, min(gripper_state + 10, 60)]
-        )
-        self.robot.send_action(target_state)
-        time.sleep(1)
+        time.sleep(1.0)
+
+    def release_at_remote_pose(self, location: Literal["left", "right"]) -> None:
+        """
+        This is a pre-defined sequence of poses that the robot will move to release the item relative to the front camera.
+        """
+        gripper_state = float(self.get_current_state()[-1])
+        random_offset = float(np.random.uniform(-5.0, 5.0))
+        if location == "left":
+            random_offset += 45.0
+        else:
+            random_offset -= 45.0
+
+        sequence = [
+            [random_offset, 0.0, 0.0, 50.0, -90.0, gripper_state],
+            [random_offset, 45.0, -45.0, 50.0, -90.0, gripper_state],
+            [random_offset, 45.0, -45.0, 50.0, -90.0, min(gripper_state + 10.0, 60.0)],
+            [random_offset, 0.0, 0.0, 50.0, -90.0, min(gripper_state + 10.0, 60.0)],
+        ]
+        for state in sequence:
+            self.set_target_state(np.array(state, dtype=np.float64))
+            time.sleep(0.5)
         self.move_to_remote_pose()
 
-    def go_home(self):
-        # [ 88.0664, 156.7090, 135.6152,  83.7598, -89.1211,  16.5107]
-        home_state = torch.tensor(
-            [88.0664, 156.7090, 135.6152, 83.7598, -89.1211, 16.5107]
-        )
-        self.set_target_state(home_state)
-        time.sleep(2)
+    def get_observation(self) -> Dict[str, Any]:
+        return self.robot.get_observation()
 
-    def get_observation(self):
-        return self.robot.capture_observation()
+    def get_current_state(self) -> np.ndarray:
+        obs = self.get_observation()
+        return np.array([float(obs[k]) for k in self._state_keys], dtype=np.float64)
 
-    def get_current_state(self):
-        return self.get_observation()["observation.state"].data.numpy()
+    def get_current_images(self) -> Dict[str, np.ndarray]:
+        obs = self.get_observation()
+        images: Dict[str, np.ndarray] = {}
+        for cam in self.camera_keys:
+            images[cam] = obs[cam]
+        return images
 
-    def get_current_images(self) -> dict[str, np.ndarray]:
-        wrist_img = self.get_observation()["observation.images.wrist"].data.numpy()
-        front_img = self.get_observation()["observation.images.front"].data.numpy()
-        # convert bgr to rgb
-        # wrist_img = cv2.cvtColor(wrist_img, cv2.COLOR_BGR2RGB)
-        # front_img = cv2.cvtColor(front_img, cv2.COLOR_BGR2RGB)
-        return {"wrist": wrist_img, "front": front_img}
-
-    @staticmethod
-    def interpolate_actions(actions, num_interp=5):
-        """
-        Linearly interpolate between each pair of actions.
-        actions: np.ndarray of shape (N, D)
-        num_interp: number of interpolated points between each pair
-        Returns: np.ndarray of shape (N-1)*num_interp + 1, D
-        """
-        actions = np.asarray(actions)
-        if actions.ndim == 1:
-            actions = actions[:, None]  # Convert to (N, 1)
-        N, D = actions.shape
-        interp_actions = []
-        for i in range(N - 1):
-            start = actions[i]
-            end = actions[i + 1]
-            for alpha in np.linspace(0, 1, num_interp, endpoint=False):
-                interp_actions.append((1 - alpha) * start + alpha * end)
-        interp_actions.append(actions[-1])
-        return np.array(interp_actions)
-
-    @classmethod
-    def interpolate_actions_with_prev_state(
-        cls, prev_state, action, num_interp: int = 3
-    ):
-        """
-        Interpolates between the previous state and the predicted actions to ensure smooth transitions.
-
-        Args:
-            prev_state: The previous state array (length 6: 5 for single arm, 1 for gripper).
-            action: A dict with keys "action.single_arm" and "action.gripper".
-
-        Returns:
-            Tuple of (single_arm_interp, gripper_interp)
-        """
-        prev_single_arm = prev_state[:5]
-        prev_gripper = prev_state[5:]
-
-        single_arm_pred = action["action.single_arm"]
-        gripper_pred = action["action.gripper"].reshape(-1, 1)
-
-        # Interpolate between prev_state and first predicted action to avoid abrupt change
-        single_arm_first = np.vstack([prev_single_arm, single_arm_pred[0]])
-        gripper_first = np.vstack([prev_gripper, gripper_pred[0]])
-        single_arm_interp_first = cls.interpolate_actions(
-            single_arm_first, num_interp=10
-        )
-        gripper_interp_first = cls.interpolate_actions(gripper_first, num_interp=10)
-
-        # Interpolate between predicted actions to smooth out the actions
-        if len(single_arm_pred) > 1:
-            single_arm_interp_rest = cls.interpolate_actions(
-                single_arm_pred, num_interp=num_interp
-            )
-            gripper_interp_rest = cls.interpolate_actions(
-                gripper_pred, num_interp=num_interp
-            )
-            # Concatenate, skipping the first point of the rest to avoid duplicate
-            single_arm_interp = np.concatenate(
-                [single_arm_interp_first, single_arm_interp_rest[1:]], axis=0
-            )
-            gripper_interp = np.concatenate(
-                [gripper_interp_first, gripper_interp_rest[1:]], axis=0
-            )
+    def set_target_state(self, target_state: Any) -> Dict[str, float]:
+        """Accepts a 6-vector (np/torch) or a dict of `*.pos` keys."""
+        action_dict: Dict[str, float]
+        if isinstance(target_state, dict):
+            action_dict = {str(k): float(v) for k, v in target_state.items()}
         else:
-            single_arm_interp = single_arm_interp_first
-            gripper_interp = gripper_interp_first
+            # numpy / torch tensor
+            if hasattr(target_state, "detach"):
+                target_state = target_state.detach().cpu().numpy()
+            target_state = np.asarray(target_state, dtype=np.float64).reshape(-1)
+            assert target_state.shape[0] == 6, "Expected 6-dof target state"
+            action_dict = {
+                k: float(target_state[i]) for i, k in enumerate(self._state_keys)
+            }
 
-        return single_arm_interp, gripper_interp
-
-    def set_target_state(self, target_state: torch.Tensor):
-        self.robot.send_action(target_state)
-
-    def enable(self):
-        self.motor_bus.write("Torque_Enable", TorqueMode.ENABLED.value)
-
-    def disable(self):
-        self.motor_bus.write("Torque_Enable", TorqueMode.DISABLED.value)
-
-    def disconnect(self):
-        self.disable()
-        self.robot.disconnect()
-        self.robot.is_connected = False
-        # Suppress verbose disconnection logging
-        # print("================> SO100 Robot disconnected")
-
-    def __del__(self):
-        try:
-            self.disconnect()
-        except RobotDeviceNotConnectedError:
-            pass  # Already disconnected, nothing to do
-        except Exception:
-            pass  # Optionally ignore all exceptions during shutdown
+        sent = self.robot.send_action(action_dict)
+        return {k: float(v) for k, v in sent.items()}
 
 
-#################################################################################
+@dataclass
+class EvalConfig:
+    # SO-ARM10x robot configuration
+    robot_type: str = "so101_follower"
+    robot_id: str = "my_awesome_follower_arm"
+    robot_port: str = "/dev/tty.usbmodem5A680102371"
+    wrist_cam_idx: int = 0
+    front_cam_idx: int = 1
+
+    # Policy/eval parameters
+    policy_host: str = "localhost"
+    policy_port: int = 5555
+    action_horizon: int = 8
+    lang_instruction: str = "Grab a banana and put it on the plate"
+    play_sounds: bool = False
+    timeout: int = 60
+    show_images: bool = True
 
 
-class Gr00tRobotInferenceClient:
-    def __init__(
-        self,
-        host="localhost",
-        port=5555,
-        language_instruction="Pick up the lego block",
-    ):
-        self.language_instruction = language_instruction
-        # 480, 640
-        self.img_size = (480, 640)
-        self.policy = ExternalRobotInferenceClient(host=host, port=port)
+@draccus.wrap()
+def eval(cfg: EvalConfig):
+    init_logging()
+    logging.info(pformat(asdict(cfg)))
 
-    def get_action(self, images: dict[str, np.ndarray], state: np.ndarray):
-        obs_dict = {
-            "video.wrist": images["wrist"][np.newaxis, :, :, :],
-            "video.front": images["front"][np.newaxis, :, :, :],
-            "state.single_arm": state[:5][np.newaxis, :].astype(np.float64),
-            "state.gripper": state[5:6][np.newaxis, :].astype(np.float64),
-            "annotation.human.task_description": [self.language_instruction],
-        }
-        res = self.policy.get_action(obs_dict)
-        # print("Inference query time taken", time.time() - start_time)
-        return res
+    # Step 1: Initialize the robot (wrapper)
+    robot = SO10xRobot(
+        robot_type=cfg.robot_type,
+        robot_port=cfg.robot_port,
+        robot_id=cfg.robot_id,
+        wrist_cam_idx=cfg.wrist_cam_idx,
+        front_cam_idx=cfg.front_cam_idx,
+    )
+    # Safe connection and initial pose handled inside the eval loop via context manager
 
-    def sample_action(self):
-        obs_dict = {
-            "video.webcam": np.zeros(
-                (1, self.img_size[0], self.img_size[1], 3), dtype=np.uint8
-            ),
-            "state.single_arm": np.zeros((1, 5)),
-            "state.gripper": np.zeros((1, 1)),
-            "annotation.human.action.task_description": [self.language_instruction],
-        }
-        return self.policy.get_action(obs_dict)
+    # get camera/state keys
+    camera_keys = robot.camera_keys
+    print("camera_keys:", camera_keys)
 
-    def set_lang_instruction(self, lang_instruction):
-        self.language_instruction = lang_instruction
+    log_say("Initializing robot", cfg.play_sounds, blocking=True)
 
+    language_instruction = cfg.lang_instruction
 
-#################################################################################
+    # NOTE: for so100/so101, this should be:
+    # ['shoulder_pan.pos', 'shoulder_lift.pos', 'elbow_flex.pos', 'wrist_flex.pos', 'wrist_roll.pos', 'gripper.pos']
+    robot_state_keys = robot.robot_state_keys
+    print("robot_state_keys:", robot_state_keys)
 
+    # Step 2: Initialize the policy
+    policy = Gr00tRobotInferenceClient(
+        host=cfg.policy_host,
+        port=cfg.policy_port,
+        camera_keys=camera_keys,
+        robot_state_keys=robot_state_keys,
+        show_images=cfg.show_images,
+    )
+    log_say(
+        "Initializing policy client with language instruction: " + language_instruction,
+        cfg.play_sounds,
+        blocking=True,
+    )
 
-def view_img(img, img2=None):
-    """
-    This is a matplotlib viewer since cv2.imshow can be flaky in lerobot env
-    also able to overlay the image to ensure camera view is alligned to training settings
-    """
-    plt.imshow(img)
-    if img2 is not None:
-        plt.imshow(img2, alpha=0.5)
-    plt.axis("off")
-    plt.pause(0.001)  # Non-blocking show
-    plt.clf()  # Clear the figure for the next frame
+    # Step 3: Run the Eval Loop with safe connect/disconnect
+    try:
+        with robot.activate():
+            print("Current robot state:", robot.get_current_state())
+            robot.move_to_initial_pose()
+            robot.move_to_ready_pose()
 
+            while True:
+                observation_dict = robot.get_observation()
+                print("observation_dict", observation_dict.keys())
+                action_list = policy.get_action(observation_dict, language_instruction)
 
-def view_images(images_dict: dict[str, np.ndarray]):
-    """
-    Display multiple images side by side in the same window.
+                horizon = min(cfg.action_horizon, len(action_list))
+                for i in range(horizon):
+                    action_dict = action_list[i]
+                    print("action_dict", action_dict.values())
+                    robot.set_target_state(action_dict)
+                    time.sleep(0.05)
+    except KeyboardInterrupt:
+        logging.info(
+            "KeyboardInterrupt received. Disconnecting robot and exiting eval."
+        )
+        # Context manager handles disconnect
 
-    Args:
-        images_dict: Dictionary of {name: image} pairs to display
-    """
-    num_images = len(images_dict)
-    if num_images == 0:
-        return
-
-    # Use a specific figure ID to reuse the same window
-    fig = plt.figure(num=1, figsize=(5 * num_images, 5), clear=True)
-
-    # Create a grid of subplots
-    for i, (name, img) in enumerate(images_dict.items()):
-        ax = fig.add_subplot(1, num_images, i + 1)
-        ax.imshow(img)
-        ax.set_title(name)
-        ax.axis("off")
-
-    plt.tight_layout()
-    plt.pause(0.001)  # Non-blocking show
-
-
-#################################################################################
 
 if __name__ == "__main__":
-    import argparse
-    import os
-
-    default_dataset_path = os.path.expanduser("~/datasets/so100_pick")
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--use_policy", action="store_true"
-    )  # default is to playback the provided dataset
-    parser.add_argument("--dataset_path", type=str, default=default_dataset_path)
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=5555)
-    parser.add_argument("--action_horizon", type=int, default=12)
-    parser.add_argument("--actions_to_execute", type=int, default=350)
-    parser.add_argument("--wrist_cam_idx", type=int, default=0)
-    parser.add_argument("--front_cam_idx", type=int, default=2)
-    parser.add_argument(
-        "--lang_instruction", type=str, default="Pick up the lego block."
-    )
-    parser.add_argument("--record_imgs", action="store_true")
-    args = parser.parse_args()
-
-    # print lang_instruction
-    print("lang_instruction: ", args.lang_instruction)
-
-    ACTIONS_TO_EXECUTE = args.actions_to_execute
-    USE_POLICY = args.use_policy
-    ACTION_HORIZON = (
-        args.action_horizon
-    )  # we will execute only some actions from the action_chunk of 16
-    MODALITY_KEYS = ["single_arm", "gripper"]
-    if USE_POLICY:
-        client = Gr00tRobotInferenceClient(
-            host=args.host,
-            port=args.port,
-            language_instruction=args.lang_instruction,
-        )
-
-        if args.record_imgs:
-            # create a folder to save the images and delete all the images in the folder
-            os.makedirs("eval_images", exist_ok=True)
-            for file in os.listdir("eval_images"):
-                os.remove(os.path.join("eval_images", file))
-
-        robot = SO100Robot(
-            calibrate=False,
-            enable_camera=True,
-            wrist_cam_idx=args.wrist_cam_idx,
-            front_cam_idx=args.front_cam_idx,
-        )
-        image_count = 0
-        with robot.activate():
-            print(robot.get_current_state())
-            robot.move_to_initial_pose()
-            prev_state = robot.get_current_state()
-            for i in tqdm(range(ACTIONS_TO_EXECUTE), desc="Executing actions"):
-                images = robot.get_current_images()
-                view_images(images)
-                state = robot.get_current_state()
-                action = client.get_action(images=images, state=state)
-
-                # Interpolate actions for smooth transition
-                single_arm_interp, gripper_interp = (
-                    robot.interpolate_actions_with_prev_state(prev_state, action, 1)
-                )
-
-                start_time = time.time()
-
-                # Use interpolated actions (skip the first, which is prev_state)
-                for j in range(1, len(single_arm_interp)):
-                    # single_arm_interp[j][1] += 2
-                    # single_arm_interp[j][2] -= 2
-                    concat_action = np.concatenate(
-                        [
-                            np.atleast_1d(single_arm_interp[j]),
-                            np.atleast_1d(gripper_interp[j]),
-                        ],
-                        axis=0,
-                    )
-                    assert concat_action.shape == (6,), concat_action.shape
-                    robot.set_target_state(torch.from_numpy(concat_action))
-                    # time.sleep(0.005)
-
-                    # Skip viewing images to speed up the execution
-                    images = robot.get_current_images()
-                    view_images(images)
-
-                    if args.record_imgs:
-                        # resize the image to 320x240
-                        img = cv2.resize(
-                            cv2.cvtColor(images["front"], cv2.COLOR_RGB2BGR),
-                            (320, 240),
-                        )
-                        cv2.imwrite(f"eval_images/img_{image_count}.jpg", img)
-                        image_count += 1
-
-                    # 0.05*16 = 0.8 seconds
-                    print("executing action", j, "time taken", time.time() - start_time)
-
-                # Update prev_state for the next chunk
-                prev_state = concat_action
-
-                print("Action chunk execution time taken", time.time() - start_time)
-            print("Done all actions")
-            robot.go_home()
-            print("Done home")
-    else:
-        # Test Dataset Source https://huggingface.co/datasets/youliangtan/so100_strawberry_grape
-        dataset = LeRobotDataset(
-            repo_id="",
-            root=args.dataset_path,
-        )
-
-        robot = SO100Robot(
-            calibrate=False,
-            enable_camera=True,
-            wrist_cam_idx=args.wrist_cam_idx,
-            front_cam_idx=args.front_cam_idx,
-        )
-
-        with robot.activate():
-            print("Run replay of the dataset")
-            actions = []
-            for i in tqdm(range(ACTIONS_TO_EXECUTE), desc="Loading actions"):
-                action = dataset[i]["action"]
-                img = dataset[i]["observation.images.front"].data.numpy()
-                # original shape (3, 480, 640) for image data
-                realtime_img = robot.get_current_images()
-
-                img = img.transpose(1, 2, 0)
-                view_img(img, realtime_img["front"])
-                actions.append(action)
-                robot.set_target_state(action)
-                time.sleep(0.05)
-
-            # plot the actions
-            plt.plot(actions)
-            plt.show()
-
-            print("Done all actions")
-            robot.go_home()
-            print("Done home")
+    eval()

@@ -4,7 +4,7 @@ defined in interfaces.py. This implementation handle:
 - In-memory task management with async operations
 - Event publishing with filtering and history
 - Tool registry with categorization and execution
-- Hardware interface wrapper for SO100Robot
+- Hardware interface wrapper for SO10xRobot
 
 These implementations are designed to be robust, thread-safe, and suitable
 for production use while maintaining clean separation of concerns.
@@ -379,20 +379,20 @@ class InMemoryToolRegistry(IToolRegistry):
 
 class SO10xHardwareInterface(IHardwareInterface):
     """
-    Hardware interface wrapper for SO100Robot.
+    Hardware interface wrapper for SO10xRobot.
 
-    Provides async interface over the existing SO100Robot implementation,
+    Provides async interface over the existing SO10xRobot implementation,
     with connection management, error handling, and consistent state reporting.
-    This adapter allows the SO100Robot to be used through the standard
+    This adapter allows the SO10xRobot to be used through the standard
     IHardwareInterface without changing existing code.
     """
 
     def __init__(self, so100_robot):
         """
-        Initialize with existing SO100Robot instance.
+        Initialize with existing SO10xRobot instance.
 
         Args:
-            so100_robot: Configured SO100Robot instance
+            so100_robot: Configured SO10xRobot instance
         """
         self._robot = so100_robot
         self._connected = False
@@ -403,13 +403,13 @@ class SO10xHardwareInterface(IHardwareInterface):
         async with self._lock:
             try:
                 if not self._connected:
-                    # The SO100Robot connect is synchronous, so we run it in executor
+                    # The SO10xRobot connect is synchronous, so we run it in executor
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, self._robot.connect)
                     self._connected = True
-                    logger.info("SO100Robot connected successfully")
+                    logger.info("SO10xRobot connected successfully")
             except Exception as e:
-                logger.error(f"Failed to connect to SO100Robot: {str(e)}")
+                logger.error(f"Failed to connect to SO10xRobot: {str(e)}")
                 raise
 
     async def disconnect(self) -> None:
@@ -420,9 +420,9 @@ class SO10xHardwareInterface(IHardwareInterface):
                     loop = asyncio.get_event_loop()
                     await loop.run_in_executor(None, self._robot.disconnect)
                     self._connected = False
-                    logger.info("SO100Robot disconnected")
+                    logger.info("SO10xRobot disconnected")
             except Exception as e:
-                logger.error(f"Error during SO100Robot disconnect: {str(e)}")
+                logger.error(f"Error during SO10xRobot disconnect: {str(e)}")
                 # Don't re-raise disconnect errors
 
     async def is_connected(self) -> bool:

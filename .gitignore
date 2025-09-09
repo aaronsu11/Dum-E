@@ -193,5 +193,6 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
-# Debug files
+# Debug images
 sample_images/
+outputs/

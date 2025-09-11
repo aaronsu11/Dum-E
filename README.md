@@ -67,7 +67,7 @@ Choose the setup that best matches your needs and hardware availability. The fol
 
 ### 🔧 Installation
 
-#### 📦 For Single Workstation and Server
+#### 📦 On Single Workstation or Server
 > Requires 1) Nvidia GPU 2) Linux or WSL2
 
 1. Install required system dependencies
@@ -128,7 +128,7 @@ Choose the setup that best matches your needs and hardware availability. The fol
     ```
     This needs to be running as long as you are using the policy for inference. Note down the IP address of the policy server (`<policy_server_ip>`) and make sure port 5555 is accessible from the client.
 
-#### For Single Workstation and Client
+#### On Single Workstation or Client
 
 1. Clone the Repository
 

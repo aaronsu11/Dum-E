@@ -1,5 +1,5 @@
 """
-Abstract interfaces for the Iron Man Dum-E robotic system.
+Interfaces for the Dum-E robotic system.
 
 This module defines the core interfaces that enable modular, loosely-coupled
 components in the robotic assistant architecture. These interfaces support:
@@ -12,11 +12,16 @@ The interfaces follow the dependency inversion principle, allowing high-level
 modules to depend on abstractions rather than concrete implementations.
 """
 
+import logging
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
+from typing import Any, Iterator, AsyncIterator, Callable, Dict, List, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskStatus(Enum):
@@ -30,8 +35,8 @@ class TaskStatus(Enum):
     PAUSED = "paused"
 
 
-class EventType(Enum):
-    """Types of events that can be published during task execution."""
+class MessageType(Enum):
+    """Types of messages that can be published during task execution."""
 
     TASK_STARTED = "task_started"
     TASK_PROGRESS = "task_progress"
@@ -62,10 +67,10 @@ class TaskInfo:
 
 
 @dataclass
-class Event:
+class Message:
     """Event data structure for streaming updates."""
 
-    event_type: EventType
+    message_type: MessageType
     task_id: Optional[str]
     timestamp: datetime
     data: Dict[str, Any]
@@ -87,6 +92,44 @@ class ToolDefinition:
     category: str = "general"
 
 
+class IRobotController(ABC):
+    """
+    Interface for robot controller abstraction.
+
+    Provides a consistent interface for running predefined robot operations,
+    enabling different controller implementations or mock interfaces
+    for testing without changing higher-level code.
+    """
+
+    @abstractmethod
+    def connect(self) -> None:
+        """Establish connection to robot controller."""
+        pass
+
+    @abstractmethod
+    def disconnect(self) -> None:
+        """Disconnect from robot controller."""
+        pass
+
+    @contextmanager
+    def activate(self):
+        self.connect()
+        try:
+            yield self
+        finally:
+            self.disconnect()
+
+    @abstractmethod
+    def is_connected(self) -> bool:
+        """Check if robot controller is connected."""
+        pass
+
+    @abstractmethod
+    def get_observation(self) -> Dict[str, Any]:
+        """Get current robot controller observation (joint positions, etc.)."""
+        pass
+
+
 class IRobotAgent(ABC):
     """
     Interface for robot agent implementations.
@@ -102,7 +145,7 @@ class IRobotAgent(ABC):
         self, instruction: str, task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Execute a natural language instruction synchronously.
+        Execute a natural language instruction asynchronously.
 
         Args:
             instruction: Natural language command to execute
@@ -118,7 +161,7 @@ class IRobotAgent(ABC):
         self, instruction: str, task_id: Optional[str] = None
     ) -> AsyncIterator[Dict[str, Any]]:
         """
-        Execute instruction with streaming progress updates.
+        Execute instruction with streaming progress updates asynchronously.
 
         This method yields events during execution, compatible with Strands
         agents' streaming API. Events should include 'message' and/or 'data'
@@ -175,7 +218,7 @@ class IToolRegistry(ABC):
         pass
 
     @abstractmethod
-    async def execute_tool(
+    async def call_tool(
         self,
         name: str,
         parameters: Dict[str, Any],
@@ -232,81 +275,40 @@ class ITaskManager(ABC):
         pass
 
 
-class IEventPublisher(ABC):
+class IMessageBroker(ABC):
     """
-    Interface for publishing events during task execution.
+    Interface for publishing and subscribing to messages during task execution.
 
-    Enables real-time streaming of events to subscribers like the voice
-    assistant, MCP clients, or monitoring systems. Events can include
-    task progress, tool execution results, and streaming data.
+    Enables real-time streaming of events to subscribers like the ROS, MQTT, or monitoring systems.
+    Events can include task progress, tool execution results, and streaming data.
     """
 
     @abstractmethod
-    async def publish_event(self, event: Event) -> None:
-        """Publish an event to all subscribers."""
+    async def publish(self, message: Message) -> None:
+        """Publish a message to all subscribers."""
         pass
 
     @abstractmethod
     async def subscribe(
         self,
-        event_types: Optional[List[EventType]] = None,
+        message_types: Optional[List[MessageType]] = None,
         task_id: Optional[str] = None,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncIterator[Message]:
         """
-        Subscribe to events with optional filtering.
+        Subscribe to messages with optional filtering.
 
         Args:
-            event_types: Optional list of event types to filter
-            task_id: Optional task ID to filter events for specific task
+            message_types: Optional list of message types to filter
+            task_id: Optional task ID to filter messages for specific task
 
         Yields:
-            Event objects matching the filter criteria
+            Message objects matching the filter criteria
         """
         pass
 
     @abstractmethod
-    async def get_event_history(
+    async def get_message_history(
         self, task_id: Optional[str] = None, limit: Optional[int] = 100
-    ) -> List[Event]:
-        """Get historical events, optionally filtered by task ID."""
-        pass
-
-
-class IHardwareInterface(ABC):
-    """
-    Interface for hardware abstraction.
-
-    Provides a consistent interface for robot hardware operations,
-    enabling different hardware implementations or mock interfaces
-    for testing without changing higher-level code.
-    """
-
-    @abstractmethod
-    async def connect(self) -> None:
-        """Establish connection to hardware."""
-        pass
-
-    @abstractmethod
-    async def disconnect(self) -> None:
-        """Disconnect from hardware."""
-        pass
-
-    @abstractmethod
-    async def is_connected(self) -> bool:
-        """Check if hardware is connected."""
-        pass
-
-    @abstractmethod
-    async def get_current_state(self) -> Dict[str, Any]:
-        """Get current hardware state (joint positions, etc.)."""
-        pass
-
-    @abstractmethod
-    async def execute_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a hardware action and return result."""
-        pass
-
-    @abstractmethod
-    async def get_sensor_data(self) -> Dict[str, Any]:
-        """Get current sensor readings (cameras, etc.)."""
+    ) -> List[Message]:
+        """Get historical messages, optionally filtered by task ID."""
         pass

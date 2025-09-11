@@ -1,25 +1,36 @@
-import argparse
 import asyncio
 import os
+from typing import Literal
+
+print("🚀 Starting Pipecat bot...")
 
 import httpx
 from dotenv import load_dotenv
 from loguru import logger
-from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.services.aws.llm import AWSBedrockLLMService, AWSBedrockLLMContext
+from pipecat.services.aws.stt import AWSTranscribeSTTService
+from pipecat.services.aws.tts import AWSPollyTTSService
+from pipecat.services.aws_nova_sonic.aws import AWSNovaSonicLLMService
+from pipecat.services.aws_nova_sonic.context import AWSNovaSonicLLMContext
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMContext
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
+from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
 
-from embodiment.so_arm10x.agent import create_robot_agent_with_config
+from embodiment.so_arm10x.agent import create_robot_agent
+
+logger.info("✅ All components loaded successfully!")
 
 load_dotenv(override=True)
 
@@ -33,33 +44,22 @@ _background_tasks = set()
 _robot_agent = None
 
 
-def get_robot_agent():
-    """Get or create a shared robot agent instance for resource management."""
-    global _robot_agent
-    if _robot_agent is None:
-        # Create callback handler that uses loguru (same as pipecat)
-        from logging_config import create_clean_callback_handler
-
-        callback_handler = create_clean_callback_handler(show_thinking=False)
-
-        _robot_agent = create_robot_agent_with_config(
-            enable_camera=True,
-            wrist_cam_idx=2,
-            front_cam_idx=0,
-            callback_handler=callback_handler,
-        )
-    return _robot_agent
-
-
-async def fetch_weather_from_api(params: FunctionCallParams):
+async def fetch_weather_from_api(
+    params: FunctionCallParams,
+    location: str,
+    unit: Literal["celsius", "fahrenheit"] = "celsius",
+):
     """
     Fetch current weather using Open-Meteo and Nominatim for geocoding.
+
+    Args:
+        location: The city and state, e.g. San Francisco, CA
+        unit: The temperature unit to use. Infer this from the user's location.
     """
-    location = params.arguments.get("location")
-    temp_unit = params.arguments.get("format", "celsius")
 
     async def _speak_status_update(delay: float = 2):
         await asyncio.sleep(delay)
+        # This will be ignored in speech-to-speech mode
         await params.llm.queue_frame(TTSSpeakFrame("Let me check on that."))
 
     status_update_task = asyncio.create_task(_speak_status_update(1))
@@ -88,9 +88,7 @@ async def fetch_weather_from_api(params: FunctionCallParams):
                 "latitude": lat,
                 "longitude": lon,
                 "current_weather": True,
-                "temperature_unit": (
-                    "celsius" if temp_unit == "celsius" else "fahrenheit"
-                ),
+                "temperature_unit": ("celsius" if unit == "celsius" else "fahrenheit"),
             }
             weather_resp = await client.get(weather_url, params=weather_params)
             weather_resp.raise_for_status()
@@ -115,23 +113,40 @@ async def fetch_weather_from_api(params: FunctionCallParams):
         status_update_task.cancel()
 
 
-async def run_robot_agent(params: FunctionCallParams):
+# TODO: replace this with a MCP server
+def get_robot_agent():
+    """Get or create a shared robot agent instance for resource management."""
+    global _robot_agent
+    if _robot_agent is None:
+        # Create callback handler that uses loguru (same as pipecat)
+        from logging_config import create_clean_callback_handler
+
+        callback_handler = create_clean_callback_handler(show_thinking=False)
+
+        _robot_agent = create_robot_agent(
+            robot_port=os.getenv("SO_ARM_PORT"),
+            callback_handler=callback_handler,
+        )
+    return _robot_agent
+
+
+async def run_robot_agent(params: FunctionCallParams, instruction: str):
     """
-    Execute robot agent tasks in the background with real-time audio feedback.
-    Uses async iterators for streaming updates with clean logging.
+    Execute robot agent tasks in the background based on the given instruction with real-time audio feedback.
+
+    Args:
+        instruction: The task to be executed by the robot
     """
 
     async def _run_robot_agent_background():
         try:
             # Use shared robot agent for better resource management
-            so100_agent = get_robot_agent()
-            logger.info(
-                f"🎯 Processing robot instruction: {params.arguments['instruction']}"
-            )
+            so10x_agent = get_robot_agent()
+            logger.info(f"🎯 Processing robot instruction: {instruction}")
 
             # Camera warmup and robot connection is handled internally by the agent
             # Use async iterator for streaming events
-            async for event in so100_agent.astream(params.arguments["instruction"]):
+            async for event in so10x_agent.astream(instruction):
                 # Handle different event types for better TTS experience
                 if (
                     "message" in event
@@ -233,113 +248,205 @@ transport_params = {
 system_prompt = """You are a helpful robot assistant. \
 Your goal is to demonstrate your capabilities in a succinct way. 
 
-Your output will be converted to audio so don't include special characters and be concise in your answers. 
+Don't include special characters and be concise in your answers. 
 
 Respond to what the user said in a professional and helpful way."""
 
 
 async def run_dum_e(
-    transport: BaseTransport, _: argparse.Namespace, handle_sigint: bool
+    transport: BaseTransport,
+    runner_args: RunnerArguments,
+    mode: Literal["cascaded", "speech_to_speech"] = "cascaded",
+    profile: Literal["default", "aws"] = "default",
 ):
+    """
+    Run Dum-E with the given transport, runner arguments, mode, and profile.
+
+    Args:
+        transport: The transport to use for the bot
+        runner_args: The runner arguments to use for the bot
+        mode: The mode to use for the bot. Voice status update is only supported in cascaded mode.
+        profile: The profile to use for the bot
+    """
+
     logger.info(f"Starting bot")
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    # Speech to speech
+    if mode == "speech_to_speech":
+        if profile == "aws":
+            llm = AWSNovaSonicLLMService(
+                secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                region=os.getenv("AWS_REGION"),
+                voice_id="matthew",  # Voices: matthew, tiffany, amy
+            )
+        else:
+            raise NotImplementedError(
+                "Currently only AWS Nova Sonic is supported for speech-to-speech mode"
+            )
+    else:  # Cascaded
+        if profile == "aws":
+            stt = AWSTranscribeSTTService(
+                api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+                region=os.getenv("AWS_REGION"),
+            )
 
-    tts = ElevenLabsTTSService(
-        api_key=os.getenv("ELEVENLABS_API_KEY"),
-        voice_id="cgSgspJ2msm6clMCkdW9",
-        sample_rate=24000,
-        params=ElevenLabsTTSService.InputParams(language=Language.EN),
-    )
+            llm = AWSBedrockLLMService(
+                api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+                aws_region=os.getenv("AWS_REGION"),
+                model="us.anthropic.claude-3-5-haiku-20241022-v1:0",
+                params=AWSBedrockLLMService.InputParams(
+                    temperature=0.1,
+                    max_tokens=500,
+                ),
+            )
 
-    llm = AnthropicLLMService(
-        api_key=os.getenv("ANTHROPIC_API_KEY"),
-        model="claude-3-5-haiku-20241022",
-        params=AnthropicLLMService.InputParams(temperature=0.7, max_tokens=500),
-    )
+            tts = AWSPollyTTSService(
+                api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
+                region=os.getenv("AWS_REGION"),
+                voice_id="Matthew",
+                params=AWSPollyTTSService.InputParams(
+                    engine="generative", language="en-AU", rate="1.3"
+                ),
+            )
+        else:
+            stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
-    # You can also register a function_name of None to get all functions
-    # sent to the same callback with an additional function_name parameter.
-    llm.register_function("get_current_weather", fetch_weather_from_api)
-    llm.register_function("run_robot_agent", run_robot_agent)
+            llm = AnthropicLLMService(
+                api_key=os.getenv("ANTHROPIC_API_KEY"),
+                model="claude-3-5-haiku-20241022",
+                params=AnthropicLLMService.InputParams(temperature=0.1, max_tokens=500),
+            )
+
+            tts = ElevenLabsTTSService(
+                api_key=os.getenv("ELEVENLABS_API_KEY"),
+                voice_id="cgSgspJ2msm6clMCkdW9",
+                sample_rate=24000,
+                params=ElevenLabsTTSService.InputParams(language=Language.EN),
+            )
+
+    # by default, function calls can be interrupted
+    llm.register_direct_function(fetch_weather_from_api)
+    llm.register_direct_function(run_robot_agent, cancel_on_interruption=False)
 
     # @llm.event_handler("on_function_calls_started")
     # async def on_function_calls_started(service, function_calls):
     #     await tts.queue_frame(TTSSpeakFrame("Let me check on that."))
 
-    weather_function = FunctionSchema(
-        name="get_current_weather",
-        description="Get the current weather",
-        properties={
-            "location": {
-                "type": "string",
-                "description": "The city and state, e.g. San Francisco, CA",
-            },
-            "format": {
-                "type": "string",
-                "enum": ["celsius", "fahrenheit"],
-                "description": "The temperature unit to use. Infer this from the user's location.",
-            },
-        },
-        required=["location", "format"],
-    )
+    tools = ToolsSchema(standard_tools=[fetch_weather_from_api, run_robot_agent])
 
-    robot_function = FunctionSchema(
-        name="run_robot_agent",
-        description="Run the robot agent to execute physical actions based on the given instruction.",
-        properties={
-            "instruction": {
-                "type": "string",
-                "description": "The task to be executed by the robot",
-            },
-        },
-        required=["instruction"],
-    )
-    tools = ToolsSchema(standard_tools=[weather_function, robot_function])
+    if profile == "aws":
+        # For Nova Sonic speech-to-speech, append the special trigger instruction so the
+        # assistant will start speaking when it hears the synthetic "ready" trigger.
+        if mode == "speech_to_speech":
+            context = AWSNovaSonicLLMContext(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "text": "\n".join(
+                                    [
+                                        system_prompt,
+                                        AWSNovaSonicLLMService.AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION,
+                                        "Greet the user by saying 'Hello there!'",
+                                    ]
+                                )
+                            }
+                        ],
+                    }
+                ],
+                tools=tools,
+            )
+        else:
+            context = AWSBedrockLLMContext(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [{"text": system_prompt}],
+                    }
+                ],
+                tools=tools,
+                # system=system_prompt, # There is a system message conversion issue as of 0.0.81
+            )
+    else:
+        context = AnthropicLLMContext(tools=tools, system=system_prompt)
 
-    context = AnthropicLLMContext(messages=[], tools=tools, system=system_prompt)
     context_aggregator = llm.create_context_aggregator(context)
 
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            context_aggregator.user(),
-            llm,
-            tts,
-            transport.output(),
-            context_aggregator.assistant(),
-        ]
-    )
+    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+
+    if mode == "cascaded":
+        pipeline = Pipeline(
+            [
+                transport.input(),  # Transport user input
+                rtvi,  # RTVI processor
+                stt,  # Speech-to-text
+                context_aggregator.user(),  # User responses
+                llm,  # LLM
+                tts,  # Text-to-speech
+                transport.output(),  # Transport bot output
+                context_aggregator.assistant(),  # Assistant spoken responses
+            ]
+        )
+    elif mode == "speech_to_speech":
+        pipeline = Pipeline(
+            [
+                transport.input(),
+                rtvi,
+                context_aggregator.user(),
+                llm,
+                transport.output(),
+                context_aggregator.assistant(),
+            ]
+        )
 
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
-            allow_interruptions=True,
             enable_metrics=True,
             enable_usage_metrics=True,
-            report_only_initial_ttfb=True,
         ),
+        observers=[RTVIObserver(rtvi)],
     )
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info(f"Client connected")
         # Kick off the conversation.
-        # await task.queue_frames([context_aggregator.user().get_context_frame()])
-        await task.queue_frames([TTSSpeakFrame(f"Hello there!")])
+        if mode == "speech_to_speech" and profile == "aws":
+            # For Nova Sonic (speech-to-speech), trigger the assistant to speak using the synthetic "ready" audio,
+            # so the model responds without having to wait for real user audio.
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
+            await llm.trigger_assistant_response()
+        else:
+            await task.queue_frames([TTSSpeakFrame(f"Hello there!")])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected")
         await task.cancel()
 
-    runner = PipelineRunner(handle_sigint=handle_sigint)
+    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
 
     await runner.run(task)
 
 
-if __name__ == "__main__":
-    from pipecat.examples.run import main
+async def bot(runner_args: RunnerArguments):
+    """Main bot entry point for the bot starter."""
 
-    main(run_dum_e, transport_params=transport_params)
+    transport = await create_transport(runner_args, transport_params)
+
+    await run_dum_e(transport, runner_args, mode="speech_to_speech", profile="aws")
+
+
+if __name__ == "__main__":
+    from pipecat.runner.run import main
+
+    main()

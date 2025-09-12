@@ -37,7 +37,10 @@ from strands.models.anthropic import AnthropicModel
 from tqdm import tqdm
 
 
-from embodiment.so_arm10x.client import Gr00tRobotInferenceClient, SO10xArmController
+from embodiment.so_arm10x.controller import (
+    Gr00tRobotInferenceClient,
+    SO10xArmController,
+)
 from shared import (
     ITaskManager,
     IMessageBroker,
@@ -47,7 +50,8 @@ from shared import (
     MessageType,
     ToolDefinition,
 )
-from shared.task_manager import InMemoryTaskManager
+from shared.message_broker.shm import get_shared_memory_broker_from_env
+from shared.task_manager.shm import get_shared_memory_task_manager_from_env
 
 from logging_config import create_clean_callback_handler, setup_robot_logging
 
@@ -206,7 +210,7 @@ class SO10xRobotAgent(IRobotAgent):
         self,
         robot_controller: SO10xArmController,
         gr00t_client_instance: Gr00tRobotInferenceClient,
-        task_manager: ITaskManager = InMemoryTaskManager(),
+        task_manager: Optional[ITaskManager] = None,
         profile: Literal["default", "aws"] = "default",
         message_broker: Optional[IMessageBroker] = None,
         callback_handler: Callable = None,
@@ -328,11 +332,11 @@ Note: Colors in images may appear different due to reflections.""",
     ) -> Dict[str, Any]:
         """Execute instruction synchronously and return final result."""
         try:
-            # Create task if not provided
-            if task_id is None:
-                task_id = await self.task_manager.create_task(instruction)
-
-            await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+            # Create task if not provided and a task manager is available
+            if self.task_manager is not None:
+                if task_id is None:
+                    task_id = await self.task_manager.create_task(instruction)
+                await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
 
             # Get the Strands agent and execute
             agent = await self._get_strands_agent()
@@ -349,7 +353,10 @@ Note: Colors in images may appear different due to reflections.""",
                 # Reset to initial pose after completion
                 self.robot_controller.move_to_initial_pose()
 
-            await self.task_manager.update_task_status(task_id, TaskStatus.COMPLETED)
+            if self.task_manager is not None and task_id is not None:
+                await self.task_manager.update_task_status(
+                    task_id, TaskStatus.COMPLETED
+                )
 
             return {
                 "task_id": task_id,
@@ -359,7 +366,7 @@ Note: Colors in images may appear different due to reflections.""",
             }
 
         except Exception as e:
-            if task_id:
+            if self.task_manager is not None and task_id is not None:
                 await self.task_manager.update_task_status(
                     task_id, TaskStatus.FAILED, str(e)
                 )
@@ -381,11 +388,11 @@ Note: Colors in images may appear different due to reflections.""",
         enhanced progress tracking and message publishing.
         """
         try:
-            # Create task if not provided
-            if task_id is None:
-                task_id = await self.task_manager.create_task(instruction)
-
-            await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+            # Create task if not provided and manager exists
+            if self.task_manager is not None:
+                if task_id is None:
+                    task_id = await self.task_manager.create_task(instruction)
+                await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
 
             # Publish task started message
             if self.message_broker:
@@ -444,7 +451,10 @@ Note: Colors in images may appear different due to reflections.""",
                         f"⚠️  Failed to reset to initial pose in time after task completion: {pose_error}"
                     )
 
-            await self.task_manager.update_task_status(task_id, TaskStatus.COMPLETED)
+            if self.task_manager is not None and task_id is not None:
+                await self.task_manager.update_task_status(
+                    task_id, TaskStatus.COMPLETED
+                )
 
             # Publish completion message
             if self.message_broker:
@@ -468,7 +478,7 @@ Note: Colors in images may appear different due to reflections.""",
             }
 
         except Exception as e:
-            if task_id:
+            if self.task_manager is not None and task_id is not None:
                 await self.task_manager.update_task_status(
                     task_id, TaskStatus.FAILED, str(e)
                 )
@@ -533,6 +543,8 @@ def create_robot_agent(
     policy_host: str = "localhost",
     profile: Literal["default", "aws"] = "default",
     callback_handler: Optional[Callable] = None,
+    task_manager: Optional[ITaskManager] = None,
+    message_broker: Optional[IMessageBroker] = None,
 ) -> SO10xRobotAgent:
     """
     Create a robot agent with customizable hardware configuration.
@@ -565,46 +577,71 @@ def create_robot_agent(
         gr00t_client_instance=gr00t_instance,
         profile=profile,
         callback_handler=callback_handler,
+        task_manager=task_manager,
+        message_broker=message_broker,
     )
 
 
-def create_mock_robot_agent(
-    mock_controller: Optional[SO10xArmController] = None,
-    mock_gr00t: Optional[Gr00tRobotInferenceClient] = None,
-    profile: Literal["default", "aws"] = "default",
-    callback_handler: Optional[Callable] = None,
-) -> SO10xRobotAgent:
+async def _agent_worker_loop(
+    agent: SO10xRobotAgent,
+    task_manager: ITaskManager,
+    message_broker: IMessageBroker,
+    robot_id: str,
+    worker_id: str,
+):
     """
-    Create a robot agent with mock instances for testing.
-
-    Provides easy setup for unit tests and integration tests without hardware.
-
-    Args:
-        mock_robot: Mock SO100Robot instance (creates default if not provided)
-        mock_gr00t: Mock Gr00t client instance (creates default if not provided)
-        profile: The model provider profile
-        callback_handler: Optional callback handler for agent events
+    Subscribe to TASK_STARTED events from the broker, claim tasks, and execute
+    them with the robot agent. Designed to work with local in-memory or OTA backends.
     """
-    from unittest.mock import Mock
+    async for msg in message_broker.subscribe(message_types=[MessageType.TASK_STARTED]):
+        try:
+            # Only handle tasks dispatched by the MCP server (avoid self-loop)
+            if not isinstance(msg.data, dict) or msg.data.get("source") != "mcp_server":
+                continue
 
-    if mock_controller is None:
-        mock_controller = Mock(spec=SO10xArmController)
-        mock_controller.activate.return_value.__enter__ = Mock(
-            return_value=mock_controller
-        )
-        mock_controller.activate.return_value.__exit__ = Mock(return_value=None)
-        mock_controller.get_current_images.return_value = None
-        mock_controller.move_to_initial_pose.return_value = None
+            # Optional routing by robot_id
+            target_robot = msg.data.get("robot_id")
+            if target_robot and target_robot != robot_id:
+                continue
 
-    if mock_gr00t is None:
-        mock_gr00t = Mock(spec=Gr00tRobotInferenceClient)
+            task_id = msg.task_id
+            instruction = (
+                msg.data.get("instruction") if isinstance(msg.data, dict) else None
+            )
+            if not task_id or not instruction:
+                continue
 
-    return SO10xRobotAgent(
-        robot_controller=mock_controller,
-        gr00t_client_instance=mock_gr00t,
-        profile=profile,
-        callback_handler=callback_handler,
-    )
+            # Atomically claim the task
+            claimed = await task_manager.claim_task(task_id, worker_id)
+            if not claimed:
+                continue
+
+            # Execute with streaming. The agent will publish streaming updates
+            # and final status via the provided message_broker.
+            async for _ in agent.astream(instruction, task_id=task_id):
+                # We rely on the agent to publish STREAMING_DATA
+                # Optional logging can be added here if needed
+                pass
+        except Exception as exec_error:
+            # Best-effort failure reporting
+            try:
+                await task_manager.update_task_status(
+                    task_id, TaskStatus.FAILED, str(exec_error)
+                )
+            except Exception:
+                pass
+            try:
+                if message_broker:
+                    await message_broker.publish(
+                        Message(
+                            message_type=MessageType.TASK_FAILED,
+                            task_id=task_id,
+                            timestamp=datetime.now(),
+                            data={"error": str(exec_error), "instruction": instruction},
+                        )
+                    )
+            except Exception:
+                pass
 
 
 # Example usage and testing
@@ -643,23 +680,53 @@ if __name__ == "__main__":
             type=str,
             help="Robot instruction (will prompt for input if not provided)",
         )
+        parser.add_argument(
+            "--worker",
+            action="store_true",
+            help="Run in worker mode: consume TASK_STARTED from broker and execute",
+        )
+
         args = parser.parse_args()
 
-        user_query = args.instruction or input("Enter your instruction: ")
+        # Configure backends: prefer shared memory when available (DUME_IPC=shm)
+        task_manager = get_shared_memory_task_manager_from_env()
+        message_broker = get_shared_memory_broker_from_env()
 
-        so10x_agent = create_robot_agent(
+        # Create agent with injected backends
+        agent = create_robot_agent(
             robot_port=args.port,
             robot_id=args.id,
             wrist_cam_idx=args.wrist_cam_idx,
             front_cam_idx=args.front_cam_idx,
             policy_host=args.policy_host,
             profile=args.profile,
+            task_manager=task_manager,
+            message_broker=message_broker,
         )
+
+        if args.worker:
+            import uuid
+
+            worker_id = f"agent-worker-{uuid.uuid4()}"
+            logger.info(
+                f"🧩 Worker mode: namespace={args.namespace}, worker_id={worker_id}"
+            )
+            await _agent_worker_loop(
+                agent=agent,
+                task_manager=task_manager,
+                message_broker=message_broker,
+                robot_id=args.id,
+                worker_id=worker_id,
+            )
+            return
+
+        # Direct single-run mode: stream once via agent
+        user_query = args.instruction or input("Enter your instruction: ")
 
         logger.info(f"🎯 Processing query: {user_query}")
 
         # Use the streaming interface with clean output
-        async for event in so10x_agent.astream(user_query):
+        async for event in agent.astream(user_query):
             event_type = event.get("type", "unknown")
 
             if event_type == "warmup_progress":

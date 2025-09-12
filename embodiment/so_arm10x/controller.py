@@ -14,7 +14,7 @@ A lightweight eval entrypoint is kept for manual testing with the new API.
 
 Example usage:
 ```shell
-python -m embodiment.so_arm10x.client \
+python -m embodiment.so_arm10x.controller \
     --robot_port /dev/tty.usbmodem5A680102371 \
     --robot_type so101_follower \
     --robot_id so101_follower_arm \

@@ -161,7 +161,7 @@ Choose the setup that best matches your needs and hardware availability. The fol
     > Default uses SO-ARM101 for the robot type.
     Run the following command by replacing `<robot_serial_port>`, `<robot_id>`, `<wrist_cam_idx>`, `<front_cam_idx>` and `<policy_server_ip>` with your own serial port, robot id, wrist camera index, front camera index and policy server IP (use `localhost` for single workstation):
     ```bash
-    python -m embodiment.so_arm10x.client \
+    python -m embodiment.so_arm10x.controller \
         --robot_port <robot_serial_port> \
         --robot_type so101_follower \
         --robot_id <robot_id> \

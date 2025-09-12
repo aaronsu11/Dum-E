@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Iterator, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -187,47 +187,6 @@ class IRobotAgent(ABC):
         pass
 
 
-class IToolRegistry(ABC):
-    """
-    Interface for managing shared tools across the system.
-
-    The tool registry enables tools to be shared between the voice assistant
-    and robot agent, providing centralized management of available capabilities.
-    """
-
-    @abstractmethod
-    async def register_tool(self, tool: ToolDefinition) -> None:
-        """Register a new tool in the registry."""
-        pass
-
-    @abstractmethod
-    async def unregister_tool(self, name: str) -> None:
-        """Remove a tool from the registry."""
-        pass
-
-    @abstractmethod
-    async def get_tool(self, name: str) -> Optional[ToolDefinition]:
-        """Retrieve a specific tool by name."""
-        pass
-
-    @abstractmethod
-    async def list_tools(
-        self, category: Optional[str] = None, requires_hardware: Optional[bool] = None
-    ) -> List[ToolDefinition]:
-        """List available tools, optionally filtered by criteria."""
-        pass
-
-    @abstractmethod
-    async def call_tool(
-        self,
-        name: str,
-        parameters: Dict[str, Any],
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Execute a tool with given parameters and optional context."""
-        pass
-
-
 class ITaskManager(ABC):
     """
     Interface for task lifecycle management.
@@ -274,6 +233,16 @@ class ITaskManager(ABC):
         """Cancel a running or pending task."""
         pass
 
+    @abstractmethod
+    async def claim_task(self, task_id: str, worker_id: str) -> bool:
+        """
+        Atomically claim a PENDING task for execution by a worker.
+
+        Returns True if the task was successfully claimed and moved to RUNNING,
+        False if it was not claimable (e.g., already claimed or not found).
+        """
+        pass
+
 
 class IMessageBroker(ABC):
     """
@@ -312,3 +281,25 @@ class IMessageBroker(ABC):
     ) -> List[Message]:
         """Get historical messages, optionally filtered by task ID."""
         pass
+
+
+@dataclass
+class BackendConfig:
+    """
+    Backend configuration for coordinating agent/server communication.
+
+    Keep this simple and transport-agnostic. For in-memory, use 'namespace' to
+    locate the same process registry. For OTA (MQTT/HTTP/DB), use the relevant
+    fields for routing and isolation.
+    """
+
+    # Local same-process coordination key
+    namespace: str = "default"
+
+    # AWS backend
+    aws_region: Optional[str] = None
+    # MQTT-based progress tracking
+    mqtt_endpoint: Optional[str] = None
+    mqtt_topic_prefix: Optional[str] = None
+    # DynamoDB/DB-backed task coordination
+    dynamodb_table: Optional[str] = None

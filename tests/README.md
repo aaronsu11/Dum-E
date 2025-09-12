@@ -22,12 +22,16 @@ This suite validates the shared interfaces, the MCP server tools, and the orches
 
 - `test_mcp_interfaces.py`
   - Scope: MCP tools exposed by `mcp_server.py` using SHM backends only (no worker)
-  - What it does: starts only the MCP HTTP server; seeds tasks/messages directly via SHM TaskManager/Broker; uses `fastmcp.Client` to call tools and verifies responses:
+  - What it does: starts only the MCP HTTP server; seeds tasks/messages/fleet directly via SHM TaskManager/Broker/FleetManager; uses `fastmcp.Client` to call tools and verifies responses:
     - `list_namespaces` returns the active namespace
     - `list_tasks` supports empty and filtered views
     - `get_task_details` optionally includes recent messages
     - `cancel_task` updates task state and acknowledges success
     - `list_last_messages` filters by `task_id` and `message_types`
+    - `register_robot` upserts a robot
+    - `list_robots` lists robots
+    - `get_robot` gets the robot details by ID
+    - `set_robot_enabled` enables or disables a robot by ID
 
 ### Running tests
 
@@ -41,6 +45,7 @@ For unit tests that directly attach to SHM (not via orchestrator), the tests cre
 
 - `DUME_BROKER_BUF`, `DUME_BROKER_META` – broker buffer and write index
 - `DUME_TASKS_BUF` – task storage buffer
+- `DUME_FLEET_BUF` – fleet registry buffer
 - `DUME_NAMESPACE` – namespace for lock files
 - `DUME_IPC=shm` – signals SHM backend selection
 

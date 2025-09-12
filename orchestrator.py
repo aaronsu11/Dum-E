@@ -10,6 +10,7 @@ from multiprocessing.managers import SharedMemoryManager
 from loguru import logger
 
 from shared import BackendConfig
+from shared.fleet_manager import get_shared_memory_fleet_manager_from_env
 
 
 def _load_config_file(config_path: Optional[str]) -> Dict[str, Any]:
@@ -40,22 +41,28 @@ def build_backend_config(
 ) -> BackendConfig:
     backend_cfg = cfg.get("backend", {}) if isinstance(cfg.get("backend"), dict) else {}
 
-    # Environment variable fallbacks
-    namespace = (
-        getattr(args, "namespace", None)
-        or backend_cfg.get("namespace")
-        or os.getenv("DUME_NAMESPACE")
-        or "default"
+    model = BackendConfig.model_validate(
+        {
+            "namespace": (
+                getattr(args, "namespace", None)
+                or backend_cfg.get("namespace")
+                or os.getenv("DUME_NAMESPACE")
+                or "default"
+            ),
+            "aws_region": backend_cfg.get("aws_region") or os.getenv("AWS_REGION"),
+            "mqtt_endpoint": backend_cfg.get("mqtt_endpoint")
+            or os.getenv("MQTT_ENDPOINT"),
+            "mqtt_topic_prefix": backend_cfg.get("mqtt_topic_prefix")
+            or os.getenv("MQTT_TOPIC_PREFIX"),
+            "dynamodb_table": backend_cfg.get("dynamodb_table")
+            or os.getenv("DYNAMODB_TABLE"),
+        }
     )
 
-    return BackendConfig(
-        namespace=namespace,
-        aws_region=backend_cfg.get("aws_region") or os.getenv("AWS_REGION"),
-        mqtt_endpoint=backend_cfg.get("mqtt_endpoint") or os.getenv("MQTT_ENDPOINT"),
-        mqtt_topic_prefix=backend_cfg.get("mqtt_topic_prefix")
-        or os.getenv("MQTT_TOPIC_PREFIX"),
-        dynamodb_table=backend_cfg.get("dynamodb_table") or os.getenv("DYNAMODB_TABLE"),
-    )
+    # Log effective config in a structured way
+    data = model.model_dump()
+    logger.info("Effective BackendConfig: {}", data)
+    return model
 
 
 def _spawn_mcp_server(
@@ -209,61 +216,88 @@ def main():
     pipecat_proc = None
     use_shm = os.getenv("DUME_IPC", "shm").lower() == "shm"
 
-    # Prepare backends and spawn MCP/agent
-    smm = None
     if use_shm:
-        smm = SharedMemoryManager()
-        smm.start()
-        broker_capacity = int(os.getenv("DUME_BROKER_CAP", "32"))
-        tasks_capacity = int(os.getenv("DUME_TASKS_CAP", "16"))
-        slot_size = int(os.getenv("DUME_SHM_SLOT", "4096"))
-        broker_buf = smm.ShareableList([" " * slot_size] * broker_capacity)
-        broker_meta = smm.ShareableList([0])
-        tasks_buf = smm.ShareableList([" " * slot_size] * tasks_capacity)
+        # Manager context ensures SHM segments are unlinked after children exit
+        with SharedMemoryManager() as smm:
+            broker_capacity = int(os.getenv("DUME_BROKER_CAP", "32"))
+            tasks_capacity = int(os.getenv("DUME_TASKS_CAP", "16"))
+            fleet_capacity = int(os.getenv("DUME_FLEET_CAP", "32"))
+            slot_size = int(os.getenv("DUME_SHM_SLOT", "4096"))
+            broker_buf = smm.ShareableList([" " * slot_size] * broker_capacity)
+            broker_meta = smm.ShareableList([0])
+            tasks_buf = smm.ShareableList([" " * slot_size] * tasks_capacity)
+            fleet_buf = smm.ShareableList([" " * slot_size] * fleet_capacity)
 
-        env_common = {
-            "DUME_IPC": "shm",
-            # Ensure namespace is present in child envs even if spawn helpers add it
-            "DUME_NAMESPACE": backend_config.namespace,
-            # SHM names
-            "DUME_BROKER_BUF": broker_buf.shm.name,
-            "DUME_BROKER_META": broker_meta.shm.name,
-            "DUME_TASKS_BUF": tasks_buf.shm.name,
-        }
-
-        if args.node in ("server", "both"):
-            server_proc = _spawn_mcp_server(backend_config, env_common)
-            procs.append(server_proc)
-
-        if args.node in ("agent", "both"):
-            agent_proc = _spawn_agent_worker(backend_config, agent_args, env_common)
-            procs.append(agent_proc)
-    else:
-        raise NotImplementedError("Only shm is supported for now")
-
-    # Spawn Pipecat independently (no SHM dependency) but only after MCP and Agent
-    if args.node == "both" and server_proc and agent_proc:
-        pipecat_proc = _spawn_pipecat_server(backend_config)
-        procs.append(pipecat_proc)
-
-    # Graceful wait and shutdown for all processes
-    try:
-        for p in procs:
-            if p:
-                p.wait()
-    except KeyboardInterrupt:
-        for p in procs:
-            if p and p.poll() is None:
-                p.terminate()
-    finally:
-        for p in procs:
-            if p and p.poll() is None:
-                p.terminate()
-        if smm is not None:
+            # Avoid parent resource_tracker double-clean complaints; manager will unlink
             try:
-                smm.shutdown()
+                from multiprocessing import resource_tracker as _rt  # type: ignore
+
+                for sl in [broker_buf, broker_meta, tasks_buf, fleet_buf]:
+                    try:
+                        n = getattr(sl.shm, "_name", sl.shm.name)
+                        _rt.unregister(n, "shared_memory")
+                    except Exception:
+                        pass
             except Exception:
                 pass
+
+            env_common = {
+                "DUME_IPC": "shm",
+                "DUME_NAMESPACE": backend_config.namespace,
+                "DUME_BROKER_BUF": broker_buf.shm.name,
+                "DUME_BROKER_META": broker_meta.shm.name,
+                "DUME_TASKS_BUF": tasks_buf.shm.name,
+                "DUME_FLEET_BUF": fleet_buf.shm.name,
+            }
+
+            # Ensure the parent process can also access these SHM-backed services
+            # (needed for default fleet registration below).
+            try:
+                os.environ.update(env_common)
+            except Exception:
+                pass
+
+            if args.node in ("server", "both"):
+                server_proc = _spawn_mcp_server(backend_config, env_common)
+                procs.append(server_proc)
+
+            if args.node in ("agent", "both"):
+                agent_proc = _spawn_agent_worker(backend_config, agent_args, env_common)
+                procs.append(agent_proc)
+
+                # Best-effort: register default robot and enable
+                try:
+                    fm = get_shared_memory_fleet_manager_from_env()
+                    if fm:
+                        import asyncio as _asyncio
+
+                        rid = str(agent_args.get("id", "my_awesome_follower_arm"))
+                        _asyncio.run(fm.register_robot(robot_id=rid, name=rid))
+                        _asyncio.run(fm.set_enabled(robot_id=rid, enabled=True))
+                except Exception as e:
+                    logger.warning("Fleet registration failed: {}", e)
+
+            # Spawn Pipecat independently (no SHM dependency) but only after MCP and Agent
+            if args.node == "both" and server_proc and agent_proc:
+                pipecat_proc = _spawn_pipecat_server(backend_config)
+                procs.append(pipecat_proc)
+
+            # Wait and ensure children stop before manager exits
+            try:
+                for p in procs:
+                    if p:
+                        p.wait()
+            except KeyboardInterrupt:
+                for p in procs:
+                    if p and p.poll() is None:
+                        p.terminate()
+            finally:
+                for p in procs:
+                    if p and p.poll() is None:
+                        p.terminate()
+        return
+    else:
+        raise NotImplementedError("Only shm is supported for now")
 
 
 if __name__ == "__main__":

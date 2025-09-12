@@ -10,13 +10,16 @@ from fastmcp import FastMCP, Context
 from shared import (
     IMessageBroker,
     ITaskManager,
+    IFleetManager,
     Message,
     MessageType,
     TaskStatus,
     TaskInfo,
+    RobotInfo,
 )
 from shared.message_broker import get_shared_memory_broker_from_env
 from shared.task_manager import get_shared_memory_task_manager_from_env
+from shared.fleet_manager import get_shared_memory_fleet_manager_from_env
 
 mcp = FastMCP(
     name="Dum-E MCP Server",
@@ -24,16 +27,23 @@ mcp = FastMCP(
 )
 
 logger = logging.getLogger("mcp_server")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+logger.info("MCP server module loaded; initializing backends")
 
 # Prefer shared-memory backends when DUME_IPC=shm and env provides shm names
 _SHM_TM = get_shared_memory_task_manager_from_env()
 _SHM_MB = get_shared_memory_broker_from_env()
+_SHM_FLEET = get_shared_memory_fleet_manager_from_env()
 if _SHM_TM and _SHM_MB:
     TASK_MANAGER: ITaskManager = _SHM_TM
     MESSAGE_BROKER: IMessageBroker = _SHM_MB
 else:
     raise NotImplementedError("Only shm is supported for now")
+
+# Fleet manager is optional; some deployments may not set DUME_FLEET_BUF
+FLEET_MANAGER: Optional[IFleetManager] = _SHM_FLEET if _SHM_FLEET else None
 
 
 async def _forward_event_to_ctx(event_data: dict, ctx: Context) -> None:
@@ -119,6 +129,59 @@ async def list_tasks(status: Optional[str] = None, limit: int = 50) -> Dict[str,
     filt = _parse_task_status(status)
     tasks = await TASK_MANAGER.list_tasks(status=filt, limit=limit)
     return {"tasks": [_task_to_dict(t) for t in tasks]}
+
+
+def _robot_to_dict(info: RobotInfo) -> Dict[str, Any]:
+    return {
+        "robot_id": info.robot_id,
+        "name": info.name,
+        "enabled": info.enabled,
+        "registered_at": info.registered_at.isoformat() if info.registered_at else None,
+        "last_seen": info.last_seen.isoformat() if info.last_seen else None,
+        "metadata": info.metadata or {},
+    }
+
+
+@mcp.tool()
+async def register_robot(
+    robot_id: str, name: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Register or upsert a robot in the fleet registry. Returns the robot info."""
+    if not FLEET_MANAGER:
+        return {"error": "Fleet manager not available in this deployment"}
+    info = await FLEET_MANAGER.register_robot(
+        robot_id=robot_id, name=name, metadata=metadata
+    )
+    return {"robot": _robot_to_dict(info)}
+
+
+@mcp.tool()
+async def list_robots(only_enabled: Optional[bool] = None) -> Dict[str, Any]:
+    """List robots from the fleet registry. Optionally filter by enabled state."""
+    if not FLEET_MANAGER:
+        return {"error": "Fleet manager not available in this deployment"}
+    items = await FLEET_MANAGER.list_robots(only_enabled=only_enabled)
+    return {"robots": [_robot_to_dict(r) for r in items]}
+
+
+@mcp.tool()
+async def get_robot(robot_id: str) -> Dict[str, Any]:
+    """Get detailed information for a robot by ID."""
+    if not FLEET_MANAGER:
+        return {"error": "Fleet manager not available in this deployment"}
+    info = await FLEET_MANAGER.get_robot(robot_id)
+    if not info:
+        return {"error": f"Robot not found: {robot_id}"}
+    return {"robot": _robot_to_dict(info)}
+
+
+@mcp.tool()
+async def set_robot_enabled(robot_id: str, enabled: bool) -> Dict[str, Any]:
+    """Enable or disable a robot by ID."""
+    if not FLEET_MANAGER:
+        return {"error": "Fleet manager not available in this deployment"}
+    ok = await FLEET_MANAGER.set_enabled(robot_id, enabled)
+    return {"robot_id": robot_id, "enabled": enabled, "updated": bool(ok)}
 
 
 @mcp.tool()
@@ -309,6 +372,6 @@ if __name__ == "__main__":
         port = int(os.getenv("DUME_MCP_PORT", "8000"))
     except Exception:
         port = 8000
-    logger.info("Starting Dum-E MCP HTTP server on port %s", port)
+    logger.info("Starting Dum-E MCP HTTP server on %s:%s", host, port)
     # Bind explicitly to host/port to avoid conflicts and allow tests to override
     mcp.run(transport="http", host=host, port=port)

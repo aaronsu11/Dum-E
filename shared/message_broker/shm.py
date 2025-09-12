@@ -52,6 +52,22 @@ class SharedMemoryMessageBroker(IMessageBroker):
         self.capacity = len(self.buffer)
         self.poll_interval_s = poll_interval_s
         self.lock_file = f"/tmp/dume_{namespace}_broker.lock"
+        # This process only attaches to existing SHM; avoid double-unlink at exit
+        try:
+            from multiprocessing import resource_tracker as _rt  # type: ignore
+
+            try:
+                n = getattr(self.buffer.shm, "_name", self.buffer.shm.name)
+                _rt.unregister(n, "shared_memory")
+            except Exception:
+                pass
+            try:
+                n2 = getattr(self.meta.shm, "_name", self.meta.shm.name)
+                _rt.unregister(n2, "shared_memory")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     async def publish(self, message: Message) -> None:
         payload = json.dumps(

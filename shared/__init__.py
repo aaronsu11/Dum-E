@@ -20,6 +20,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,22 @@ class MessageType(Enum):
     TOOL_EXECUTED = "tool_executed"
     STATUS_UPDATE = "status_update"
     STREAMING_DATA = "streaming_data"
+
+
+@dataclass
+class RobotInfo:
+    """Information about a robot in the fleet."""
+
+    robot_id: str
+    name: Optional[str]
+    enabled: bool
+    registered_at: datetime
+    last_seen: Optional[datetime] = None
+    metadata: Dict[str, Any] = None
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
 
 
 @dataclass
@@ -283,14 +300,56 @@ class IMessageBroker(ABC):
         pass
 
 
-@dataclass
-class BackendConfig:
+class IFleetManager(ABC):
+    """
+    Interface for basic fleet management operations.
+
+    Implementations may be backed by shared memory for local development or by
+    cloud services (e.g., AWS IoT Device Management, Supabase) in production.
+    """
+
+    @abstractmethod
+    async def register_robot(
+        self,
+        robot_id: str,
+        name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> RobotInfo:
+        """Register or upsert a robot and return its info."""
+        pass
+
+    @abstractmethod
+    async def list_robots(self, only_enabled: Optional[bool] = None) -> List[RobotInfo]:
+        """List robots with optional enabled filter."""
+        pass
+
+    @abstractmethod
+    async def get_robot(self, robot_id: str) -> Optional[RobotInfo]:
+        """Get robot information by ID."""
+        pass
+
+    @abstractmethod
+    async def set_enabled(self, robot_id: str, enabled: bool) -> bool:
+        """Enable or disable a robot by ID."""
+        pass
+
+    @abstractmethod
+    async def update_robot(
+        self,
+        robot_id: str,
+        name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Update robot name and/or metadata. Returns True if updated."""
+        pass
+
+
+class BackendConfig(BaseModel):
     """
     Backend configuration for coordinating agent/server communication.
 
-    Keep this simple and transport-agnostic. For in-memory, use 'namespace' to
-    locate the same process registry. For OTA (MQTT/HTTP/DB), use the relevant
-    fields for routing and isolation.
+    Transport-agnostic with optional cloud backends. Uses Pydantic for
+    validation and easy introspection/logging of the effective config.
     """
 
     # Local same-process coordination key

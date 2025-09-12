@@ -7,6 +7,7 @@ from multiprocessing.managers import SharedMemoryManager
 
 import orchestrator
 from fastmcp import Client
+from shared import BackendConfig
 
 
 def test_spawn_mcp_server_env_injection():
@@ -25,7 +26,7 @@ def test_spawn_mcp_server_env_injection():
             return 0
 
     with mock.patch("subprocess.Popen", DummyPopen):
-        cfg = orchestrator.BackendConfig(namespace="unit")
+        cfg = BackendConfig(namespace="unit")
         extra_env = {"DUME_IPC": "shm", "FOO": "BAR"}
         orchestrator._spawn_mcp_server(cfg, extra_env)
 
@@ -53,7 +54,7 @@ def test_spawn_agent_worker_mock_env_injection():
             return 0
 
     with mock.patch("subprocess.Popen", DummyPopen):
-        cfg = orchestrator.BackendConfig(namespace="unit")
+        cfg = BackendConfig(namespace="unit")
         agent_args = {"use_mock": True, "id": "mock_robot"}
         extra_env = {"DUME_IPC": "shm"}
         orchestrator._spawn_agent_worker(cfg, agent_args, extra_env)
@@ -79,7 +80,7 @@ def test_spawn_pipecat_server_env_injection():
             return 0
 
     with mock.patch("subprocess.Popen", DummyPopen):
-        cfg = orchestrator.BackendConfig(namespace="unit")
+        cfg = BackendConfig(namespace="unit")
         extra_env = {"FOO": "BAR"}
         orchestrator._spawn_pipecat_server(cfg, extra_env)
 
@@ -143,6 +144,7 @@ async def test_orchestrator_http_progress_integration(monkeypatch):
         broker_buf = smm.ShareableList([" " * slot] * 32)
         broker_meta = smm.ShareableList([0])
         tasks_buf = smm.ShareableList([" " * slot] * 16)
+        fleet_buf = smm.ShareableList([" " * slot] * 32)
 
         shm_env = {
             "DUME_IPC": "shm",
@@ -150,6 +152,7 @@ async def test_orchestrator_http_progress_integration(monkeypatch):
             "DUME_BROKER_BUF": broker_buf.shm.name,
             "DUME_BROKER_META": broker_meta.shm.name,
             "DUME_TASKS_BUF": tasks_buf.shm.name,
+            "DUME_FLEET_BUF": fleet_buf.shm.name,
         }
 
         # Also export to real environment so the FastMCP client-spawned server can read them

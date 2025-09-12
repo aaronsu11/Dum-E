@@ -17,6 +17,7 @@ from contextlib import closing
 
 import pytest
 import pytest_asyncio
+from types import SimpleNamespace
 from multiprocessing.managers import SharedMemoryManager
 
 from fastmcp import Client
@@ -69,6 +70,7 @@ async def shm_env_and_server(monkeypatch):
         broker_buf = smm.ShareableList([" " * slot] * 32)
         broker_meta = smm.ShareableList([0])
         tasks_buf = smm.ShareableList([" " * slot] * 16)
+        fleet_buf = smm.ShareableList([" " * slot] * 32)
 
         env = {
             "DUME_IPC": "shm",
@@ -76,13 +78,16 @@ async def shm_env_and_server(monkeypatch):
             "DUME_BROKER_BUF": broker_buf.shm.name,
             "DUME_BROKER_META": broker_meta.shm.name,
             "DUME_TASKS_BUF": tasks_buf.shm.name,
+            "DUME_FLEET_BUF": fleet_buf.shm.name,
             "DUME_MCP_PORT": str(port),
             "DUME_MCP_HOST": "127.0.0.1",
         }
         for k, v in env.items():
             monkeypatch.setenv(k, v)
 
-        backend_cfg = orchestrator.BackendConfig(namespace=namespace)
+        # Use resolved backend config via builder to avoid strict constructor
+        args = SimpleNamespace(namespace=namespace)
+        backend_cfg = orchestrator.build_backend_config(args, {})
         server_proc = orchestrator._spawn_mcp_server(backend_cfg, env)
 
         try:
@@ -265,3 +270,57 @@ async def test_list_last_messages_filters(shm_env_and_server):
     )
     msgs_types = res_types.data.get("messages", [])
     assert all(m.get("message_type") == "task_completed" for m in msgs_types)
+
+
+@pytest.mark.asyncio
+async def test_fleet_register_get_and_enable_disable(shm_env_and_server):
+    """Register robots, fetch details, and toggle enabled state via MCP tools."""
+    client = shm_env_and_server["client"]
+
+    # Register a new robot
+    res_reg = await client.call_tool(
+        "register_robot",
+        {"robot_id": "r-001", "name": "alpha", "metadata": {"model": "so101"}},
+    )
+    robot = res_reg.data.get("robot")
+    assert robot["robot_id"] == "r-001"
+    assert robot["enabled"] is True
+    assert robot["name"] == "alpha"
+
+    # Get robot details
+    res_get = await client.call_tool("get_robot", {"robot_id": "r-001"})
+    got = res_get.data.get("robot")
+    assert got["robot_id"] == "r-001"
+    assert got["metadata"].get("model") == "so101"
+
+    # Disable robot
+    res_dis = await client.call_tool(
+        "set_robot_enabled", {"robot_id": "r-001", "enabled": False}
+    )
+    assert res_dis.data.get("updated") is True
+    res_get2 = await client.call_tool("get_robot", {"robot_id": "r-001"})
+    assert res_get2.data["robot"]["enabled"] is False
+
+    # List robots, ensure our robot is present
+    res_list = await client.call_tool("list_robots", {})
+    ids = [r["robot_id"] for r in res_list.data.get("robots", [])]
+    assert "r-001" in ids
+
+
+@pytest.mark.asyncio
+async def test_fleet_list_robots_only_enabled_filter(shm_env_and_server):
+    """list_robots should filter by enabled state when provided."""
+    client = shm_env_and_server["client"]
+
+    # Register two robots and disable one
+    await client.call_tool("register_robot", {"robot_id": "r-A"})
+    await client.call_tool("register_robot", {"robot_id": "r-B"})
+    await client.call_tool("set_robot_enabled", {"robot_id": "r-B", "enabled": False})
+
+    res_enabled = await client.call_tool("list_robots", {"only_enabled": True})
+    enabled_ids = {r["robot_id"] for r in res_enabled.data.get("robots", [])}
+    assert "r-A" in enabled_ids and "r-B" not in enabled_ids
+
+    res_disabled = await client.call_tool("list_robots", {"only_enabled": False})
+    disabled_ids = {r["robot_id"] for r in res_disabled.data.get("robots", [])}
+    assert "r-B" in disabled_ids

@@ -38,6 +38,17 @@ class SharedMemoryTaskManager(ITaskManager):
         self.tasks = ShareableList(name=tasks_name)
         self.capacity = len(self.tasks)
         self.lock_file = f"/tmp/dume_{namespace}_tasks.lock"
+        # This process only attaches to existing SHM; avoid double-unlink at exit
+        try:
+            from multiprocessing import resource_tracker as _rt  # type: ignore
+
+            try:
+                n = getattr(self.tasks.shm, "_name", self.tasks.shm.name)
+                _rt.unregister(n, "shared_memory")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     async def create_task(
         self, instruction: str, metadata: Optional[Dict[str, Any]] = None

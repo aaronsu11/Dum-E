@@ -1,6 +1,7 @@
 python-dotenv
 loguru
 uv
+pydantic>=2.0
 pipecat-ai[webrtc,silero,aws-nova-sonic,deepgram,aws,anthropic,elevenlabs]==0.0.84
 pipecat-ai-small-webrtc-prebuilt
 uvicorn

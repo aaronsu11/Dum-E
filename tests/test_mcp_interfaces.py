@@ -25,7 +25,7 @@ from fastmcp import Client
 from shared import Message, MessageType, TaskStatus
 from shared.message_broker.shm import SharedMemoryMessageBroker
 from shared.task_manager.shm import SharedMemoryTaskManager
-import orchestrator
+import dum_e
 
 
 def _find_free_port() -> int:
@@ -87,8 +87,8 @@ async def shm_env_and_server(monkeypatch):
 
         # Use resolved backend config via builder to avoid strict constructor
         args = SimpleNamespace(namespace=namespace)
-        backend_cfg = orchestrator.build_backend_config(args, {})
-        server_proc = orchestrator._spawn_mcp_server(backend_cfg, env)
+        backend_cfg = dum_e.build_backend_config(args, {})
+        server_proc = dum_e._spawn_mcp_server(backend_cfg, env)
 
         try:
             await _wait_for_port("127.0.0.1", port, timeout=5.0)
@@ -151,8 +151,8 @@ async def test_task_lifecycle_and_list_filters(shm_env_and_server):
     t2 = await tm.create_task("move", {"robot_id": "r2"})
     t3 = await tm.create_task("pick", {"robot_id": "r1"})
 
-    await tm.update_task_status(t2, TaskStatus.RUNNING)
-    await tm.update_task_status(t3, TaskStatus.COMPLETED)
+    await tm.update_task(t2, TaskStatus.RUNNING)
+    await tm.update_task(t3, TaskStatus.COMPLETED)
 
     # No filter
     res_all = await client.call_tool("list_tasks", {"limit": 10})

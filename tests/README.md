@@ -1,6 +1,6 @@
 ## Tests
 
-This suite validates the shared interfaces, the MCP server tools, and the orchestrated server/agent flow without requiring robot hardware. All tests are robot‑agnostic unless explicitly using the mock worker via the orchestrator helpers.
+This suite validates the shared interfaces, the MCP server tools, and the orchestrated server/agent flow without requiring robot hardware. All tests are robot‑agnostic unless explicitly using the mock worker via the dum_e helpers.
 
 ### Test layout and scope
 
@@ -16,7 +16,7 @@ This suite validates the shared interfaces, the MCP server tools, and the orches
   - Scope: `IRobotAgent` integration using `MockRobotAgent`
   - What it does: runs `MockRobotAgent.astream` with SHM backends; subscribes to broker; asserts warmup and assistant messages; verifies task completion state
 
-- `test_orchestrator.py`
+- `test_dum_e.py`
   - Scope: Orchestrator process spawning and HTTP MCP integration with mock worker
   - What it does: validates env injection in spawned processes; spins up MCP server, mock worker, and Pipecat; uses `fastmcp.Client` over HTTP to call `execute_robot_instruction`; captures and asserts progress events
 
@@ -41,7 +41,7 @@ pytest -q
 
 ### Shared memory setup
 
-For unit tests that directly attach to SHM (not via orchestrator), the tests create `ShareableList` buffers using `SharedMemoryManager` and pass their names via env vars:
+For unit tests that directly attach to SHM (not via dum_e), the tests create `ShareableList` buffers using `SharedMemoryManager` and pass their names via env vars:
 
 - `DUME_BROKER_BUF`, `DUME_BROKER_META` – broker buffer and write index
 - `DUME_TASKS_BUF` – task storage buffer

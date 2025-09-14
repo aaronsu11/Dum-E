@@ -39,6 +39,7 @@ class TaskStatus(Enum):
 class MessageType(Enum):
     """Types of messages that can be published during task execution."""
 
+    TASK_CREATED = "task_created"
     TASK_STARTED = "task_started"
     TASK_PROGRESS = "task_progress"
     TASK_COMPLETED = "task_completed"
@@ -74,6 +75,7 @@ class TaskInfo:
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    status_message: Optional[str] = None
     error_message: Optional[str] = None
     progress: float = 0.0  # 0.0 to 1.0
     metadata: Dict[str, Any] = None
@@ -118,6 +120,12 @@ class IRobotController(ABC):
     for testing without changing higher-level code.
     """
 
+    @property
+    @abstractmethod
+    def id(self) -> str:
+        """Unique identifier for the robot controller."""
+        pass
+
     @abstractmethod
     def connect(self) -> None:
         """Establish connection to robot controller."""
@@ -156,6 +164,12 @@ class IRobotAgent(ABC):
     Implementations might use different LLMs, reasoning strategies, or hardware
     interfaces while maintaining the same API.
     """
+
+    @property
+    @abstractmethod
+    def id(self) -> str:
+        """Unique identifier for the robot agent."""
+        pass
 
     @abstractmethod
     async def arun(
@@ -225,17 +239,14 @@ class ITaskManager(ABC):
         pass
 
     @abstractmethod
-    async def update_task_status(
-        self, task_id: str, status: TaskStatus, error_message: Optional[str] = None
+    async def update_task(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        status_message: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update the status of a task."""
-        pass
-
-    @abstractmethod
-    async def update_task_progress(
-        self, task_id: str, progress: float, status_message: Optional[str] = None
-    ) -> None:
-        """Update task progress (0.0 to 1.0) with optional status message."""
         pass
 
     @abstractmethod

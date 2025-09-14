@@ -34,13 +34,17 @@ class MockRobotAgent(IRobotAgent):
         self.logger = logging.getLogger("mock_agent")
         logging.basicConfig(level=logging.INFO)
 
+    @property
+    def id(self) -> str:
+        return "mock_robot"
+
     async def arun(
         self, instruction: str, task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         if self.task_manager is not None:
             if task_id is None:
                 task_id = await self.task_manager.create_task(instruction)
-            await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+            await self.task_manager.update_task(task_id, TaskStatus.RUNNING)
         self.logger.info(
             "arun started: task_id=%s instruction=%s", task_id, instruction
         )
@@ -50,7 +54,7 @@ class MockRobotAgent(IRobotAgent):
             for i in range(3):
                 await self.message_broker.publish(
                     Message(
-                        message_type=MessageType.STREAMING_DATA,
+                        message_type=MessageType.TASK_PROGRESS,
                         task_id=task_id,
                         timestamp=datetime.now(),
                         data={"type": "progress", "progress": (i + 1) / 3},
@@ -68,7 +72,7 @@ class MockRobotAgent(IRobotAgent):
             )
 
         if self.task_manager is not None and task_id is not None:
-            await self.task_manager.update_task_status(task_id, TaskStatus.COMPLETED)
+            await self.task_manager.update_task(task_id, TaskStatus.COMPLETED)
 
         return {"status": "completed", "task_id": task_id}
 
@@ -78,25 +82,12 @@ class MockRobotAgent(IRobotAgent):
         if self.task_manager is not None:
             if task_id is None:
                 task_id = await self.task_manager.create_task(instruction)
-            await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+            await self.task_manager.update_task(task_id, TaskStatus.RUNNING)
         self.logger.info(
             "astream started: task_id=%s instruction=%s", task_id, instruction
         )
-
-        # Simulate warmup
-        for i in range(2):
-            event = {"type": "warmup_progress", "progress": (i + 1) / 2}
-            if self.message_broker is not None and task_id is not None:
-                await self.message_broker.publish(
-                    Message(
-                        message_type=MessageType.STREAMING_DATA,
-                        task_id=task_id,
-                        timestamp=datetime.now(),
-                        data=event,
-                    )
-                )
-            yield event
-            await asyncio.sleep(0.01)
+        # Give subscribers a moment to attach before emitting the first event
+        await asyncio.sleep(0.01)
 
         # Simulate a short progression of actions
         for i in range(3):
@@ -106,7 +97,7 @@ class MockRobotAgent(IRobotAgent):
             if self.message_broker is not None and task_id is not None:
                 await self.message_broker.publish(
                     Message(
-                        message_type=MessageType.STREAMING_DATA,
+                        message_type=MessageType.TASK_PROGRESS,
                         task_id=task_id,
                         timestamp=datetime.now(),
                         data=event,
@@ -127,7 +118,7 @@ class MockRobotAgent(IRobotAgent):
             )
 
         if self.task_manager is not None and task_id is not None:
-            await self.task_manager.update_task_status(task_id, TaskStatus.COMPLETED)
+            await self.task_manager.update_task(task_id, TaskStatus.COMPLETED)
 
         yield {
             "task_id": task_id,
@@ -153,7 +144,8 @@ async def mock_agent_worker_loop(
     Subscribe to TASK_STARTED, claim tasks, and execute via mock agent.
     Mirrors the real worker loop behavior for integration tests.
     """
-    async for msg in message_broker.subscribe(message_types=[MessageType.TASK_STARTED]):
+    # Listen for task creation (new contract: server emits TASK_CREATED)
+    async for msg in message_broker.subscribe(message_types=[MessageType.TASK_CREATED]):
         try:
             if not isinstance(msg.data, dict) or msg.data.get("source") != "mcp_server":
                 continue
@@ -169,13 +161,20 @@ async def mock_agent_worker_loop(
             claimed = await task_manager.claim_task(task_id, worker_id)
             if not claimed:
                 continue
+            # Announce task start
+            await message_broker.publish(
+                Message(
+                    message_type=MessageType.TASK_STARTED,
+                    task_id=task_id,
+                    timestamp=datetime.now(),
+                    data={"source": "mock_worker", "robot_id": robot_id},
+                )
+            )
             async for _ in agent.astream(instruction, task_id=task_id):
                 pass
         except Exception as e:
             try:
-                await task_manager.update_task_status(
-                    task_id, TaskStatus.FAILED, str(e)
-                )
+                await task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
             except Exception:
                 pass
             try:

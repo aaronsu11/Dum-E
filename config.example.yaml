@@ -1,0 +1,43 @@
+# Dum-E configuration file (YAML)
+#
+# Copy this file to your own config (e.g. my-dum-e.yaml) and edit values.
+# CLI flags override values in this file when provided.
+#
+# Two common scenarios are shown below:
+# 1) Mock agent (no hardware required) -> set agent.use_mock: true
+# 2) Real robot (hardware required)     -> set agent.use_mock: false and fill controller fields
+
+backend:
+  # Logical namespace to isolate local shared-memory backends
+  # Change this to run multiple independent stacks on the same machine
+  namespace: "default"
+
+  # Optional cloud backends (not required for local SHM mode)
+  aws_region: null          # e.g. "us-west-2"
+  mqtt_endpoint: null       # e.g. "a1b2c3d4e5f6-ats.iot.us-west-2.amazonaws.com"
+  mqtt_topic_prefix: null   # e.g. "dum-e/dev"
+  dynamodb_table: null      # e.g. "dum_e_tasks_dev"
+
+agent:
+  # Toggle between mock and real agent
+  # - true: starts a lightweight MockRobotAgent with no hardware
+  # - false: starts the real SO-ARM10x agent (requires a robot connected)
+  use_mock: false
+
+  # Agent profile (reserved for future profiles/configs)
+  profile: "default" # "default" or "aws"
+
+controller:
+  # Hardware configuration for the SO-ARM10x controller
+  # See https://huggingface.co/docs/lerobot/en/so101 for more details
+  robot_type: "so101_follower" # the type of the robot
+  robot_id: "my_awesome_follower_arm" # the ID used for calibration
+  robot_port: "/dev/ttyACM0" # the serial port of the robot
+  wrist_cam_idx: 0 # the OpenCV index of the wrist camera
+  front_cam_idx: 1 # the OpenCV index of the front camera
+  show_images: false # show camera images for debugging (may slow down the robot)
+
+  # Policy server settings
+  policy_host: "localhost" # the host IP of the policy server
+  policy_port: 5555 # the port of the policy server
+  action_horizon: 8 # the number of action steps to generate each time

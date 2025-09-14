@@ -17,8 +17,8 @@ async def test_agent_with_shared_memory_interfaces():
 
     - Creates SHM broker and task manager
     - Runs MockRobotAgent.astream to emit streaming events
-    - Subscribes server-side to collect STREAMING_DATA and TASK_COMPLETED
-    - Asserts we received warmup and assistant messages and final completion
+    - Subscribes server-side to collect TASK_PROGRESS and TASK_COMPLETED
+    - Asserts we received assistant messages and final completion
     - Confirms task status transitioned to COMPLETED with timestamps
     """
 
@@ -55,7 +55,7 @@ async def test_agent_with_shared_memory_interfaces():
             async def server_listener():
                 async for m in broker.subscribe(
                     message_types=[
-                        MessageType.STREAMING_DATA,
+                        MessageType.TASK_PROGRESS,
                         MessageType.TASK_COMPLETED,
                     ],
                     task_id=task_id,
@@ -73,12 +73,10 @@ async def test_agent_with_shared_memory_interfaces():
             await asyncio.wait_for(listen_task, timeout=1.0)
 
             # Validate that we saw multiple streaming data and a completion
-            assert any(m.message_type == MessageType.STREAMING_DATA for m in received)
+            assert any(m.message_type == MessageType.TASK_PROGRESS for m in received)
             assert any(m.message_type == MessageType.TASK_COMPLETED for m in received)
 
-            # Validate warmup messages and assistant step messages are present
-            warmups = [m for m in received if m.data.get("type") == "warmup_progress"]
-            assert len(warmups) >= 1
+            # Validate assistant step messages are present
             assistant_msgs = [
                 m
                 for m in received

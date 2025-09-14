@@ -5,7 +5,7 @@ import sys
 import asyncio
 from multiprocessing.managers import SharedMemoryManager
 
-import orchestrator
+import dum_e
 from fastmcp import Client
 from shared import BackendConfig
 
@@ -14,7 +14,7 @@ def test_spawn_mcp_server_env_injection():
     """Ensure MCP server is spawned with injected namespace and extras.
 
     Stubs subprocess.Popen and inspects the command/env passed by
-    orchestrator._spawn_mcp_server.
+    dum_e._spawn_mcp_server.
     """
     popen_calls = []
 
@@ -28,7 +28,7 @@ def test_spawn_mcp_server_env_injection():
     with mock.patch("subprocess.Popen", DummyPopen):
         cfg = BackendConfig(namespace="unit")
         extra_env = {"DUME_IPC": "shm", "FOO": "BAR"}
-        orchestrator._spawn_mcp_server(cfg, extra_env)
+        dum_e._spawn_mcp_server(cfg, extra_env)
 
     assert len(popen_calls) == 1
     cmd, env = popen_calls[0]
@@ -41,7 +41,7 @@ def test_spawn_mcp_server_env_injection():
 def test_spawn_agent_worker_mock_env_injection():
     """Ensure mock agent worker is spawned with correct CLI and env.
 
-    Validates that orchestrator chooses tests.mocks worker path when
+    Validates that dum_e chooses tests.mocks worker path when
     use_mock=True and forwards namespace and shm indicator to env.
     """
     popen_calls = []
@@ -57,7 +57,7 @@ def test_spawn_agent_worker_mock_env_injection():
         cfg = BackendConfig(namespace="unit")
         agent_args = {"use_mock": True, "id": "mock_robot"}
         extra_env = {"DUME_IPC": "shm"}
-        orchestrator._spawn_agent_worker(cfg, agent_args, extra_env)
+        dum_e._spawn_agent_worker(cfg, agent_args, extra_env)
 
     assert len(popen_calls) == 1
     cmd, env = popen_calls[0]
@@ -82,7 +82,7 @@ def test_spawn_pipecat_server_env_injection():
     with mock.patch("subprocess.Popen", DummyPopen):
         cfg = BackendConfig(namespace="unit")
         extra_env = {"FOO": "BAR"}
-        orchestrator._spawn_pipecat_server(cfg, extra_env)
+        dum_e._spawn_pipecat_server(cfg, extra_env)
 
     assert len(popen_calls) == 1
     cmd, env = popen_calls[0]
@@ -98,21 +98,21 @@ def test_build_backend_config_namespace_resolution(monkeypatch):
         namespace = None
 
     cfg = {}
-    bc = orchestrator.build_backend_config(Args, cfg)
+    bc = dum_e.build_backend_config(Args, cfg)
     assert bc.namespace == "env"
 
     class Args2:
         namespace = "cli"
 
-    bc2 = orchestrator.build_backend_config(Args2, cfg)
+    bc2 = dum_e.build_backend_config(Args2, cfg)
     assert bc2.namespace == "cli"
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_http_progress_integration(monkeypatch):
+async def test_dum_e_http_progress_integration(monkeypatch):
     """End-to-end HTTP integration with FastMCP client and mock worker.
 
-    - Spawns MCP server (HTTP) and a mock agent worker using orchestrator helpers
+    - Spawns MCP server (HTTP) and a mock agent worker using dum_e helpers
     - Connects a FastMCP Client to the HTTP endpoint and calls execute_robot_instruction
     - Captures progress events via client's progress_handler and validates streaming
     - Terminates all processes cleanly after assertions
@@ -132,7 +132,7 @@ async def test_orchestrator_http_progress_integration(monkeypatch):
         use_mock = True
 
     cfg = {}
-    backend_cfg = orchestrator.build_backend_config(Args, cfg)
+    backend_cfg = dum_e.build_backend_config(Args, cfg)
 
     # Force SHM path
     monkeypatch.setenv("DUME_IPC", "shm")
@@ -159,19 +159,19 @@ async def test_orchestrator_http_progress_integration(monkeypatch):
         for k, v in shm_env.items():
             monkeypatch.setenv(k, v)
 
-        # Start the actual HTTP MCP server process (no stdio) with SHM env using orchestrator helpers
+        # Start the actual HTTP MCP server process (no stdio) with SHM env using dum_e helpers
         # Use alternate port to avoid collisions across concurrent tests
         shm_env_with_port = dict(shm_env)
         shm_env_with_port["DUME_MCP_PORT"] = "8010"
-        server_proc = orchestrator._spawn_mcp_server(backend_cfg, shm_env_with_port)
+        server_proc = dum_e._spawn_mcp_server(backend_cfg, shm_env_with_port)
         # Start a mock agent worker that consumes TASK_STARTED and completes the task
-        worker_proc = orchestrator._spawn_agent_worker(
+        worker_proc = dum_e._spawn_agent_worker(
             backend_cfg,
             {"use_mock": True, "id": "mock_robot"},
             shm_env,
         )
         # Start the independent Pipecat server (no SHM dependency)
-        pipecat_proc = orchestrator._spawn_pipecat_server(backend_cfg)
+        pipecat_proc = dum_e._spawn_pipecat_server(backend_cfg)
         try:
             # Wait for port to be open
             async def _wait_for_port(host: str, port: int, timeout: float = 5.0):
@@ -221,10 +221,10 @@ async def test_orchestrator_http_progress_integration(monkeypatch):
 
                 # Validate that progress events from the agent were propagated
                 assert len(progress_events) > 0
-                # We expect warmup progress (0<progress<100) with message 'warmup_progress'
+                # Expect at least one assistant message forwarded (e.g., 'step 1')
                 assert any(
-                    (e["progress"] is not None and 0 < e["progress"] < 100)
-                    and (e["message"] == "warmup_progress")
+                    isinstance(e.get("message"), str)
+                    and e["message"].startswith("step ")
                     for e in progress_events
                 )
                 # We expect a completion message

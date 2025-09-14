@@ -34,13 +34,8 @@ async def test_shared_memory_task_manager_lifecycle_and_claim():
             claimed = await tm.claim_task(task_id, worker_id="w1")
             assert claimed
 
-            # Update progress
-            await tm.update_task_progress(task_id, 0.5, "halfway")
-            t = await tm.get_task(task_id)
-            assert t is not None and t.progress == 0.5
-
             # Complete
-            await tm.update_task_status(task_id, TaskStatus.COMPLETED)
+            await tm.update_task(task_id, TaskStatus.COMPLETED)
             t = await tm.get_task(task_id)
             assert t is not None and t.status == TaskStatus.COMPLETED
 

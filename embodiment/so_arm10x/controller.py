@@ -47,6 +47,7 @@ from lerobot.utils.utils import init_logging, log_say
 
 from shared import IRobotController
 from policy.gr00t.service import ExternalRobotInferenceClient
+from utils import load_config_file
 
 #################################################################################
 
@@ -215,6 +216,9 @@ class SO10xArmController(IRobotController):
                     "Robot serial port is required. Set `port` or env `SO_ARM_PORT`."
                 )
 
+        # Store robot_id for the id property
+        self._robot_id = robot_id
+
         cameras = {
             "wrist": OpenCVCameraConfig(
                 index_or_path=wrist_cam_idx, fps=30, width=640, height=480
@@ -262,6 +266,11 @@ class SO10xArmController(IRobotController):
             "wrist_roll.pos",
             "gripper.pos",
         ]
+
+    @property
+    def id(self) -> str:
+        """Unique identifier for the robot controller."""
+        return self._robot_id
 
     @property
     def camera_keys(self) -> List[str]:
@@ -456,4 +465,37 @@ def eval(cfg: EvalConfig):
 
 
 if __name__ == "__main__":
-    eval()
+    # Support both: 1) YAML/JSON config file and 2) draccus CLI
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=str, help="Path to YAML/JSON config file")
+    parser.add_argument("--instruction", type=str, help="Robot instruction")
+    args, unknown = parser.parse_known_args()
+
+    if args.config:
+        cfg_root = load_config_file(args.config)
+        ctrl = (
+            cfg_root.get("controller", {})
+            if isinstance(cfg_root.get("controller"), dict)
+            else {}
+        )
+        cfg = EvalConfig(
+            robot_type=ctrl.get("robot_type", "so101_follower"),
+            robot_id=ctrl.get("robot_id", "my_awesome_follower_arm"),
+            robot_port=ctrl.get("robot_port", "/dev/ttyUSB0"),
+            wrist_cam_idx=int(ctrl.get("wrist_cam_idx", 0)),
+            front_cam_idx=int(ctrl.get("front_cam_idx", 1)),
+            policy_host=ctrl.get("policy_host", "localhost"),
+            policy_port=int(ctrl.get("policy_port", 5555)),
+            action_horizon=int(ctrl.get("action_horizon", 8)),
+            lang_instruction=args.instruction
+            or ctrl.get("lang_instruction", "Grab a banana and put it on the plate"),
+            play_sounds=bool(ctrl.get("play_sounds", False)),
+            timeout=int(ctrl.get("timeout", 60)),
+            show_images=bool(ctrl.get("show_images", False)),
+        )
+        eval(cfg)
+    else:
+        # Fall back to draccus CLI (supports the dataclass fields directly)
+        eval()

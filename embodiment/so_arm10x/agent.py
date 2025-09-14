@@ -32,6 +32,7 @@ import numpy as np
 from dotenv import load_dotenv
 from loguru import logger
 from strands import Agent, tool
+from strands.agent import AgentResult
 from strands.models import BedrockModel
 from strands.models.anthropic import AnthropicModel
 from tqdm import tqdm
@@ -52,8 +53,7 @@ from shared import (
 )
 from shared.message_broker.shm import get_shared_memory_broker_from_env
 from shared.task_manager.shm import get_shared_memory_task_manager_from_env
-
-from logging_config import create_clean_callback_handler, setup_robot_logging
+from utils import load_config_file, create_clean_callback_handler, setup_robot_logging
 
 load_dotenv()
 
@@ -230,6 +230,9 @@ class SO10xRobotAgent(IRobotAgent):
         self.robot_controller = robot_controller
         self.gr00t_client_instance = gr00t_client_instance
 
+        # Store robot_id for the id property
+        self._robot_id = robot_controller.id
+
         # Initialize MCP server interfaces with defaults if not provided (suppress verbose logging)
         self.task_manager = task_manager
         self.message_broker = message_broker
@@ -327,6 +330,11 @@ Note: Colors in images may appear different due to reflections.""",
 
     # IRobotAgent interface implementation
 
+    @property
+    def id(self) -> str:
+        """Unique identifier for the robot agent."""
+        return self._robot_id
+
     async def arun(
         self, instruction: str, task_id: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -336,7 +344,7 @@ Note: Colors in images may appear different due to reflections.""",
             if self.task_manager is not None:
                 if task_id is None:
                     task_id = await self.task_manager.create_task(instruction)
-                await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+                await self.task_manager.update_task(task_id, TaskStatus.RUNNING)
 
             # Get the Strands agent and execute
             agent = await self._get_strands_agent()
@@ -354,9 +362,7 @@ Note: Colors in images may appear different due to reflections.""",
                 self.robot_controller.move_to_initial_pose()
 
             if self.task_manager is not None and task_id is not None:
-                await self.task_manager.update_task_status(
-                    task_id, TaskStatus.COMPLETED
-                )
+                await self.task_manager.update_task(task_id, TaskStatus.COMPLETED)
 
             return {
                 "task_id": task_id,
@@ -367,9 +373,7 @@ Note: Colors in images may appear different due to reflections.""",
 
         except Exception as e:
             if self.task_manager is not None and task_id is not None:
-                await self.task_manager.update_task_status(
-                    task_id, TaskStatus.FAILED, str(e)
-                )
+                await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
 
             return {
                 "task_id": task_id,
@@ -392,7 +396,7 @@ Note: Colors in images may appear different due to reflections.""",
             if self.task_manager is not None:
                 if task_id is None:
                     task_id = await self.task_manager.create_task(instruction)
-                await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+                await self.task_manager.update_task(task_id, TaskStatus.RUNNING)
 
             # Publish task started message
             if self.message_broker:
@@ -401,11 +405,11 @@ Note: Colors in images may appear different due to reflections.""",
                         message_type=MessageType.TASK_STARTED,
                         task_id=task_id,
                         timestamp=datetime.now(),
-                        data={"instruction": instruction},
+                        data={"instruction": instruction, "source": self.id},
                     )
                 )
 
-            # Get the Strands agent
+            # Get the Strands agent with robot-specific tools
             agent = await self._get_strands_agent()
 
             # Execute with robot hardware context and streaming
@@ -423,23 +427,67 @@ Note: Colors in images may appear different due to reflections.""",
                         "message": "Warming up robot cameras...",
                     }
 
+                # Placeholder for last event
+                data = None
                 # Stream from the Strands agent
+                # See https://strandsagents.com/latest/documentation/docs/user-guide/concepts/streaming/async-iterators/
+                # for more information
                 async for event in agent.stream_async(instruction):
-                    # Enhance event with task information
-                    enriched_event = {"task_id": task_id, **event}
-
-                    # Publish streaming message
-                    if self.message_broker:
-                        await self.message_broker.publish(
-                            Message(
-                                message_type=MessageType.STREAMING_DATA,
-                                task_id=task_id,
-                                timestamp=datetime.now(),
-                                data=enriched_event,
+                    if (
+                        "message" in event
+                        and isinstance(event["message"], dict)
+                        and event["message"].get("role") == "assistant"
+                        and event["message"].get("content")
+                    ):
+                        for content in event["message"]["content"]:
+                            # only yield text messages
+                            if "text" in content:
+                                # Enhance event with task information
+                                data = {
+                                    "task_id": task_id,
+                                    "type": "assistant_message",
+                                    "source": self.id,
+                                    "message": event["message"],
+                                }
+                                # Publish task progress message
+                                if self.message_broker:
+                                    await self.message_broker.publish(
+                                        Message(
+                                            message_type=MessageType.TASK_PROGRESS,
+                                            task_id=task_id,
+                                            timestamp=datetime.now(),
+                                            data=data,
+                                        )
+                                    )
+                                yield data
+                    elif "result" in event:
+                        agent_result: AgentResult = event["result"]
+                        result_message = agent_result.message["content"][-1]
+                        data = {
+                            "task_id": task_id,
+                            "type": "assistant_result",
+                            "source": self.id,
+                            "result": (
+                                result_message if "text" in result_message else None
+                            ),
+                        }
+                        if self.task_manager is not None and task_id is not None:
+                            await self.task_manager.update_task(
+                                task_id,
+                                TaskStatus.COMPLETED,
+                                metadata=agent_result.message,
                             )
-                        )
-
-                    yield enriched_event
+                        # Publish task completed message
+                        if self.message_broker:
+                            await self.message_broker.publish(
+                                Message(
+                                    message_type=MessageType.TASK_COMPLETED,
+                                    task_id=task_id,
+                                    timestamp=datetime.now(),
+                                    data=data,
+                                )
+                            )
+                        # don't yield the result, same data is already yielded in the assistant_message event
 
                 # Reset to initial pose after completion
                 try:
@@ -451,37 +499,9 @@ Note: Colors in images may appear different due to reflections.""",
                         f"⚠️  Failed to reset to initial pose in time after task completion: {pose_error}"
                     )
 
-            if self.task_manager is not None and task_id is not None:
-                await self.task_manager.update_task_status(
-                    task_id, TaskStatus.COMPLETED
-                )
-
-            # Publish completion message
-            if self.message_broker:
-                await self.message_broker.publish(
-                    Message(
-                        message_type=MessageType.TASK_COMPLETED,
-                        task_id=task_id,
-                        timestamp=datetime.now(),
-                        data={"instruction": instruction},
-                    )
-                )
-
-            # Final completion message
-            yield {
-                "task_id": task_id,
-                "type": "completion",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"text": "Task completed successfully"}],
-                },
-            }
-
         except Exception as e:
             if self.task_manager is not None and task_id is not None:
-                await self.task_manager.update_task_status(
-                    task_id, TaskStatus.FAILED, str(e)
-                )
+                await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
 
                 if self.message_broker:
                     # Publish failure message
@@ -593,7 +613,7 @@ async def _agent_worker_loop(
     Subscribe to TASK_STARTED events from the broker, claim tasks, and execute
     them with the robot agent. Designed to work with local in-memory or OTA backends.
     """
-    async for msg in message_broker.subscribe(message_types=[MessageType.TASK_STARTED]):
+    async for msg in message_broker.subscribe(message_types=[MessageType.TASK_CREATED]):
         try:
             # Only handle tasks dispatched by the MCP server (avoid self-loop)
             if not isinstance(msg.data, dict) or msg.data.get("source") != "mcp_server":
@@ -619,13 +639,13 @@ async def _agent_worker_loop(
             # Execute with streaming. The agent will publish streaming updates
             # and final status via the provided message_broker.
             async for _ in agent.astream(instruction, task_id=task_id):
-                # We rely on the agent to publish STREAMING_DATA
+                # We rely on the agent to publish TASK_PROGRESS
                 # Optional logging can be added here if needed
                 pass
         except Exception as exec_error:
             # Best-effort failure reporting
             try:
-                await task_manager.update_task_status(
+                await task_manager.update_task(
                     task_id, TaskStatus.FAILED, str(exec_error)
                 )
             except Exception:
@@ -653,26 +673,30 @@ if __name__ == "__main__":
         import argparse
 
         parser = argparse.ArgumentParser(description="Run SO-ARM10x agent")
+        parser.add_argument("--config", type=str, help="Path to YAML/JSON config file")
+        parser.add_argument(
+            "--namespace",
+            type=str,
+            default=os.getenv("DUME_NAMESPACE", "default"),
+            help="Namespace for shared-memory backends",
+        )
         parser.add_argument(
             "--port",
             type=str,
-            required=True,
             help="Serial port for the arm (e.g., /dev/tty.usbmodemXXXX)",
         )
-        parser.add_argument("--id", type=str, default="my_awesome_follower_arm")
-        parser.add_argument("--wrist_cam_idx", type=int, default=0)
-        parser.add_argument("--front_cam_idx", type=int, default=1)
+        parser.add_argument("--id", type=str)
+        parser.add_argument("--wrist_cam_idx", type=int)
+        parser.add_argument("--front_cam_idx", type=int)
 
         parser.add_argument(
             "--policy_host",
             type=str,
-            default="localhost",
             help="Host for the GR00T policy server",
         )
         parser.add_argument(
             "--profile",
             type=str,
-            default="default",
             help="Model provider profile",
         )
         parser.add_argument(
@@ -688,18 +712,42 @@ if __name__ == "__main__":
 
         args = parser.parse_args()
 
+        # Load config and resolve effective values (CLI > config > defaults)
+        cfg = load_config_file(args.config)
+        cfg_agent: Dict[str, Any] = (
+            cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
+        )
+        cfg_ctrl: Dict[str, Any] = (
+            cfg.get("controller", {}) if isinstance(cfg.get("controller"), dict) else {}
+        )
+        robot_port = args.port or cfg_ctrl.get("robot_port")
+        robot_id = args.id or cfg_ctrl.get("robot_id", "my_awesome_follower_arm")
+        wrist_cam_idx = args.wrist_cam_idx or cfg_ctrl.get("wrist_cam_idx", 0)
+        front_cam_idx = args.front_cam_idx or cfg_ctrl.get("front_cam_idx", 1)
+        policy_host = args.policy_host or cfg_ctrl.get("policy_host", "localhost")
+        profile = args.profile or cfg_agent.get("profile", "default")
+
+        # If a backend namespace is provided in config, export for downstream libs
+        backend_ns = (
+            (cfg.get("backend", {}) or {}).get("namespace")
+            if isinstance(cfg.get("backend"), dict)
+            else None
+        )
+        if backend_ns:
+            os.environ["DUME_NAMESPACE"] = str(backend_ns)
+
         # Configure backends: prefer shared memory when available (DUME_IPC=shm)
         task_manager = get_shared_memory_task_manager_from_env()
         message_broker = get_shared_memory_broker_from_env()
 
         # Create agent with injected backends
         agent = create_robot_agent(
-            robot_port=args.port,
-            robot_id=args.id,
-            wrist_cam_idx=args.wrist_cam_idx,
-            front_cam_idx=args.front_cam_idx,
-            policy_host=args.policy_host,
-            profile=args.profile,
+            robot_port=robot_port,
+            robot_id=robot_id,
+            wrist_cam_idx=wrist_cam_idx,
+            front_cam_idx=front_cam_idx,
+            policy_host=policy_host,
+            profile=profile,
             task_manager=task_manager,
             message_broker=message_broker,
         )
@@ -708,14 +756,13 @@ if __name__ == "__main__":
             import uuid
 
             worker_id = f"agent-worker-{uuid.uuid4()}"
-            logger.info(
-                f"🧩 Worker mode: namespace={args.namespace}, worker_id={worker_id}"
-            )
+            ns = os.getenv("DUME_NAMESPACE", "default")
+            logger.info(f"🧩 Worker mode: namespace={ns}, worker_id={worker_id}")
             await _agent_worker_loop(
                 agent=agent,
                 task_manager=task_manager,
                 message_broker=message_broker,
-                robot_id=args.id,
+                robot_id=robot_id,
                 worker_id=worker_id,
             )
             return

@@ -1,4 +1,3 @@
-import asyncio
 import fcntl
 import json
 import os
@@ -92,8 +91,12 @@ class SharedMemoryTaskManager(ITaskManager):
                 continue
         return None
 
-    async def update_task_status(
-        self, task_id: str, status: TaskStatus, error_message: Optional[str] = None
+    async def update_task(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        status_message: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         fd = _acquire_file_lock(self.lock_file)
         try:
@@ -106,7 +109,11 @@ class SharedMemoryTaskManager(ITaskManager):
                     continue
                 if t.task_id == task_id:
                     t.status = status
-                    t.error_message = error_message
+                    t.status_message = status_message
+                    if metadata:
+                        t.metadata = metadata
+                        t.metadata["last_update"] = datetime.now().isoformat()
+
                     now = datetime.now()
                     if status == TaskStatus.RUNNING and not t.started_at:
                         t.started_at = now
@@ -116,29 +123,6 @@ class SharedMemoryTaskManager(ITaskManager):
                         TaskStatus.CANCELLED,
                     ]:
                         t.completed_at = now
-                    self.tasks[i] = self._encode_task(t)
-                    return
-        finally:
-            _release_file_lock(fd)
-
-    async def update_task_progress(
-        self, task_id: str, progress: float, status_message: Optional[str] = None
-    ) -> None:
-        progress = max(0.0, min(1.0, progress))
-        fd = _acquire_file_lock(self.lock_file)
-        try:
-            for i in range(self.capacity):
-                if not self.tasks[i].strip():
-                    continue
-                try:
-                    t = self._decode_task(self.tasks[i].rstrip())
-                except Exception:
-                    continue
-                if t.task_id == task_id:
-                    t.progress = progress
-                    if status_message:
-                        t.metadata["last_status_message"] = status_message
-                        t.metadata["last_update"] = datetime.now().isoformat()
                     self.tasks[i] = self._encode_task(t)
                     return
         finally:
@@ -164,7 +148,7 @@ class SharedMemoryTaskManager(ITaskManager):
         return result
 
     async def cancel_task(self, task_id: str) -> bool:
-        await self.update_task_status(task_id, TaskStatus.CANCELLED)
+        await self.update_task(task_id, TaskStatus.CANCELLED)
         return True
 
     async def claim_task(self, task_id: str, worker_id: str) -> bool:

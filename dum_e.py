@@ -1,9 +1,8 @@
 import argparse
-import json
+import re
 import os
 import subprocess
 import sys
-from pathlib import Path
 from typing import Any, Dict, Optional
 from multiprocessing.managers import SharedMemoryManager
 
@@ -11,29 +10,7 @@ from loguru import logger
 
 from shared import BackendConfig
 from shared.fleet_manager import get_shared_memory_fleet_manager_from_env
-
-
-def _load_config_file(config_path: Optional[str]) -> Dict[str, Any]:
-    if not config_path:
-        return {}
-
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    if path.suffix.lower() in {".json"}:
-        return json.loads(path.read_text())
-
-    if path.suffix.lower() in {".yaml", ".yml"}:
-        try:
-            import yaml  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "PyYAML is required to load YAML configs. Install with: pip install pyyaml"
-            ) from e
-        return yaml.safe_load(path.read_text()) or {}
-
-    raise ValueError("Unsupported config format. Use .json or .yaml/.yml")
+from utils import load_config_file
 
 
 def build_backend_config(
@@ -170,7 +147,7 @@ def main():
         "--namespace",
         type=str,
         default=os.getenv("DUME_NAMESPACE", "default"),
-        help="Namespace for in-memory backends or topic/table prefixes",
+        help="Namespace for shared memory backends or topic/table prefixes",
     )
 
     # Agent overrides (optional if provided in config)
@@ -188,19 +165,22 @@ def main():
 
     args = parser.parse_args()
 
-    cfg = _load_config_file(args.config)
+    cfg = load_config_file(args.config)
 
     # Build backend config (transport-agnostic)
     backend_config = build_backend_config(args, cfg)
 
     # Agent config resolution (CLI overrides config file)
     agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
+    ctrl_cfg = (
+        cfg.get("controller", {}) if isinstance(cfg.get("controller"), dict) else {}
+    )
     agent_args = {
-        "port": args.port or agent_cfg.get("port"),
-        "id": args.id or agent_cfg.get("id", "my_awesome_follower_arm"),
-        "wrist_cam_idx": args.wrist_cam_idx or agent_cfg.get("wrist_cam_idx", 0),
-        "front_cam_idx": args.front_cam_idx or agent_cfg.get("front_cam_idx", 1),
-        "policy_host": args.policy_host or agent_cfg.get("policy_host", "localhost"),
+        "port": args.port or ctrl_cfg.get("robot_port"),
+        "id": args.id or ctrl_cfg.get("robot_id", "my_awesome_follower_arm"),
+        "wrist_cam_idx": args.wrist_cam_idx or ctrl_cfg.get("wrist_cam_idx", 0),
+        "front_cam_idx": args.front_cam_idx or ctrl_cfg.get("front_cam_idx", 1),
+        "policy_host": args.policy_host or ctrl_cfg.get("policy_host", "localhost"),
         "profile": args.profile or agent_cfg.get("profile", "default"),
         "use_mock": bool(args.use_mock or agent_cfg.get("use_mock", False)),
     }
@@ -272,7 +252,9 @@ def main():
                         import asyncio as _asyncio
 
                         rid = str(agent_args.get("id", "my_awesome_follower_arm"))
-                        _asyncio.run(fm.register_robot(robot_id=rid, name=rid))
+                        # Convert rid to a name without special characters
+                        clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", rid)
+                        _asyncio.run(fm.register_robot(robot_id=rid, name=clean_name))
                         _asyncio.run(fm.set_enabled(robot_id=rid, enabled=True))
                 except Exception as e:
                     logger.warning("Fleet registration failed: {}", e)

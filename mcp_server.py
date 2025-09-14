@@ -48,21 +48,19 @@ FLEET_MANAGER: Optional[IFleetManager] = _SHM_FLEET if _SHM_FLEET else None
 
 async def _forward_event_to_ctx(event_data: dict, ctx: Context) -> None:
     """Forward a broker event payload to MCP client via ctx.report_progress."""
-    # Extract human-friendly message text if present
+    # Extract human-friendly assistant message text if present
     text_message: Optional[str] = None
-    if "message" in event_data and isinstance(event_data["message"], dict):
-        contents = event_data["message"].get("content", [])
-        texts: List[str] = []
-        for c in contents:
-            if isinstance(c, dict) and "text" in c:
-                texts.append(c["text"])
-        if texts:
-            text_message = " ".join(texts)
-    # Fallbacks
-    if not text_message and "type" in event_data:
-        text_message = str(event_data.get("type"))
-    if not text_message:
-        text_message = "Processing..."
+    if "message" in event_data:
+        if isinstance(event_data["message"], dict):
+            contents = event_data["message"].get("content", [])
+            texts: List[str] = []
+            for c in contents:
+                if isinstance(c, dict) and "text" in c:
+                    texts.append(c["text"])
+            if texts:
+                text_message = " ".join(texts)
+        elif isinstance(event_data["message"], str):
+            text_message = event_data["message"]
 
     # Progress, if provided by the event
     progress_value = event_data.get("progress")
@@ -123,14 +121,6 @@ def _parse_task_status(status: Optional[str]) -> Optional[TaskStatus]:
             return None
 
 
-@mcp.tool()
-async def list_tasks(status: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
-    """List tasks with optional status filter. Status can be one of pending, running, completed, failed, cancelled."""
-    filt = _parse_task_status(status)
-    tasks = await TASK_MANAGER.list_tasks(status=filt, limit=limit)
-    return {"tasks": [_task_to_dict(t) for t in tasks]}
-
-
 def _robot_to_dict(info: RobotInfo) -> Dict[str, Any]:
     return {
         "robot_id": info.robot_id,
@@ -182,6 +172,131 @@ async def set_robot_enabled(robot_id: str, enabled: bool) -> Dict[str, Any]:
         return {"error": "Fleet manager not available in this deployment"}
     ok = await FLEET_MANAGER.set_enabled(robot_id, enabled)
     return {"robot_id": robot_id, "enabled": enabled, "updated": bool(ok)}
+
+
+@mcp.tool(meta={"long_running": True})
+async def execute_robot_instruction(
+    instruction: str,
+    robot_id: Optional[str],
+    ctx: Context,
+    timeout_s: int = 900,
+) -> dict:
+    """
+    Trigger a robot task on the edge agent and stream progress to the MCP client.
+
+    This creates a task via ITaskManager and publishes a TASK_CREATED message via IMessageBroker.
+    The edge Dum-E agent should pick up the task, execute it, and publish streaming updates.
+
+    All updates are forwarded to the MCP client through ctx.report_progress,
+    making this tool compatible with streamable HTTP clients.
+    """
+    # Create task record
+    task_id = await TASK_MANAGER.create_task(
+        instruction,
+        metadata={
+            "source": "mcp_server",
+            "robot_id": robot_id,
+            "created_at": datetime.now().isoformat(),
+        },
+    )
+    logger.info("Created task %s for instruction: %s", task_id, instruction)
+
+    # Stream events for this task back to the MCP client
+    done = asyncio.Event()
+    final_status: str = "unknown"
+    final_error: Optional[str] = None
+
+    async def _stream_updates():
+        nonlocal final_status, final_error
+        async for message in MESSAGE_BROKER.subscribe(
+            message_types=[
+                MessageType.TASK_STARTED,
+                MessageType.STREAMING_DATA,
+                MessageType.TASK_PROGRESS,
+                MessageType.TASK_COMPLETED,
+                MessageType.TASK_FAILED,
+            ],
+            task_id=task_id,
+        ):
+            message: Message = message
+            if message.message_type == MessageType.TASK_STARTED:
+                await ctx.report_progress(progress=0, total=100, message="Task started")
+                continue
+            elif message.message_type in (
+                MessageType.STREAMING_DATA,
+                MessageType.TASK_PROGRESS,
+            ):
+                await _forward_event_to_ctx(message.data, ctx)
+                continue
+            elif message.message_type == MessageType.TASK_COMPLETED:
+                await ctx.report_progress(
+                    progress=100, total=100, message="Task completed"
+                )
+                final_status = message.data.get(
+                    "result", "completed with unknown result"
+                )
+                done.set()
+                break
+            elif message.message_type == MessageType.TASK_FAILED:
+                err_text = (
+                    message.data.get("error")
+                    if isinstance(message.data, dict)
+                    else None
+                )
+                await ctx.report_progress(
+                    progress=100, total=100, message=f"Task failed: {err_text}"
+                )
+                final_status = "failed"
+                final_error = err_text
+                done.set()
+                break
+
+    streamer = asyncio.create_task(_stream_updates())
+
+    # Announce task start so an edge agent can claim/execute it
+    await MESSAGE_BROKER.publish(
+        Message(
+            message_type=MessageType.TASK_CREATED,
+            task_id=task_id,
+            timestamp=datetime.now(),
+            data={
+                "instruction": instruction,
+                "robot_id": robot_id,
+                "source": "mcp_server",
+            },
+        )
+    )
+    logger.info("Published TASK_CREATED for task %s", task_id)
+
+    await ctx.report_progress(progress=0, total=100, message="Task dispatched to agent")
+
+    try:
+        await asyncio.wait_for(done.wait(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        await ctx.report_progress(
+            progress=100,
+            total=100,
+            message="Timed out waiting for agent to finish task",
+        )
+        final_status = "timeout"
+    finally:
+        streamer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await streamer
+
+    result: dict = {"task_id": task_id, "status": final_status}
+    if final_error:
+        result["error"] = final_error
+    logger.info("Returning result for task %s: %s", task_id, result)
+    return result
+
+
+@mcp.tool()
+async def list_tasks(status: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
+    """List tasks with optional status filter. Status can be one of pending, running, completed, failed, cancelled."""
+    filt = _parse_task_status(status)
+    tasks = await TASK_MANAGER.list_tasks(status=filt, limit=limit)
+    return {"tasks": [_task_to_dict(t) for t in tasks]}
 
 
 @mcp.tool()
@@ -243,117 +358,6 @@ async def list_last_messages(
             continue
         out.append(_message_to_dict(m))
     return {"messages": out}
-
-
-@mcp.tool(meta={"long_running": True})
-async def execute_robot_instruction(
-    instruction: str,
-    robot_id: Optional[str],
-    ctx: Context,
-    timeout_s: int = 900,
-) -> dict:
-    """
-    Trigger a robot task on the edge agent and stream progress to the MCP client.
-
-    This creates a task via ITaskManager and publishes a TASK_STARTED message via
-    IMessageBroker. The edge Dum-E agent should pick up the task (via its own
-    subscription to the broker), execute it, and publish streaming updates.
-
-    All updates are forwarded to the MCP client through ctx.report_progress,
-    making this tool compatible with streamable HTTP clients.
-    """
-    # Create task record
-    task_id = await TASK_MANAGER.create_task(
-        instruction,
-        metadata={
-            "source": "mcp_server",
-            "robot_id": robot_id,
-            "created_at": datetime.now().isoformat(),
-        },
-    )
-    logger.info("Created task %s for instruction: %s", task_id, instruction)
-
-    # Announce task start so an edge agent can claim/execute it
-    await MESSAGE_BROKER.publish(
-        Message(
-            message_type=MessageType.TASK_STARTED,
-            task_id=task_id,
-            timestamp=datetime.now(),
-            data={
-                "instruction": instruction,
-                "robot_id": robot_id,
-                "source": "mcp_server",
-            },
-        )
-    )
-    logger.info("Published TASK_STARTED for task %s", task_id)
-
-    await ctx.report_progress(progress=0, total=100, message="Task dispatched to agent")
-
-    # Stream events for this task back to the MCP client
-    done = asyncio.Event()
-    final_status: str = "unknown"
-    final_error: Optional[str] = None
-
-    async def _stream_updates():
-        nonlocal final_status, final_error
-        async for message in MESSAGE_BROKER.subscribe(
-            message_types=[
-                MessageType.STREAMING_DATA,
-                MessageType.TASK_PROGRESS,
-                MessageType.TASK_COMPLETED,
-                MessageType.TASK_FAILED,
-            ],
-            task_id=task_id,
-        ):
-            if message.message_type in (
-                MessageType.STREAMING_DATA,
-                MessageType.TASK_PROGRESS,
-            ):
-                await _forward_event_to_ctx(message.data, ctx)
-                continue
-
-            if message.message_type == MessageType.TASK_COMPLETED:
-                await ctx.report_progress(
-                    progress=100, total=100, message="Task completed"
-                )
-                final_status = "completed"
-                done.set()
-                break
-
-            if message.message_type == MessageType.TASK_FAILED:
-                err_text = (
-                    message.data.get("error")
-                    if isinstance(message.data, dict)
-                    else None
-                )
-                await ctx.report_progress(
-                    progress=100, total=100, message=f"Task failed: {err_text}"
-                )
-                final_status = "failed"
-                final_error = err_text
-                done.set()
-                break
-
-    streamer = asyncio.create_task(_stream_updates())
-
-    try:
-        await asyncio.wait_for(done.wait(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        await ctx.report_progress(
-            progress=100, total=100, message="Timed out waiting for agent updates"
-        )
-        final_status = "timeout"
-    finally:
-        streamer.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await streamer
-
-    result: dict = {"task_id": task_id, "status": final_status}
-    if final_error:
-        result["error"] = final_error
-    logger.info("Returning result for task %s: %s", task_id, result)
-    return result
 
 
 @mcp.tool()

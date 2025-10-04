@@ -323,7 +323,7 @@ We welcome contributions from the robotics and AI community! Here's how you can 
    - Use Python 3.12 type hints
    - Follow PEP 8 style guidelines
    - Add comprehensive docstrings
-   - Maintain test coverage >95%
+   - Maintain test coverage > 50%
 
 3. **Testing Requirements**
    ```bash

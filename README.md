@@ -162,9 +162,9 @@ Choose the setup that best matches your needs and hardware availability. The fol
     cp config.example.yaml my-dum-e.yaml
     ```
     Edit my-dum-e.yaml:
-    - Set controller.robot_type/robot_port/robot_id/wrist_cam_idx/front_cam_idx
-    - Set controller.policy_host to your gr00t policy server IP (or localhost)
-    - Optionally set agent.profile to use different model presets
+    - Set `controller.robot_type`/`robot_port`/`robot_id`/`wrist_cam_idx`/`front_cam_idx`
+    - Set `controller.policy_host` to your gr00t policy server IP (or `localhost`)
+    - Optionally set `agent.profile` to use different model presets
 
 
 5. Test policy execution
@@ -199,9 +199,6 @@ Choose the setup that best matches your needs and hardware availability. The fol
     ```bash
     # One-shot instruction (agent inherits controller.* unless overridden in agent section)
     python -m embodiment.so_arm10x.agent --config my-dum-e.yaml --instruction "<your-instruction>"
-
-    # Worker mode to consume tasks sent from MCP
-    python -m embodiment.so_arm10x.agent --config my-dum-e.yaml --worker
     ```
 
 8. Start Dum-E
@@ -211,6 +208,11 @@ Choose the setup that best matches your needs and hardware availability. The fol
     python dum_e.py --config my-dum-e.yaml
     ```
     This will launch the voice interface at `http://localhost:7860` where you can connect and speak to Dum-E using your microphone. Have fun!
+
+    > You can also start only the voice interface and MCP servers. Useful for testing the servers independently without the robot hardware:
+    > ```bash
+    > python dum_e.py --node servers --config my-dum-e.yaml
+    > ```
 
 ## 🏗️ Architecture Overview
 
@@ -318,7 +320,7 @@ We welcome contributions from the robotics and AI community! Here's how you can 
    ```
 
 2. **Follow Code Standards**
-   - Use Python 3.10 type hints
+   - Use Python 3.12 type hints
    - Follow PEP 8 style guidelines
    - Add comprehensive docstrings
    - Maintain test coverage >95%

@@ -202,7 +202,7 @@ if __name__ == "__main__":
         help="Run in worker mode: consume TASK_STARTED and execute",
     )
     parser.add_argument(
-        "--robot_id",
+        "--id",
         type=str,
         default="mock_robot",
         help="Robot ID for routing",
@@ -224,7 +224,7 @@ if __name__ == "__main__":
                 agent=agent,
                 task_manager=task_manager,
                 message_broker=message_broker,
-                robot_id=args.robot_id,
+                robot_id=args.id,
                 worker_id=worker_id,
             )
         else:

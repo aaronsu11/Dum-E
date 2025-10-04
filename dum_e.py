@@ -79,6 +79,7 @@ def _spawn_pipecat_server(
 def _spawn_agent_worker(
     config: BackendConfig,
     agent_args: Dict[str, Any],
+    config_path: Optional[str] = None,
     extra_env: Optional[Dict[str, str]] = None,
 ):
     env = os.environ.copy()
@@ -97,7 +98,7 @@ def _spawn_agent_worker(
             "-m",
             "tests.mocks",
             "--worker",
-            "--robot_id",
+            "--id",
             str(agent_args.get("id", "mock_robot")),
         ]
     else:
@@ -108,19 +109,29 @@ def _spawn_agent_worker(
             "--worker",
             "--namespace",
             config.namespace,
-            "--port",
-            str(agent_args["port"]),
-            "--id",
-            str(agent_args.get("id", "my_awesome_follower_arm")),
-            "--wrist_cam_idx",
-            str(agent_args.get("wrist_cam_idx", 0)),
-            "--front_cam_idx",
-            str(agent_args.get("front_cam_idx", 1)),
-            "--policy_host",
-            str(agent_args.get("policy_host", "localhost")),
-            "--profile",
-            str(agent_args.get("profile", "default")),
         ]
+
+        # Pass config file path if provided, otherwise pass individual args
+        if config_path:
+            cmd.extend(["--config", config_path])
+        else:
+            # Fallback: pass individual args (for backward compatibility)
+            cmd.extend(
+                [
+                    "--port",
+                    str(agent_args["port"]),
+                    "--id",
+                    str(agent_args.get("id", "my_awesome_follower_arm")),
+                    "--wrist_cam_idx",
+                    str(agent_args.get("wrist_cam_idx", 0)),
+                    "--front_cam_idx",
+                    str(agent_args.get("front_cam_idx", 1)),
+                    "--policy_host",
+                    str(agent_args.get("policy_host", "localhost")),
+                    "--profile",
+                    str(agent_args.get("profile", "default")),
+                ]
+            )
 
     logger.info(
         "Starting agent worker with namespace={} and args={}",
@@ -134,9 +145,9 @@ def main():
     parser = argparse.ArgumentParser(description="Dum-E Orchestrator")
     parser.add_argument(
         "--node",
-        choices=["server", "agent", "both"],
-        default="both",
-        help="Which components to run on this host",
+        choices=["agent", "servers", "all"],
+        default="all",
+        help="Whether to run only the agent worker, the servers (voice and MCP) or all components",
     )
     parser.add_argument(
         "--config",
@@ -169,26 +180,6 @@ def main():
 
     # Build backend config (transport-agnostic)
     backend_config = build_backend_config(args, cfg)
-
-    # Agent config resolution (CLI overrides config file)
-    agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
-    ctrl_cfg = (
-        cfg.get("controller", {}) if isinstance(cfg.get("controller"), dict) else {}
-    )
-    agent_args = {
-        "port": args.port or ctrl_cfg.get("robot_port"),
-        "id": args.id or ctrl_cfg.get("robot_id", "my_awesome_follower_arm"),
-        "wrist_cam_idx": args.wrist_cam_idx or ctrl_cfg.get("wrist_cam_idx", 0),
-        "front_cam_idx": args.front_cam_idx or ctrl_cfg.get("front_cam_idx", 1),
-        "policy_host": args.policy_host or ctrl_cfg.get("policy_host", "localhost"),
-        "profile": args.profile or agent_cfg.get("profile", "default"),
-        "use_mock": bool(args.use_mock or agent_cfg.get("use_mock", False)),
-    }
-
-    # Validate agent port if agent is selected
-    if args.node in ("agent", "both") and not agent_args.get("use_mock"):
-        if not agent_args["port"]:
-            parser.error("--port is required for real agent (or set in config)")
 
     procs = []
     server_proc = None
@@ -237,12 +228,48 @@ def main():
             except Exception:
                 pass
 
-            if args.node in ("server", "both"):
+            if args.node in ("servers", "all"):
                 server_proc = _spawn_mcp_server(backend_config, env_common)
                 procs.append(server_proc)
+                pipecat_proc = _spawn_pipecat_server(backend_config)
+                procs.append(pipecat_proc)
 
-            if args.node in ("agent", "both"):
-                agent_proc = _spawn_agent_worker(backend_config, agent_args, env_common)
+            if args.node in ("agent", "all"):
+                # Agent config resolution (CLI overrides config file)
+                agent_cfg = (
+                    cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
+                )
+                ctrl_cfg = (
+                    cfg.get("controller", {})
+                    if isinstance(cfg.get("controller"), dict)
+                    else {}
+                )
+                agent_args = {
+                    "port": args.port or ctrl_cfg.get("robot_port"),
+                    "id": args.id
+                    or ctrl_cfg.get("robot_id", "my_awesome_follower_arm"),
+                    "wrist_cam_idx": args.wrist_cam_idx
+                    or ctrl_cfg.get("wrist_cam_idx", 0),
+                    "front_cam_idx": args.front_cam_idx
+                    or ctrl_cfg.get("front_cam_idx", 1),
+                    "policy_host": args.policy_host
+                    or ctrl_cfg.get("policy_host", "localhost"),
+                    "profile": args.profile or agent_cfg.get("profile", "default"),
+                    "use_mock": bool(args.use_mock or agent_cfg.get("use_mock", False)),
+                }
+                # Validate agent port if agent is selected
+                if not agent_args.get("use_mock"):
+                    if not agent_args["port"]:
+                        raise ValueError(
+                            "--port is required for real agent (or set in config)"
+                        )
+
+                agent_proc = _spawn_agent_worker(
+                    backend_config,
+                    agent_args,
+                    config_path=args.config,
+                    extra_env=env_common,
+                )
                 procs.append(agent_proc)
 
                 # Best-effort: register default robot and enable
@@ -258,11 +285,6 @@ def main():
                         _asyncio.run(fm.set_enabled(robot_id=rid, enabled=True))
                 except Exception as e:
                     logger.warning("Fleet registration failed: {}", e)
-
-            # Spawn Pipecat independently (no SHM dependency) but only after MCP and Agent
-            if args.node == "both" and server_proc and agent_proc:
-                pipecat_proc = _spawn_pipecat_server(backend_config)
-                procs.append(pipecat_proc)
 
             # Wait and ensure children stop before manager exits
             try:

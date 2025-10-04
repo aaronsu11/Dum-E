@@ -556,10 +556,11 @@ Note: Colors in images may appear different due to reflections.""",
 
 # Factory function optimized for testability, flexibility, and resource management
 def create_robot_agent(
+    robot_type: str = "so101_follower",
     robot_port: Optional[str] = None,
     robot_id: str = "my_awesome_follower_arm",
     wrist_cam_idx: int = 0,
-    front_cam_idx: int = 2,
+    front_cam_idx: int = 1,
     policy_host: str = "localhost",
     profile: Literal["default", "aws"] = "default",
     callback_handler: Optional[Callable] = None,
@@ -573,6 +574,7 @@ def create_robot_agent(
     multiple agents with different camera configurations.
 
     Args:
+        robot_type: Robot type (so100_follower or so101_follower)
         robot_port: Serial port for the arm
         robot_id: Robot ID
         wrist_cam_idx: Wrist camera index
@@ -585,6 +587,7 @@ def create_robot_agent(
         raise ValueError("`robot_port` is required for create_robot_agent")
 
     robot_controller = SO10xArmController(
+        robot_type=robot_type,
         robot_port=robot_port,
         robot_id=robot_id,
         wrist_cam_idx=wrist_cam_idx,
@@ -686,6 +689,11 @@ if __name__ == "__main__":
             help="Serial port for the arm (e.g., /dev/tty.usbmodemXXXX)",
         )
         parser.add_argument("--id", type=str)
+        parser.add_argument(
+            "--robot_type",
+            type=str,
+            help="Robot type (so100_follower or so101_follower)",
+        )
         parser.add_argument("--wrist_cam_idx", type=int)
         parser.add_argument("--front_cam_idx", type=int)
 
@@ -720,6 +728,7 @@ if __name__ == "__main__":
         cfg_ctrl: Dict[str, Any] = (
             cfg.get("controller", {}) if isinstance(cfg.get("controller"), dict) else {}
         )
+        robot_type = args.robot_type or cfg_ctrl.get("robot_type", "so101_follower")
         robot_port = args.port or cfg_ctrl.get("robot_port")
         robot_id = args.id or cfg_ctrl.get("robot_id", "my_awesome_follower_arm")
         wrist_cam_idx = args.wrist_cam_idx or cfg_ctrl.get("wrist_cam_idx", 0)
@@ -742,6 +751,7 @@ if __name__ == "__main__":
 
         # Create agent with injected backends
         agent = create_robot_agent(
+            robot_type=robot_type,
             robot_port=robot_port,
             robot_id=robot_id,
             wrist_cam_idx=wrist_cam_idx,

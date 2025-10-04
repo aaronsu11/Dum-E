@@ -157,12 +157,20 @@ class AsyncMCPClient(MCPClient):
         return tools_schema
 
 
-system_prompt = """You are a helpful robot assistant. \
-Your goal is to demonstrate your capabilities in a succinct way. 
+system_prompt = """You are a helpful robot assistant speaking out loud to users.
 
-Don't include special characters and be concise in your answers. 
+CRITICAL RULES FOR VOICE OUTPUT:
+- Speak naturally as if in conversation - no special characters ever
+- No markdown, asterisks, brackets, quotes, dashes, or number points
+- No lists or bullet points - speak in flowing sentences
+- Keep responses to 1-3 short sentences maximum
+- If multiple pieces of information, use words like "first, second, also, and"
 
-Respond to what the user said in a professional and helpful way."""
+RESPONSE STYLE:
+- Be direct and conversational
+- Skip explanations of what you're doing - just give results
+- Don't ask follow-up questions unless necessary
+- Use natural speech patterns"""
 
 
 async def run_dum_e(
@@ -239,7 +247,7 @@ async def run_dum_e(
 
             tts = ElevenLabsTTSService(
                 api_key=os.getenv("ELEVENLABS_API_KEY"),
-                voice_id="cgSgspJ2msm6clMCkdW9",
+                voice_id="iP95p4xoKVk53GoZ742B",
                 sample_rate=24000,
                 params=ElevenLabsTTSService.InputParams(language=Language.EN),
             )
@@ -289,10 +297,17 @@ async def run_dum_e(
                     }
                 ],
                 tools=tools,
-                # system=system_prompt, # There is a system message conversion issue as of 0.0.81
             )
     else:
-        context = AnthropicLLMContext(tools=tools, system=system_prompt)
+        context = AnthropicLLMContext(
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+            ],
+            tools=tools,
+        )
 
     context_aggregator = llm.create_context_aggregator(context)
 
@@ -342,7 +357,7 @@ async def run_dum_e(
             await task.queue_frames([LLMRunFrame()])
             await llm.trigger_assistant_response()
         else:
-            await task.queue_frames([TTSSpeakFrame(f"Hello there!")])
+            await task.queue_frames([TTSSpeakFrame(f"At your service, sir.")])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):

@@ -5,7 +5,7 @@ This module provides an SO10x robot agent that implements the abstract
 interfaces while maintaining compatibility with the existing voice assistant
 streaming pattern. Key improvements include:
 - Implements IRobotAgent interface for modularity
-- Event publishing for real-time progress updates
+- Message publishing for real-time progress updates
 - Enhanced error handling and recovery
 - Task lifecycle management
 - Tool registry integration
@@ -17,6 +17,7 @@ python -m embodiment.so_arm10x.agent \
     --wrist_cam_idx 0 \
     --front_cam_idx 1 \
     --policy_host localhost \
+    --profile aws \
     --instruction "I want one banana and one apple on the plate"
 """
 
@@ -31,33 +32,30 @@ import numpy as np
 from dotenv import load_dotenv
 from loguru import logger
 from strands import Agent, tool
+from strands.agent import AgentResult
+from strands.models import BedrockModel
 from strands.models.anthropic import AnthropicModel
 from tqdm import tqdm
 
-from embodiment.so_arm10x import (
-    InMemoryEventPublisher,
-    InMemoryTaskManager,
-    InMemoryToolRegistry,
-    SO10xHardwareInterface,
+
+from embodiment.so_arm10x.controller import (
+    Gr00tRobotInferenceClient,
+    SO10xArmController,
 )
-from embodiment.so_arm10x.client import Gr00tRobotInferenceClient, SO10xRobot
-from interfaces import (
-    Event,
-    EventType,
-    IEventPublisher,
-    IHardwareInterface,
-    IRobotAgent,
+from shared import (
     ITaskManager,
-    IToolRegistry,
+    IMessageBroker,
+    IRobotAgent,
     TaskStatus,
+    Message,
+    MessageType,
     ToolDefinition,
 )
-from logging_config import create_clean_callback_handler, setup_robot_logging
+from shared.message_broker.shm import get_shared_memory_broker_from_env
+from shared.task_manager.shm import get_shared_memory_task_manager_from_env
+from utils import load_config_file, create_clean_callback_handler, setup_robot_logging
 
 load_dotenv()
-
-# Model configuration
-DEFAULT_MODEL_ID = "claude-sonnet-4-20250514"
 
 
 def image_to_jpeg_bytes(
@@ -86,14 +84,15 @@ def image_to_jpeg_bytes(
 
 
 def create_robot_tools(
-    robot_instance: SO10xRobot, gr00t_client_instance: Gr00tRobotInferenceClient
+    robot_controller: SO10xArmController,
+    gr00t_client_instance: Gr00tRobotInferenceClient,
 ):
     """Create robot tools that use the specific robot instance."""
 
     @tool
     def reset_pose():
         """Reset the robot to the initial pose to make the workspace clear and visible."""
-        robot_instance.move_to_initial_pose()
+        robot_controller.move_to_initial_pose()
         return {
             "status": "success",
             "content": [
@@ -104,7 +103,7 @@ def create_robot_tools(
     @tool
     def assess_situation() -> dict:
         """Assess the situation of the current state"""
-        images = robot_instance.get_current_images()
+        images = robot_controller.get_current_images()
         front_image_bytes = image_to_jpeg_bytes(images["front"], verbose=False)
         wrist_image_bytes = image_to_jpeg_bytes(images["wrist"], verbose=False)
 
@@ -125,12 +124,12 @@ def create_robot_tools(
         language_instruction: Optional[str] = None,
     ) -> dict:
         if pose == "initial":
-            robot_instance.move_to_initial_pose()
-            robot_instance.move_to_ready_pose()
+            robot_controller.move_to_initial_pose()
+            robot_controller.move_to_ready_pose()
 
         for _ in tqdm(range(actions_to_execute), desc="Executing actions"):
             # New observation -> policy -> action flow using updated interfaces
-            observation_dict = robot_instance.get_observation()
+            observation_dict = robot_controller.get_observation()
             action_list = gr00t_client_instance.get_action(
                 observation_dict,
                 language_instruction or gr00t_client_instance.language_instruction,
@@ -138,11 +137,11 @@ def create_robot_tools(
 
             # Execute a short horizon for stability
             for action_dict in action_list:
-                robot_instance.set_target_state(action_dict)
+                robot_controller.set_target_state(action_dict)
                 time.sleep(0.05)
 
         time.sleep(0.5)
-        return robot_instance.get_current_images()
+        return robot_controller.get_current_images()
 
     @tool
     def start_pick(item: Literal["a banana", "an apple", "an orange"]) -> dict:
@@ -181,8 +180,8 @@ def create_robot_tools(
     @tool
     def place(location: Literal["left", "right"]):
         """Place an item at a given location"""
-        robot_instance.release_at_remote_pose(location)
-        latest_images = robot_instance.get_current_images()
+        robot_controller.release_at_remote_pose(location)
+        latest_images = robot_controller.get_current_images()
         image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
 
         return {
@@ -209,55 +208,45 @@ class SO10xRobotAgent(IRobotAgent):
 
     def __init__(
         self,
-        robot_instance: SO10xRobot,
-        gr00t_client_instance: Optional[Gr00tRobotInferenceClient] = None,
-        model_id: str = DEFAULT_MODEL_ID,
-        region_name: str = "us-west-2",
-        callback_handler: Callable = None,
+        robot_controller: SO10xArmController,
+        gr00t_client_instance: Gr00tRobotInferenceClient,
         task_manager: Optional[ITaskManager] = None,
-        event_publisher: Optional[IEventPublisher] = None,
-        tool_registry: Optional[IToolRegistry] = None,
-        hardware_interface: Optional[IHardwareInterface] = None,
+        profile: Literal["default", "aws"] = "default",
+        message_broker: Optional[IMessageBroker] = None,
+        callback_handler: Callable = None,
     ):
         """
         Initialize the SO10x robot agent with explicit dependency injection.
 
         Args:
-            robot_instance: Required SO100Robot instance for hardware control
-            gr00t_client_instance: Optional Gr00t client instance (creates default if not provided)
-            model_id: The model ID to use for the agent
-            region_name: AWS region name
-            callback_handler: Optional callback handler for agent events
-            task_manager: Optional task manager instance
-            event_publisher: Optional event publisher instance
-            tool_registry: Optional tool registry instance
-            hardware_interface: Optional hardware interface instance
+            robot_controller: Required SO100Robot instance for hardware control
+            gr00t_client_instance: Required Gr00t client instance
+            profile: The model provider profile
+            task_manager: task manager instance
+            message_broker: optional message broker instance
+            callback_handler: optional callback handler for agent events
         """
-        # Required robot instance
-        self._robot_instance = robot_instance
-        self._gr00t_client_instance = (
-            gr00t_client_instance or Gr00tRobotInferenceClient()
-        )
+        # Required controller and policy client
+        self.robot_controller = robot_controller
+        self.gr00t_client_instance = gr00t_client_instance
 
-        # Initialize interfaces with defaults if not provided (suppress verbose logging)
-        self.task_manager = task_manager or InMemoryTaskManager()
-        self.event_publisher = event_publisher or InMemoryEventPublisher()
-        self.tool_registry = tool_registry or InMemoryToolRegistry()
-        self.hardware_interface = hardware_interface or SO10xHardwareInterface(
-            self._robot_instance
-        )
+        # Store robot_id for the id property
+        self._robot_id = robot_controller.id
 
-        # Store configuration
-        self.model_id = model_id
-        self.region_name = region_name
+        # Initialize MCP server interfaces with defaults if not provided (suppress verbose logging)
+        self.task_manager = task_manager
+        self.message_broker = message_broker
+
+        # Agent events handler for custom logging
         self.callback_handler = callback_handler or create_clean_callback_handler()
 
         # Create robot-specific tools
         self._robot_tools = create_robot_tools(
-            self._robot_instance, self._gr00t_client_instance
+            self.robot_controller, self.gr00t_client_instance
         )
 
         # Initialize the underlying Strands agent
+        self.profile = profile
         self._strands_agent = None
         self._agent_lock = asyncio.Lock()
 
@@ -271,23 +260,38 @@ class SO10xRobotAgent(IRobotAgent):
 
     async def _create_strands_agent(self) -> Agent:
         """Create the underlying Strands agent with tools."""
-        # Create the model (same as original implementation)
-        model = AnthropicModel(
-            client_args={
-                "api_key": os.getenv("ANTHROPIC_API_KEY"),
-            },
-            max_tokens=8000,
-            model_id=self.model_id,
-            params={
-                "thinking": {
-                    "type": "enabled",
-                    "budget_tokens": 6000,
+        # Create the model based on the profile
+        if self.profile == "aws":
+            model = BedrockModel(
+                # Use the cross-region inference profile prefix "us." with Sonnet 4
+                model_id="us.anthropic.claude-sonnet-4-20250514-v1:0",
+                region_name=os.getenv("AWS_REGION"),
+                max_tokens=8000,
+                additional_request_fields={
+                    "thinking": {
+                        "type": "enabled",
+                        "budget_tokens": 6000,  # Minimum of 1,024
+                    },
+                    "anthropic_beta": ["interleaved-thinking-2025-05-14"],
                 },
-                "extra_headers": {
-                    "anthropic-beta": "interleaved-thinking-2025-05-14",
+            )
+        else:
+            model = AnthropicModel(
+                client_args={
+                    "api_key": os.getenv("ANTHROPIC_API_KEY"),
                 },
-            },
-        )
+                model_id="claude-sonnet-4-20250514",
+                max_tokens=8000,
+                params={
+                    "thinking": {
+                        "type": "enabled",
+                        "budget_tokens": 6000,
+                    },
+                    "extra_headers": {
+                        "anthropic-beta": "interleaved-thinking-2025-05-14",
+                    },
+                },
+            )
 
         # Create agent with robot-specific tools (no longer importing from robot_agent)
         agent = Agent(
@@ -326,33 +330,39 @@ Note: Colors in images may appear different due to reflections.""",
 
     # IRobotAgent interface implementation
 
+    @property
+    def id(self) -> str:
+        """Unique identifier for the robot agent."""
+        return self._robot_id
+
     async def arun(
         self, instruction: str, task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Execute instruction synchronously and return final result."""
         try:
-            # Create task if not provided
-            if task_id is None:
-                task_id = await self.task_manager.create_task(instruction)
-
-            await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
+            # Create task if not provided and a task manager is available
+            if self.task_manager is not None:
+                if task_id is None:
+                    task_id = await self.task_manager.create_task(instruction)
+                await self.task_manager.update_task(task_id, TaskStatus.RUNNING)
 
             # Get the Strands agent and execute
             agent = await self._get_strands_agent()
 
             # Execute with robot hardware context
-            with self._robot_instance.activate():
+            with self.robot_controller.activate():
                 # Warm up cameras for 1 second
                 for _ in range(5):
-                    self._robot_instance.get_current_images()
+                    self.robot_controller.get_current_images()
                     await asyncio.sleep(0.2)
 
                 result = agent(instruction)
 
                 # Reset to initial pose after completion
-                self._robot_instance.move_to_initial_pose()
+                self.robot_controller.move_to_initial_pose()
 
-            await self.task_manager.update_task_status(task_id, TaskStatus.COMPLETED)
+            if self.task_manager is not None and task_id is not None:
+                await self.task_manager.update_task(task_id, TaskStatus.COMPLETED)
 
             return {
                 "task_id": task_id,
@@ -362,10 +372,8 @@ Note: Colors in images may appear different due to reflections.""",
             }
 
         except Exception as e:
-            if task_id:
-                await self.task_manager.update_task_status(
-                    task_id, TaskStatus.FAILED, str(e)
-                )
+            if self.task_manager is not None and task_id is not None:
+                await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
 
             return {
                 "task_id": task_id,
@@ -381,33 +389,34 @@ Note: Colors in images may appear different due to reflections.""",
         Execute instruction with streaming progress updates.
 
         Maintains compatibility with existing voice assistant while adding
-        enhanced progress tracking and event publishing.
+        enhanced progress tracking and message publishing.
         """
         try:
-            # Create task if not provided
-            if task_id is None:
-                task_id = await self.task_manager.create_task(instruction)
+            # Create task if not provided and manager exists
+            if self.task_manager is not None:
+                if task_id is None:
+                    task_id = await self.task_manager.create_task(instruction)
+                await self.task_manager.update_task(task_id, TaskStatus.RUNNING)
 
-            await self.task_manager.update_task_status(task_id, TaskStatus.RUNNING)
-
-            # Publish task started event
-            await self.event_publisher.publish_event(
-                Event(
-                    event_type=EventType.TASK_STARTED,
-                    task_id=task_id,
-                    timestamp=datetime.now(),
-                    data={"instruction": instruction},
+            # Publish task started message
+            if self.message_broker:
+                await self.message_broker.publish(
+                    Message(
+                        message_type=MessageType.TASK_STARTED,
+                        task_id=task_id,
+                        timestamp=datetime.now(),
+                        data={"instruction": instruction, "source": self.id},
+                    )
                 )
-            )
 
-            # Get the Strands agent
+            # Get the Strands agent with robot-specific tools
             agent = await self._get_strands_agent()
 
             # Execute with robot hardware context and streaming
-            with self._robot_instance.activate():
+            with self.robot_controller.activate():
                 # Warm up cameras with progress updates
                 for i in range(5):
-                    self._robot_instance.get_current_images()
+                    self.robot_controller.get_current_images()
                     await asyncio.sleep(0.2)
 
                     # Yield camera warmup progress
@@ -418,27 +427,71 @@ Note: Colors in images may appear different due to reflections.""",
                         "message": "Warming up robot cameras...",
                     }
 
+                # Placeholder for last event
+                data = None
                 # Stream from the Strands agent
-                # This maintains compatibility with existing voice assistant
+                # See https://strandsagents.com/latest/documentation/docs/user-guide/concepts/streaming/async-iterators/
+                # for more information
                 async for event in agent.stream_async(instruction):
-                    # Enhance event with task information
-                    enriched_event = {"task_id": task_id, **event}
-
-                    # Publish streaming event
-                    await self.event_publisher.publish_event(
-                        Event(
-                            event_type=EventType.STREAMING_DATA,
-                            task_id=task_id,
-                            timestamp=datetime.now(),
-                            data=enriched_event,
-                        )
-                    )
-
-                    yield enriched_event
+                    if (
+                        "message" in event
+                        and isinstance(event["message"], dict)
+                        and event["message"].get("role") == "assistant"
+                        and event["message"].get("content")
+                    ):
+                        for content in event["message"]["content"]:
+                            # only yield text messages
+                            if "text" in content:
+                                # Enhance event with task information
+                                data = {
+                                    "task_id": task_id,
+                                    "type": "assistant_message",
+                                    "source": self.id,
+                                    "message": event["message"],
+                                }
+                                # Publish task progress message
+                                if self.message_broker:
+                                    await self.message_broker.publish(
+                                        Message(
+                                            message_type=MessageType.TASK_PROGRESS,
+                                            task_id=task_id,
+                                            timestamp=datetime.now(),
+                                            data=data,
+                                        )
+                                    )
+                                yield data
+                    elif "result" in event:
+                        agent_result: AgentResult = event["result"]
+                        result_message = agent_result.message["content"][-1]
+                        data = {
+                            "task_id": task_id,
+                            "type": "assistant_result",
+                            "source": self.id,
+                            "result": (
+                                result_message if "text" in result_message else None
+                            ),
+                        }
+                        if self.task_manager is not None and task_id is not None:
+                            await self.task_manager.update_task(
+                                task_id,
+                                TaskStatus.COMPLETED,
+                                metadata=agent_result.message,
+                            )
+                        # Publish task completed message
+                        if self.message_broker:
+                            await self.message_broker.publish(
+                                Message(
+                                    message_type=MessageType.TASK_COMPLETED,
+                                    task_id=task_id,
+                                    timestamp=datetime.now(),
+                                    data=data,
+                                )
+                            )
+                        # don't yield the result, same data is already yielded in the assistant_message event
 
                 # Reset to initial pose after completion
                 try:
-                    self._robot_instance.move_to_initial_pose()
+                    self.robot_controller.move_to_initial_pose()
                     time.sleep(1.0)
                 except Exception as pose_error:
                     # Log the error but don't fail the task - it already completed successfully
@@ -446,43 +499,20 @@ Note: Colors in images may appear different due to reflections.""",
                         f"⚠️  Failed to reset to initial pose in time after task completion: {pose_error}"
                     )
 
-            await self.task_manager.update_task_status(task_id, TaskStatus.COMPLETED)
-
-            # Publish completion event
-            await self.event_publisher.publish_event(
-                Event(
-                    event_type=EventType.TASK_COMPLETED,
-                    task_id=task_id,
-                    timestamp=datetime.now(),
-                    data={"instruction": instruction},
-                )
-            )
-
-            # Final completion message
-            yield {
-                "task_id": task_id,
-                "type": "completion",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"text": "Task completed successfully"}],
-                },
-            }
-
         except Exception as e:
-            if task_id:
-                await self.task_manager.update_task_status(
-                    task_id, TaskStatus.FAILED, str(e)
-                )
+            if self.task_manager is not None and task_id is not None:
+                await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
 
-                # Publish failure event
-                await self.event_publisher.publish_event(
-                    Event(
-                        event_type=EventType.TASK_FAILED,
-                        task_id=task_id,
-                        timestamp=datetime.now(),
-                        data={"error": str(e), "instruction": instruction},
+                if self.message_broker:
+                    # Publish failure message
+                    await self.message_broker.publish(
+                        Message(
+                            message_type=MessageType.TASK_FAILED,
+                            task_id=task_id,
+                            timestamp=datetime.now(),
+                            data={"error": str(e), "instruction": instruction},
+                        )
                     )
-                )
 
             # Yield error information
             yield {
@@ -497,24 +527,24 @@ Note: Colors in images may appear different due to reflections.""",
 
     async def get_available_tools(self) -> List[ToolDefinition]:
         """Get list of tools available to this agent."""
-        return await self.tool_registry.list_tools()
+        # TODO: convert this to ToolDefinition list
+        return await self._robot_tools
 
     async def get_status(self) -> Dict[str, Any]:
         """Get current agent status and health information."""
         try:
-            is_hardware_connected = await self.hardware_interface.is_connected()
+            is_controller_connected = await self.robot_controller.is_connected()
             running_tasks = await self.task_manager.list_tasks(
                 status=TaskStatus.RUNNING
             )
-            recent_events = await self.event_publisher.get_event_history(limit=5)
+            recent_messages = await self.message_broker.get_message_history(limit=5)
 
             return {
                 "status": "healthy",
-                "hardware_connected": is_hardware_connected,
+                "controller_connected": is_controller_connected,
                 "running_tasks": len(running_tasks),
-                "recent_events": len(recent_events),
+                "recent_messages": len(recent_messages),
                 "timestamp": datetime.now().isoformat(),
-                "model_id": self.model_id,
             }
         except Exception as e:
             return {
@@ -524,45 +554,18 @@ Note: Colors in images may appear different due to reflections.""",
             }
 
 
-# Factory functions optimized for testability, flexibility, and resource management
-
-
+# Factory function optimized for testability, flexibility, and resource management
 def create_robot_agent(
-    robot_instance: SO10xRobot,
-    gr00t_client_instance: Optional[Gr00tRobotInferenceClient] = None,
-    model_id: str = DEFAULT_MODEL_ID,
-    region_name: str = "us-west-2",
+    robot_type: str = "so101_follower",
+    robot_port: Optional[str] = None,
+    robot_id: str = "my_awesome_follower_arm",
+    wrist_cam_idx: int = 0,
+    front_cam_idx: int = 1,
+    policy_host: str = "localhost",
+    profile: Literal["default", "aws"] = "default",
     callback_handler: Optional[Callable] = None,
-) -> SO10xRobotAgent:
-    """
-    Create an SO10x robot agent with explicit dependency injection.
-
-    Requires explicit robot instance for better resource management and testability.
-
-    Args:
-        robot_instance: Required SO100Robot instance for hardware control
-        gr00t_client_instance: Optional Gr00t client instance (creates default if not provided)
-        model_id: The model ID to use for the agent
-        region_name: AWS region name
-        callback_handler: Optional callback handler for agent events
-    """
-    return SO10xRobotAgent(
-        robot_instance=robot_instance,
-        gr00t_client_instance=gr00t_client_instance,
-        model_id=model_id,
-        region_name=region_name,
-        callback_handler=callback_handler,
-    )
-
-
-def create_robot_agent_with_config(
-    enable_camera: bool = True,
-    wrist_cam_idx: int = 2,
-    front_cam_idx: int = 0,
-    port: Optional[str] = None,
-    model_id: str = DEFAULT_MODEL_ID,
-    region_name: str = "us-west-2",
-    callback_handler: Optional[Callable] = None,
+    task_manager: Optional[ITaskManager] = None,
+    message_broker: Optional[IMessageBroker] = None,
 ) -> SO10xRobotAgent:
     """
     Create a robot agent with customizable hardware configuration.
@@ -571,72 +574,97 @@ def create_robot_agent_with_config(
     multiple agents with different camera configurations.
 
     Args:
-        enable_camera: Whether to enable camera support
+        robot_type: Robot type (so100_follower or so101_follower)
+        robot_port: Serial port for the arm
+        robot_id: Robot ID
         wrist_cam_idx: Wrist camera index
         front_cam_idx: Front camera index
-        port: Serial port for the arm
-        model_id: The model ID to use for the agent
-        region_name: AWS region name
+        policy_host: Host for the GR00T policy server
+        profile: The model provider profile
         callback_handler: Optional callback handler for agent events
     """
-    if port is None:
-        raise ValueError("`port` is required for create_robot_agent_with_config")
+    if robot_port is None:
+        raise ValueError("`robot_port` is required for create_robot_agent")
 
-    robot_instance = SO10xRobot(
-        enable_camera=enable_camera,
+    robot_controller = SO10xArmController(
+        robot_type=robot_type,
+        robot_port=robot_port,
+        robot_id=robot_id,
         wrist_cam_idx=wrist_cam_idx,
         front_cam_idx=front_cam_idx,
-        robot_port=port,
     )
-    gr00t_instance = Gr00tRobotInferenceClient()
+    gr00t_instance = Gr00tRobotInferenceClient(host=policy_host)
 
     return SO10xRobotAgent(
-        robot_instance=robot_instance,
+        robot_controller=robot_controller,
         gr00t_client_instance=gr00t_instance,
-        model_id=model_id,
-        region_name=region_name,
+        profile=profile,
         callback_handler=callback_handler,
+        task_manager=task_manager,
+        message_broker=message_broker,
     )
 
 
-def create_mock_robot_agent(
-    mock_robot: Optional[SO10xRobot] = None,
-    mock_gr00t: Optional[Gr00tRobotInferenceClient] = None,
-    model_id: str = DEFAULT_MODEL_ID,
-    region_name: str = "us-west-2",
-    callback_handler: Optional[Callable] = None,
-) -> SO10xRobotAgent:
+async def _agent_worker_loop(
+    agent: SO10xRobotAgent,
+    task_manager: ITaskManager,
+    message_broker: IMessageBroker,
+    robot_id: str,
+    worker_id: str,
+):
     """
-    Create a robot agent with mock instances for testing.
-
-    Provides easy setup for unit tests and integration tests without hardware.
-
-    Args:
-        mock_robot: Mock SO100Robot instance (creates default if not provided)
-        mock_gr00t: Mock Gr00t client instance (creates default if not provided)
-        model_id: The model ID to use for the agent
-        region_name: AWS region name
-        callback_handler: Optional callback handler for agent events
+    Subscribe to TASK_STARTED events from the broker, claim tasks, and execute
+    them with the robot agent. Designed to work with local in-memory or OTA backends.
     """
-    from unittest.mock import Mock
+    async for msg in message_broker.subscribe(message_types=[MessageType.TASK_CREATED]):
+        try:
+            # Only handle tasks dispatched by the MCP server (avoid self-loop)
+            if not isinstance(msg.data, dict) or msg.data.get("source") != "mcp_server":
+                continue
 
-    if mock_robot is None:
-        mock_robot = Mock(spec=SO10xRobot)
-        mock_robot.activate.return_value.__enter__ = Mock(return_value=mock_robot)
-        mock_robot.activate.return_value.__exit__ = Mock(return_value=None)
-        mock_robot.get_current_images.return_value = None
-        mock_robot.move_to_initial_pose.return_value = None
+            # Optional routing by robot_id
+            target_robot = msg.data.get("robot_id")
+            if target_robot and target_robot != robot_id:
+                continue
 
-    if mock_gr00t is None:
-        mock_gr00t = Mock(spec=Gr00tRobotInferenceClient)
+            task_id = msg.task_id
+            instruction = (
+                msg.data.get("instruction") if isinstance(msg.data, dict) else None
+            )
+            if not task_id or not instruction:
+                continue
 
-    return SO10xRobotAgent(
-        robot_instance=mock_robot,
-        gr00t_client_instance=mock_gr00t,
-        model_id=model_id,
-        region_name=region_name,
-        callback_handler=callback_handler,
-    )
+            # Atomically claim the task
+            claimed = await task_manager.claim_task(task_id, worker_id)
+            if not claimed:
+                continue
+
+            # Execute with streaming. The agent will publish streaming updates
+            # and final status via the provided message_broker.
+            async for _ in agent.astream(instruction, task_id=task_id):
+                # We rely on the agent to publish TASK_PROGRESS
+                # Optional logging can be added here if needed
+                pass
+        except Exception as exec_error:
+            # Best-effort failure reporting
+            try:
+                await task_manager.update_task(
+                    task_id, TaskStatus.FAILED, str(exec_error)
+                )
+            except Exception:
+                pass
+            try:
+                if message_broker:
+                    await message_broker.publish(
+                        Message(
+                            message_type=MessageType.TASK_FAILED,
+                            task_id=task_id,
+                            timestamp=datetime.now(),
+                            data={"error": str(exec_error), "instruction": instruction},
+                        )
+                    )
+            except Exception:
+                pass
 
 
 # Example usage and testing
@@ -648,49 +676,114 @@ if __name__ == "__main__":
         import argparse
 
         parser = argparse.ArgumentParser(description="Run SO-ARM10x agent")
+        parser.add_argument("--config", type=str, help="Path to YAML/JSON config file")
+        parser.add_argument(
+            "--namespace",
+            type=str,
+            default=os.getenv("DUME_NAMESPACE", "default"),
+            help="Namespace for shared-memory backends",
+        )
         parser.add_argument(
             "--port",
             type=str,
-            required=True,
             help="Serial port for the arm (e.g., /dev/tty.usbmodemXXXX)",
         )
-        parser.add_argument("--id", type=str, default="my_awesome_follower_arm")
-        parser.add_argument("--wrist_cam_idx", type=int, default=0)
-        parser.add_argument("--front_cam_idx", type=int, default=1)
+        parser.add_argument("--id", type=str)
+        parser.add_argument(
+            "--robot_type",
+            type=str,
+            help="Robot type (so100_follower or so101_follower)",
+        )
+        parser.add_argument("--wrist_cam_idx", type=int)
+        parser.add_argument("--front_cam_idx", type=int)
 
         parser.add_argument(
             "--policy_host",
             type=str,
-            default="localhost",
             help="Host for the GR00T policy server",
         )
-
+        parser.add_argument(
+            "--profile",
+            type=str,
+            help="Model provider profile",
+        )
         parser.add_argument(
             "--instruction",
             type=str,
             help="Robot instruction (will prompt for input if not provided)",
         )
+        parser.add_argument(
+            "--worker",
+            action="store_true",
+            help="Run in worker mode: consume TASK_STARTED from broker and execute",
+        )
+
         args = parser.parse_args()
 
+        # Load config and resolve effective values (CLI > config > defaults)
+        cfg = load_config_file(args.config)
+        cfg_agent: Dict[str, Any] = (
+            cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
+        )
+        cfg_ctrl: Dict[str, Any] = (
+            cfg.get("controller", {}) if isinstance(cfg.get("controller"), dict) else {}
+        )
+        robot_type = args.robot_type or cfg_ctrl.get("robot_type", "so101_follower")
+        robot_port = args.port or cfg_ctrl.get("robot_port")
+        robot_id = args.id or cfg_ctrl.get("robot_id", "my_awesome_follower_arm")
+        wrist_cam_idx = args.wrist_cam_idx or cfg_ctrl.get("wrist_cam_idx", 0)
+        front_cam_idx = args.front_cam_idx or cfg_ctrl.get("front_cam_idx", 1)
+        policy_host = args.policy_host or cfg_ctrl.get("policy_host", "localhost")
+        profile = args.profile or cfg_agent.get("profile", "default")
+
+        # If a backend namespace is provided in config, export for downstream libs
+        backend_ns = (
+            (cfg.get("backend", {}) or {}).get("namespace")
+            if isinstance(cfg.get("backend"), dict)
+            else None
+        )
+        if backend_ns:
+            os.environ["DUME_NAMESPACE"] = str(backend_ns)
+
+        # Configure backends: prefer shared memory when available (DUME_IPC=shm)
+        task_manager = get_shared_memory_task_manager_from_env()
+        message_broker = get_shared_memory_broker_from_env()
+
+        # Create agent with injected backends
+        agent = create_robot_agent(
+            robot_type=robot_type,
+            robot_port=robot_port,
+            robot_id=robot_id,
+            wrist_cam_idx=wrist_cam_idx,
+            front_cam_idx=front_cam_idx,
+            policy_host=policy_host,
+            profile=profile,
+            task_manager=task_manager,
+            message_broker=message_broker,
+        )
+
+        if args.worker:
+            import uuid
+
+            worker_id = f"agent-worker-{uuid.uuid4()}"
+            ns = os.getenv("DUME_NAMESPACE", "default")
+            logger.info(f"🧩 Worker mode: namespace={ns}, worker_id={worker_id}")
+            await _agent_worker_loop(
+                agent=agent,
+                task_manager=task_manager,
+                message_broker=message_broker,
+                robot_id=robot_id,
+                worker_id=worker_id,
+            )
+            return
+
+        # Direct single-run mode: stream once via agent
         user_query = args.instruction or input("Enter your instruction: ")
-
-        # Create agent with provided configuration
-        robot_instance = SO10xRobot(
-            robot_port=args.port,
-            robot_id=args.id,
-            wrist_cam_idx=args.wrist_cam_idx,
-            front_cam_idx=args.front_cam_idx,
-        )
-
-        gr00t_client_instance = Gr00tRobotInferenceClient(host=args.policy_host)
-        so10x_agent = create_robot_agent(
-            robot_instance=robot_instance, gr00t_client_instance=gr00t_client_instance
-        )
 
         logger.info(f"🎯 Processing query: {user_query}")
 
         # Use the streaming interface with clean output
-        async for event in so10x_agent.astream(user_query):
+        async for event in agent.astream(user_query):
             event_type = event.get("type", "unknown")
 
             if event_type == "warmup_progress":
@@ -699,9 +792,7 @@ if __name__ == "__main__":
 
             elif "message" in event and event["message"].get("role") == "assistant":
                 for content in event["message"].get("content", []):
-                    if "text" in content and not _is_signature_or_binary(
-                        content["text"]
-                    ):
+                    if "text" in content:
                         logger.info(f"🤖 Agent: {content['text']}")
 
             elif event_type == "completion":
@@ -713,22 +804,5 @@ if __name__ == "__main__":
                 break
 
         logger.info("🏁 Execution complete!")
-
-    def _is_signature_or_binary(text: str) -> bool:
-        """Check if text appears to be a signature or binary data."""
-        if not isinstance(text, str):
-            return True
-
-        # Check for signature patterns (very long strings with base64-like chars)
-        if len(text) > 100 and any(char in text for char in ["=", "+", "/"]):
-            non_printable = sum(1 for c in text if ord(c) < 32 or ord(c) > 126)
-            if non_printable / len(text) > 0.1:  # More than 10% non-printable
-                return True
-
-        # Check for very long strings that might be signatures/hashes
-        if len(text) > 500 and " " not in text:
-            return True
-
-        return False
 
     asyncio.run(main())

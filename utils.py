@@ -1,17 +1,20 @@
 """
-Standardized logging configuration for the robot agent system.
+Standardized run-time and logging configuration for Dum-E.
 
 This module provides:
 - Clean, structured logging without verbose output using loguru
 - Custom callback handler that filters out binary data and signatures
 - Configurable log levels and formatters
 - Integration with voice assistant for clean terminal output
+- Config file loading utilities
 """
 
+import json
 import logging
 import sys
+from pathlib import Path
+from typing import Any, Dict, Optional
 from datetime import datetime
-from typing import Any, Dict, Optional, Union
 
 # Use loguru normally - let pipecat handle the setup when in voice assistant context
 from loguru import logger
@@ -26,7 +29,9 @@ class CleanFormatter(logging.Formatter):
 
     def format(self, record):
         # Use ISO format for timestamps
-        record.asctime = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S")
+        record.asctime = datetime.fromtimestamp(record.created).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
         # Truncate long messages
         if hasattr(record, "msg") and isinstance(record.msg, str):
@@ -82,7 +87,9 @@ class RobotCallbackHandler:
         if reasoning_text:
             if self.show_thinking:
                 if self.log_level in ["DEBUG"]:
-                    self._log_debug(f"🧠 Reasoning: {reasoning_text[:100]}{'...' if len(reasoning_text) > 100 else ''}")
+                    self._log_debug(
+                        f"🧠 Reasoning: {reasoning_text[:100]}{'...' if len(reasoning_text) > 100 else ''}"
+                    )
             else:
                 if self.log_level in ["DEBUG"]:
                     self._log_debug("🧠 Model reasoning completed")
@@ -104,7 +111,9 @@ class RobotCallbackHandler:
                 else:
                     # For streaming, we can accumulate or just log partial updates
                     if self.log_level in ["DEBUG"]:
-                        self._log_debug(f"🤖 Streaming: {clean_data[:50]}{'...' if len(clean_data) > 50 else ''}")
+                        self._log_debug(
+                            f"🤖 Streaming: {clean_data[:50]}{'...' if len(clean_data) > 50 else ''}"
+                        )
 
     def _log_info(self, message: str):
         """Log info message using loguru."""
@@ -151,7 +160,9 @@ class RobotCallbackHandler:
 _logging_configured = False
 
 
-def setup_robot_logging(log_level: str = "INFO", include_timestamps: bool = True) -> None:
+def setup_robot_logging(
+    log_level: str = "INFO", include_timestamps: bool = True
+) -> None:
     """
     Setup standardized logging for the robot system using loguru.
 
@@ -181,7 +192,9 @@ def setup_robot_logging(log_level: str = "INFO", include_timestamps: bool = True
         else:
             format_string = "<level>{level: <8}</level> | <cyan>robot</cyan> | <level>{message}</level>"
 
-        logger.add(sys.stdout, format=format_string, level=log_level.upper(), colorize=True)
+        logger.add(
+            sys.stdout, format=format_string, level=log_level.upper(), colorize=True
+        )
 
     # Suppress verbose logs from external libraries (always do this)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -222,5 +235,24 @@ def create_clean_callback_handler(show_thinking: bool = False) -> RobotCallbackH
     return RobotCallbackHandler(show_thinking=show_thinking)
 
 
-# No auto-setup - explicit setup required to avoid conflicts with pipecat
-# Call setup_robot_logging() explicitly when needed
+def load_config_file(config_path: Optional[str]) -> Dict[str, Any]:
+    if not config_path:
+        return {}
+
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    if path.suffix.lower() == ".json":
+        return json.loads(path.read_text())
+
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        try:
+            import yaml  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "PyYAML is required to load YAML configs. Install with: pip install pyyaml"
+            ) from e
+        return yaml.safe_load(path.read_text()) or {}
+
+    raise ValueError("Unsupported config format. Use .json or .yaml/.yml")

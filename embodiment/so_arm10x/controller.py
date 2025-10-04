@@ -1,7 +1,6 @@
 """
-Unified client interfaces for interacting with the SO-ARM10x robots using the
-new LeRobot `robots` API, while preserving the legacy helper methods expected by
-the Dum-E agent. This module provides:
+Unified client interfaces for interacting with the SO-ARM10x robots using the LeRobot `robots` API, 
+and the Gr00t policy server expected by the Dum-E agent. This module provides:
 
 - SO10xRobot: thin wrapper around LeRobot's follower robots (SO-100/101) that
   exposes convenience methods like `move_to_initial_pose`, `move_to_remote_pose`,
@@ -15,7 +14,7 @@ A lightweight eval entrypoint is kept for manual testing with the new API.
 
 Example usage:
 ```shell
-python -m embodiment.so_arm10x.client \
+python -m embodiment.so_arm10x.controller \
     --robot_port /dev/tty.usbmodem5A680102371 \
     --robot_type so101_follower \
     --robot_id so101_follower_arm \
@@ -29,7 +28,6 @@ python -m embodiment.so_arm10x.client \
 import logging
 import os
 import time
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Literal, Optional
 from pprint import pformat
@@ -47,7 +45,9 @@ from lerobot.robots import (
 )  # noqa: F401
 from lerobot.utils.utils import init_logging, log_say
 
+from shared import IRobotController
 from policy.gr00t.service import ExternalRobotInferenceClient
+from utils import load_config_file
 
 #################################################################################
 
@@ -187,14 +187,14 @@ def view_img(img, overlay_img=None):
 
 
 # ============================================================================
-# Hardware wrapper built on new LeRobot API, exposing legacy helper methods
+# Hardware wrapper built on LeRobot API
 # ============================================================================
 
 
-class SO10xRobot:
-    """Thin wrapper for SO-100/101 follower arms using the new LeRobot API.
+class SO10xArmController(IRobotController):
+    """Thin wrapper for SO-100/101 follower arms using LeRobot API.
 
-    Exposes convenience methods used by Dum-E while delegating to the underlying
+    Exposes convenience methods for robot agents while delegating to the underlying
     `Robot` implementation.
     """
 
@@ -215,6 +215,9 @@ class SO10xRobot:
                 raise ValueError(
                     "Robot serial port is required. Set `port` or env `SO_ARM_PORT`."
                 )
+
+        # Store robot_id for the id property
+        self._robot_id = robot_id
 
         cameras = {
             "wrist": OpenCVCameraConfig(
@@ -250,7 +253,9 @@ class SO10xRobot:
         else:
             raise ValueError(f"Unsupported robot_type: {robot_type}")
 
-        self.robot: Robot = make_robot_from_config(self.config)
+        self.robot: so100_follower.SO100Follower | so101_follower.SO101Follower = (
+            make_robot_from_config(self.config)
+        )
 
         # Cache ordering used for vector<->dict conversions
         self._state_keys: List[str] = [
@@ -263,20 +268,17 @@ class SO10xRobot:
         ]
 
     @property
+    def id(self) -> str:
+        """Unique identifier for the robot controller."""
+        return self._robot_id
+
+    @property
     def camera_keys(self) -> List[str]:
         return list(self.robot.cameras.keys())
 
     @property
     def robot_state_keys(self) -> List[str]:
         return list(self._state_keys)
-
-    @contextmanager
-    def activate(self):
-        self.connect()
-        try:
-            yield self
-        finally:
-            self.disconnect()
 
     def connect(self, calibrate: bool = True) -> None:
         self.robot.connect(calibrate=calibrate)
@@ -285,6 +287,12 @@ class SO10xRobot:
 
     def disconnect(self) -> None:
         self.robot.disconnect()
+
+    def is_connected(self) -> bool:
+        return self.robot.is_connected
+
+    def get_observation(self) -> Dict[str, Any]:
+        return self.robot.get_observation()
 
     # ------------------------ Convenience methods ------------------------
     def set_so10x_robot_preset(self) -> None:
@@ -298,6 +306,35 @@ class SO10xRobot:
         except Exception:
             # Keep silent if firmware/register names differ
             pass
+
+    def get_current_state(self) -> np.ndarray:
+        obs = self.get_observation()
+        return np.array([float(obs[k]) for k in self._state_keys], dtype=np.float64)
+
+    def get_current_images(self) -> Dict[str, np.ndarray]:
+        obs = self.get_observation()
+        images: Dict[str, np.ndarray] = {}
+        for cam in self.camera_keys:
+            images[cam] = obs[cam]
+        return images
+
+    def set_target_state(self, target_state: Any) -> Dict[str, float]:
+        """Accepts a 6-vector (np/torch) or a dict of `*.pos` keys."""
+        action_dict: Dict[str, float]
+        if isinstance(target_state, dict):
+            action_dict = {str(k): float(v) for k, v in target_state.items()}
+        else:
+            # numpy / torch tensor
+            if hasattr(target_state, "detach"):
+                target_state = target_state.detach().cpu().numpy()
+            target_state = np.asarray(target_state, dtype=np.float64).reshape(-1)
+            assert target_state.shape[0] == 6, "Expected 6-dof target state"
+            action_dict = {
+                k: float(target_state[i]) for i, k in enumerate(self._state_keys)
+            }
+
+        sent = self.robot.send_action(action_dict)
+        return {k: float(v) for k, v in sent.items()}
 
     def move_to_initial_pose(self) -> None:
         # These target degrees mirror legacy behavior
@@ -340,38 +377,6 @@ class SO10xRobot:
             time.sleep(0.5)
         self.move_to_remote_pose()
 
-    def get_observation(self) -> Dict[str, Any]:
-        return self.robot.get_observation()
-
-    def get_current_state(self) -> np.ndarray:
-        obs = self.get_observation()
-        return np.array([float(obs[k]) for k in self._state_keys], dtype=np.float64)
-
-    def get_current_images(self) -> Dict[str, np.ndarray]:
-        obs = self.get_observation()
-        images: Dict[str, np.ndarray] = {}
-        for cam in self.camera_keys:
-            images[cam] = obs[cam]
-        return images
-
-    def set_target_state(self, target_state: Any) -> Dict[str, float]:
-        """Accepts a 6-vector (np/torch) or a dict of `*.pos` keys."""
-        action_dict: Dict[str, float]
-        if isinstance(target_state, dict):
-            action_dict = {str(k): float(v) for k, v in target_state.items()}
-        else:
-            # numpy / torch tensor
-            if hasattr(target_state, "detach"):
-                target_state = target_state.detach().cpu().numpy()
-            target_state = np.asarray(target_state, dtype=np.float64).reshape(-1)
-            assert target_state.shape[0] == 6, "Expected 6-dof target state"
-            action_dict = {
-                k: float(target_state[i]) for i, k in enumerate(self._state_keys)
-            }
-
-        sent = self.robot.send_action(action_dict)
-        return {k: float(v) for k, v in sent.items()}
-
 
 @dataclass
 class EvalConfig:
@@ -398,7 +403,7 @@ def eval(cfg: EvalConfig):
     logging.info(pformat(asdict(cfg)))
 
     # Step 1: Initialize the robot (wrapper)
-    robot = SO10xRobot(
+    robot = SO10xArmController(
         robot_type=cfg.robot_type,
         robot_port=cfg.robot_port,
         robot_id=cfg.robot_id,
@@ -418,7 +423,7 @@ def eval(cfg: EvalConfig):
     # NOTE: for so100/so101, this should be:
     # ['shoulder_pan.pos', 'shoulder_lift.pos', 'elbow_flex.pos', 'wrist_flex.pos', 'wrist_roll.pos', 'gripper.pos']
     robot_state_keys = robot.robot_state_keys
-    print("robot_state_keys:", robot_state_keys)
+    print("robot_state_keys:", robot.robot_state_keys)
 
     # Step 2: Initialize the policy
     policy = Gr00tRobotInferenceClient(
@@ -460,4 +465,37 @@ def eval(cfg: EvalConfig):
 
 
 if __name__ == "__main__":
-    eval()
+    # Support both: 1) YAML/JSON config file and 2) draccus CLI
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=str, help="Path to YAML/JSON config file")
+    parser.add_argument("--instruction", type=str, help="Robot instruction")
+    args, unknown = parser.parse_known_args()
+
+    if args.config:
+        cfg_root = load_config_file(args.config)
+        ctrl = (
+            cfg_root.get("controller", {})
+            if isinstance(cfg_root.get("controller"), dict)
+            else {}
+        )
+        cfg = EvalConfig(
+            robot_type=ctrl.get("robot_type", "so101_follower"),
+            robot_id=ctrl.get("robot_id", "my_awesome_follower_arm"),
+            robot_port=ctrl.get("robot_port", "/dev/ttyUSB0"),
+            wrist_cam_idx=int(ctrl.get("wrist_cam_idx", 0)),
+            front_cam_idx=int(ctrl.get("front_cam_idx", 1)),
+            policy_host=ctrl.get("policy_host", "localhost"),
+            policy_port=int(ctrl.get("policy_port", 5555)),
+            action_horizon=int(ctrl.get("action_horizon", 8)),
+            lang_instruction=args.instruction
+            or ctrl.get("lang_instruction", "Grab a banana and put it on the plate"),
+            play_sounds=bool(ctrl.get("play_sounds", False)),
+            timeout=int(ctrl.get("timeout", 60)),
+            show_images=bool(ctrl.get("show_images", False)),
+        )
+        eval(cfg)
+    else:
+        # Fall back to draccus CLI (supports the dataclass fields directly)
+        eval()

@@ -67,7 +67,7 @@ Choose the setup that best matches your needs and hardware availability. The fol
 
 ### 🔧 Installation
 
-#### 📦 For Single Workstation and Server
+#### 📦 On Single Workstation or Server
 > Requires 1) Nvidia GPU 2) Linux or WSL2
 
 1. Install required system dependencies
@@ -86,11 +86,11 @@ Choose the setup that best matches your needs and hardware availability. The fol
     sudo apt-get -y install cuda-toolkit-12-4
     ```
 
-3. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.10 for policy server:
+3. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.10 for gr00t policy server:
 
     ```bash
-    conda create -y -n dum-e-server python=3.10
-    conda activate dum-e-server
+    conda create -y -n gr00t python=3.10
+    conda activate gr00t
     ```
 
 4. Clone Isaac-GR00T repository:
@@ -103,22 +103,22 @@ Choose the setup that best matches your needs and hardware availability. The fol
 
     ```bash
     cd Isaac-GR00T
-    # use the tested version on 7th Aug 2025
-    git checkout ae7d46f02cdca5d9c80efc446fe41fe2b58e94c7
+    # use the tested version on 12th Sep 2025
+    git checkout b211007ed6698e6642d2fd7679dabab1d97e9e6c
 
-    # conda activate dum-e-server
+    # conda activate gr00t
     pip install --upgrade setuptools
     pip install -e .[base]
     pip install --no-build-isolation flash-attn==2.7.1.post4
     ```
     Download a fine-tuned GR00T model from Hugging Face for the task you want to perform. For example, to pick up a fruit (apple, banana, orange, etc.) and put it on the plate, you can download our checkpoint by running:
     ```bash
-    hf download aaronsu11/GR00T-N1.5-3B-FT-FRUIT-0809 --local-dir ./GR00T-N1.5-3B-FT --exclude "optimizer.pt"
+    hf download aaronsu11/GR00T-N1.5-3B-FT-FRUIT-0810 --local-dir ./GR00T-N1.5-3B-FT --exclude "optimizer.pt"
     ```
 
 6. Start policy server
     
-    Run the following command to start the policy server:
+    Run the following command to start the gr00t policy server:
     ```bash
     python scripts/inference_service.py \
     --server \
@@ -126,9 +126,9 @@ Choose the setup that best matches your needs and hardware availability. The fol
     --embodiment_tag new_embodiment \
     --data_config so100_dualcam
     ```
-    This needs to be running as long as you are using the policy for inference. Note down the IP address of the policy server (`<policy_server_ip>`) and make sure port 5555 is accessible from the client.
+    This needs to be running as long as you are using the gr00t policy for inference. Note down the IP address of the policy server (`<policy_host>`) and make sure port 5555 is accessible from the client.
 
-#### For Single Workstation and Client
+#### On Single Workstation or Client
 
 1. Clone the Repository
 
@@ -136,7 +136,7 @@ Choose the setup that best matches your needs and hardware availability. The fol
     git clone https://github.com/aaronsu11/Dum-E.git
     ```
 
-2. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.10 for dum-e client:
+2. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.12 for dum-e client:
     ```bash
     conda create -y -n dum-e python=3.12
     conda activate dum-e
@@ -151,61 +151,68 @@ Choose the setup that best matches your needs and hardware availability. The fol
     ```
 
     > If you have never set up SO-ARM before:
-    > - Find the `<wrist_cam_idx>` and `<front_cam_idx>` by running `lerobot-find-cameras`
-    > - Find the `<robot_serial_port>` of by running `lerobot-find-port`
-    > - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `<robot_id>`. For example with SO-101, run: `lerobot-calibrate --robot.type=so101_follower --robot.port=<robot_serial_port> --robot.id=<robot_id>`
+    > - Find the `wrist_cam_idx` and `front_cam_idx` by running `lerobot-find-cameras`
+    > - Find the `robot_port` of by running `lerobot-find-port`
+    > - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `robot_id`. For example with SO-101, run: `lerobot-calibrate --robot.type=so101_follower --robot.port=<robot_port> --robot.id=<robot_id>`
     
 
-4. Test policy execution
-    
-    > Default uses SO-ARM101 for the robot type.
-    Run the following command by replacing `<robot_serial_port>`, `<robot_id>`, `<wrist_cam_idx>`, `<front_cam_idx>` and `<policy_server_ip>` with your own serial port, robot id, wrist camera index, front camera index and policy server IP (use `localhost` for single workstation):
+4. Configure Dum-E
+
     ```bash
-    python -m embodiment.so_arm10x.client \
-        --robot_port <robot_serial_port> \
-        --robot_type so101_follower \
-        --robot_id <robot_id> \
-        --wrist_cam_idx <wrist_cam_idx> \
-        --front_cam_idx <front_cam_idx> \
-        --policy_host <policy_server_ip> \
-        --lang_instruction "Grab a banana and put it on the plate"
+    cp config.example.yaml my-dum-e.yaml
+    ```
+    Edit my-dum-e.yaml:
+    - Set `controller.robot_type`/`robot_port`/`robot_id`/`wrist_cam_idx`/`front_cam_idx`
+    - Set `controller.policy_host` to your gr00t policy server IP (or `localhost`)
+    - Optionally set `agent.profile` to use different model presets
+
+
+5. Test policy execution
+
+    ```bash
+    # Uses controller.* from YAML
+    python -m embodiment.so_arm10x.controller --config my-dum-e.yaml --instruction "<your-instruction>"
     ```
 
-    > If the robot is not moving, check if the policy server is running and the port is accessible from the client by running 
-    > * `nc -zv <policy_server_ip> 5555` (on MacOS/Linux) or 
-    > * `Test-NetConnection -ComputerName <policy_server_ip> -Port 5555` (on Windows PowerShell).
+    > If the robot is not moving, check if the gr00t policy server is running and the port is accessible from the client by running 
+    > * `nc -zv <policy_host> 5555` (on MacOS/Linux) or 
+    > * `Test-NetConnection -ComputerName <policy_host> -Port 5555` (on Windows PowerShell).
 
-5. Environment configuration for agent and voice
+6. Environment configuration for agent and voice
 
-    Sign up for free accounts at [ElevenLabs](https://elevenlabs.io/), [Deepgram](https://deepgram.com/), [Anthropic](https://www.anthropic.com/api) and obtain the API keys. Then copy the environment template and update the `.env` file with your credentials:
+    Sign up for free accounts at [ElevenLabs](https://elevenlabs.io/), [Deepgram](https://deepgram.com/), [Anthropic](https://www.anthropic.com/api) and obtain the API keys if you are using the default profile, or get your AWS credentials if you are using the `aws` profile. Then copy the environment template and update the `.env` file with your credentials:
     ```bash
     cp .env.example .env
     ```
-    Edit `.env` with your credentials:
-    - Anthropic API key for LLM
-    - ElevenLabs API key for TTS  
-    - Deepgram API key for STT
+    Edit `.env` with your credentials (choose one of the following):
+    - For `default` profile:
+        - Anthropic API key for LLM
+        - ElevenLabs API key for TTS  
+        - Deepgram API key for STT
+    - For `aws` profile:
+        - AWS Access Key ID
+        - AWS Secret Access Key
+        - AWS Region
 
-6. Test the robot agent
+7. Test the robot agent
 
-    Once the policy is working, you can test the robot agent with text instructions by running the following command:
     ```bash
-    python -m embodiment.so_arm10x.agent \
-        --port <robot_serial_port> \
-        --id <robot_id> \
-        --wrist_cam_idx <wrist_cam_idx> \
-        --front_cam_idx <front_cam_idx> \
-        --policy_host <policy_server_host> \
-        --instruction "<your-instruction>"
+    # One-shot instruction (agent inherits controller.* unless overridden in agent section)
+    python -m embodiment.so_arm10x.agent --config my-dum-e.yaml --instruction "<your-instruction>"
     ```
 
-7. Start Dum-E
+8. Start Dum-E
 
-    Finally, let's start Dum-E!
+    Finally, start the full stack with the voice interface, MCP server and robot agent:
     ```bash
-    python dum_e.py
+    python dum_e.py --config my-dum-e.yaml
     ```
-    This will launch a web interface at `http://localhost:7860` where you can connect and speak to Dum-E using your microphone. Have fun!
+    This will launch the voice interface at `http://localhost:7860` where you can connect and speak to Dum-E using your microphone. Have fun!
+
+    > You can also start only the voice interface and MCP servers. Useful for testing the servers independently without the robot hardware:
+    > ```bash
+    > python dum_e.py --node servers --config my-dum-e.yaml
+    > ```
 
 ## 🏗️ Architecture Overview
 
@@ -258,13 +265,13 @@ graph TB
 ## 🗺️ Roadmap
 
 ### Q3 2025
-- [ ] **Voice Interaction**
+- [x] **Voice Interaction**
   - [ ] Multi-language support (Mandarin, Japanese, Spanish etc.)
-  - [ ] Emotional understanding with speech-to-speech models
+  - [x] Emotional understanding with speech-to-speech models
 
-- [ ] **MCP Servers**
-  - [ ] Access to robot agent via MCP
-  - [ ] Configurable MCP server endpoints for Dum-E
+- [x] **MCP Servers**
+  - [x] Access to robot agent via MCP
+  - [x] Configurable MCP server endpoints for Dum-E
 
 - [ ] **Local Model Support**
   - [ ] Integration with Ollama for local language model inference
@@ -313,10 +320,10 @@ We welcome contributions from the robotics and AI community! Here's how you can 
    ```
 
 2. **Follow Code Standards**
-   - Use Python 3.10 type hints
+   - Use Python 3.12 type hints
    - Follow PEP 8 style guidelines
    - Add comprehensive docstrings
-   - Maintain test coverage >95%
+   - Maintain test coverage > 50%
 
 3. **Testing Requirements**
    ```bash

@@ -193,6 +193,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+#VSCode
+.vscode/
+
 # Debug images
 sample_images/
 outputs/

@@ -1,5 +1,5 @@
 """
-Abstract interfaces for the Iron Man Dum-E robotic system.
+Interfaces for the Dum-E robotic system.
 
 This module defines the core interfaces that enable modular, loosely-coupled
 components in the robotic assistant architecture. These interfaces support:
@@ -12,11 +12,17 @@ The interfaces follow the dependency inversion principle, allowing high-level
 modules to depend on abstractions rather than concrete implementations.
 """
 
+import logging
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class TaskStatus(Enum):
@@ -30,9 +36,10 @@ class TaskStatus(Enum):
     PAUSED = "paused"
 
 
-class EventType(Enum):
-    """Types of events that can be published during task execution."""
+class MessageType(Enum):
+    """Types of messages that can be published during task execution."""
 
+    TASK_CREATED = "task_created"
     TASK_STARTED = "task_started"
     TASK_PROGRESS = "task_progress"
     TASK_COMPLETED = "task_completed"
@@ -40,6 +47,22 @@ class EventType(Enum):
     TOOL_EXECUTED = "tool_executed"
     STATUS_UPDATE = "status_update"
     STREAMING_DATA = "streaming_data"
+
+
+@dataclass
+class RobotInfo:
+    """Information about a robot in the fleet."""
+
+    robot_id: str
+    name: Optional[str]
+    enabled: bool
+    registered_at: datetime
+    last_seen: Optional[datetime] = None
+    metadata: Dict[str, Any] = None
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
 
 
 @dataclass
@@ -52,6 +75,7 @@ class TaskInfo:
     created_at: datetime
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    status_message: Optional[str] = None
     error_message: Optional[str] = None
     progress: float = 0.0  # 0.0 to 1.0
     metadata: Dict[str, Any] = None
@@ -62,10 +86,10 @@ class TaskInfo:
 
 
 @dataclass
-class Event:
+class Message:
     """Event data structure for streaming updates."""
 
-    event_type: EventType
+    message_type: MessageType
     task_id: Optional[str]
     timestamp: datetime
     data: Dict[str, Any]
@@ -87,6 +111,50 @@ class ToolDefinition:
     category: str = "general"
 
 
+class IRobotController(ABC):
+    """
+    Interface for robot controller abstraction.
+
+    Provides a consistent interface for running predefined robot operations,
+    enabling different controller implementations or mock interfaces
+    for testing without changing higher-level code.
+    """
+
+    @property
+    @abstractmethod
+    def id(self) -> str:
+        """Unique identifier for the robot controller."""
+        pass
+
+    @abstractmethod
+    def connect(self) -> None:
+        """Establish connection to robot controller."""
+        pass
+
+    @abstractmethod
+    def disconnect(self) -> None:
+        """Disconnect from robot controller."""
+        pass
+
+    @contextmanager
+    def activate(self):
+        self.connect()
+        try:
+            yield self
+        finally:
+            self.disconnect()
+
+    @abstractmethod
+    def is_connected(self) -> bool:
+        """Check if robot controller is connected."""
+        pass
+
+    @abstractmethod
+    def get_observation(self) -> Dict[str, Any]:
+        """Get current robot controller observation (joint positions, etc.)."""
+        pass
+
+
 class IRobotAgent(ABC):
     """
     Interface for robot agent implementations.
@@ -97,12 +165,18 @@ class IRobotAgent(ABC):
     interfaces while maintaining the same API.
     """
 
+    @property
+    @abstractmethod
+    def id(self) -> str:
+        """Unique identifier for the robot agent."""
+        pass
+
     @abstractmethod
     async def arun(
         self, instruction: str, task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Execute a natural language instruction synchronously.
+        Execute a natural language instruction asynchronously.
 
         Args:
             instruction: Natural language command to execute
@@ -118,7 +192,7 @@ class IRobotAgent(ABC):
         self, instruction: str, task_id: Optional[str] = None
     ) -> AsyncIterator[Dict[str, Any]]:
         """
-        Execute instruction with streaming progress updates.
+        Execute instruction with streaming progress updates asynchronously.
 
         This method yields events during execution, compatible with Strands
         agents' streaming API. Events should include 'message' and/or 'data'
@@ -144,47 +218,6 @@ class IRobotAgent(ABC):
         pass
 
 
-class IToolRegistry(ABC):
-    """
-    Interface for managing shared tools across the system.
-
-    The tool registry enables tools to be shared between the voice assistant
-    and robot agent, providing centralized management of available capabilities.
-    """
-
-    @abstractmethod
-    async def register_tool(self, tool: ToolDefinition) -> None:
-        """Register a new tool in the registry."""
-        pass
-
-    @abstractmethod
-    async def unregister_tool(self, name: str) -> None:
-        """Remove a tool from the registry."""
-        pass
-
-    @abstractmethod
-    async def get_tool(self, name: str) -> Optional[ToolDefinition]:
-        """Retrieve a specific tool by name."""
-        pass
-
-    @abstractmethod
-    async def list_tools(
-        self, category: Optional[str] = None, requires_hardware: Optional[bool] = None
-    ) -> List[ToolDefinition]:
-        """List available tools, optionally filtered by criteria."""
-        pass
-
-    @abstractmethod
-    async def execute_tool(
-        self,
-        name: str,
-        parameters: Dict[str, Any],
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Execute a tool with given parameters and optional context."""
-        pass
-
-
 class ITaskManager(ABC):
     """
     Interface for task lifecycle management.
@@ -206,17 +239,14 @@ class ITaskManager(ABC):
         pass
 
     @abstractmethod
-    async def update_task_status(
-        self, task_id: str, status: TaskStatus, error_message: Optional[str] = None
+    async def update_task(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        status_message: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update the status of a task."""
-        pass
-
-    @abstractmethod
-    async def update_task_progress(
-        self, task_id: str, progress: float, status_message: Optional[str] = None
-    ) -> None:
-        """Update task progress (0.0 to 1.0) with optional status message."""
         pass
 
     @abstractmethod
@@ -231,82 +261,115 @@ class ITaskManager(ABC):
         """Cancel a running or pending task."""
         pass
 
+    @abstractmethod
+    async def claim_task(self, task_id: str, worker_id: str) -> bool:
+        """
+        Atomically claim a PENDING task for execution by a worker.
 
-class IEventPublisher(ABC):
+        Returns True if the task was successfully claimed and moved to RUNNING,
+        False if it was not claimable (e.g., already claimed or not found).
+        """
+        pass
+
+
+class IMessageBroker(ABC):
     """
-    Interface for publishing events during task execution.
+    Interface for publishing and subscribing to messages during task execution.
 
-    Enables real-time streaming of events to subscribers like the voice
-    assistant, MCP clients, or monitoring systems. Events can include
-    task progress, tool execution results, and streaming data.
+    Enables real-time streaming of events to subscribers like the ROS, MQTT, or monitoring systems.
+    Events can include task progress, tool execution results, and streaming data.
     """
 
     @abstractmethod
-    async def publish_event(self, event: Event) -> None:
-        """Publish an event to all subscribers."""
+    async def publish(self, message: Message) -> None:
+        """Publish a message to all subscribers."""
         pass
 
     @abstractmethod
     async def subscribe(
         self,
-        event_types: Optional[List[EventType]] = None,
+        message_types: Optional[List[MessageType]] = None,
         task_id: Optional[str] = None,
-    ) -> AsyncIterator[Event]:
+    ) -> AsyncIterator[Message]:
         """
-        Subscribe to events with optional filtering.
+        Subscribe to messages with optional filtering.
 
         Args:
-            event_types: Optional list of event types to filter
-            task_id: Optional task ID to filter events for specific task
+            message_types: Optional list of message types to filter
+            task_id: Optional task ID to filter messages for specific task
 
         Yields:
-            Event objects matching the filter criteria
+            Message objects matching the filter criteria
         """
         pass
 
     @abstractmethod
-    async def get_event_history(
+    async def get_message_history(
         self, task_id: Optional[str] = None, limit: Optional[int] = 100
-    ) -> List[Event]:
-        """Get historical events, optionally filtered by task ID."""
+    ) -> List[Message]:
+        """Get historical messages, optionally filtered by task ID."""
         pass
 
 
-class IHardwareInterface(ABC):
+class IFleetManager(ABC):
     """
-    Interface for hardware abstraction.
+    Interface for basic fleet management operations.
 
-    Provides a consistent interface for robot hardware operations,
-    enabling different hardware implementations or mock interfaces
-    for testing without changing higher-level code.
+    Implementations may be backed by shared memory for local development or by
+    cloud services (e.g., AWS IoT Device Management, Supabase) in production.
     """
 
     @abstractmethod
-    async def connect(self) -> None:
-        """Establish connection to hardware."""
+    async def register_robot(
+        self,
+        robot_id: str,
+        name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> RobotInfo:
+        """Register or upsert a robot and return its info."""
         pass
 
     @abstractmethod
-    async def disconnect(self) -> None:
-        """Disconnect from hardware."""
+    async def list_robots(self, only_enabled: Optional[bool] = None) -> List[RobotInfo]:
+        """List robots with optional enabled filter."""
         pass
 
     @abstractmethod
-    async def is_connected(self) -> bool:
-        """Check if hardware is connected."""
+    async def get_robot(self, robot_id: str) -> Optional[RobotInfo]:
+        """Get robot information by ID."""
         pass
 
     @abstractmethod
-    async def get_current_state(self) -> Dict[str, Any]:
-        """Get current hardware state (joint positions, etc.)."""
+    async def set_enabled(self, robot_id: str, enabled: bool) -> bool:
+        """Enable or disable a robot by ID."""
         pass
 
     @abstractmethod
-    async def execute_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a hardware action and return result."""
+    async def update_robot(
+        self,
+        robot_id: str,
+        name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Update robot name and/or metadata. Returns True if updated."""
         pass
 
-    @abstractmethod
-    async def get_sensor_data(self) -> Dict[str, Any]:
-        """Get current sensor readings (cameras, etc.)."""
-        pass
+
+class BackendConfig(BaseModel):
+    """
+    Backend configuration for coordinating agent/server communication.
+
+    Transport-agnostic with optional cloud backends. Uses Pydantic for
+    validation and easy introspection/logging of the effective config.
+    """
+
+    # Local same-process coordination key
+    namespace: str = "default"
+
+    # AWS backend
+    aws_region: Optional[str] = None
+    # MQTT-based progress tracking
+    mqtt_endpoint: Optional[str] = None
+    mqtt_topic_prefix: Optional[str] = None
+    # DynamoDB/DB-backed task coordination
+    dynamodb_table: Optional[str] = None

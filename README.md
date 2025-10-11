@@ -30,6 +30,8 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
 
 ## 📺 Demo
 
+> 🔊 Watch with sound to hear voice interactions
+
 <div align="center">
 
 <video src="https://github.com/user-attachments/assets/035d252a-e437-484f-a502-9f95a5bceb6f" controls></video>
@@ -148,11 +150,11 @@ Choose the setup that best matches your needs and hardware availability. The fol
     pip install -r requirements.txt
     ```
 
-    > [!NOTE]
-    > If you have never set up SO-ARM before:
-    > - Find the `wrist_cam_idx` and `front_cam_idx` by running `lerobot-find-cameras`
-    > - Find the `robot_port` of by running `lerobot-find-port`
-    > - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `robot_id`. For example with SO-101, run: `lerobot-calibrate --robot.type=so101_follower --robot.port=<robot_port> --robot.id=<robot_id>`
+> [!NOTE]
+> If you have never set up SO-ARM before:
+> - Find the `wrist_cam_idx` and `front_cam_idx` by running `lerobot-find-cameras`
+> - Find the `robot_port` of by running `lerobot-find-port`
+> - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `robot_id`. For example with SO-101, run: `lerobot-calibrate --robot.type=so101_follower --robot.port=<robot_port> --robot.id=<robot_id>`
     
 
 4. Configure Dum-E
@@ -173,10 +175,10 @@ Choose the setup that best matches your needs and hardware availability. The fol
     python -m embodiment.so_arm10x.controller --config my-dum-e.yaml --instruction "<your-instruction>"
     ```
 
-    > [!NOTE]
-    > If the robot is not moving, check if the gr00t policy server is running and the port is accessible from the client by running 
-    > * `nc -zv <policy_host> 5555` (on MacOS/Linux) or 
-    > * `Test-NetConnection -ComputerName <policy_host> -Port 5555` (on Windows PowerShell).
+> [!NOTE]
+> If the robot is not moving, check if the gr00t policy server is running and the port is accessible from the client by running 
+> * `nc -zv <policy_host> 5555` (on MacOS/Linux) or 
+> * `Test-NetConnection -ComputerName <policy_host> -Port 5555` (on Windows PowerShell).
 
 6. Environment configuration for agent and voice
 
@@ -196,8 +198,8 @@ Choose the setup that best matches your needs and hardware availability. The fol
         - AWS Secret Access Key
         - AWS Region
 
-    > [!NOTE]
-    > You can optionally configure [Langfuse](https://langfuse.com/) observability for agent and voice by setting `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_HOST` in the `.env` file.
+> [!NOTE]
+> You can optionally configure [Langfuse](https://langfuse.com/) observability for agent and voice by setting `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_HOST` in the `.env` file.
 
 7. Test the robot agent
 

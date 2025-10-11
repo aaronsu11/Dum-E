@@ -174,17 +174,17 @@ async def set_robot_enabled(robot_id: str, enabled: bool) -> Dict[str, Any]:
     return {"robot_id": robot_id, "enabled": enabled, "updated": bool(ok)}
 
 
-@mcp.tool(meta={"long_running": True})
+@mcp.tool(
+    meta={"long_running": True},
+    description="Assign a task to the physical robot agent and stream progress to the MCP client.",
+)
 async def execute_robot_instruction(
     instruction: str,
     robot_id: Optional[str],
     ctx: Context,
     timeout_s: int = 900,
 ) -> dict:
-    """
-    Trigger a robot task on the edge agent and stream progress to the MCP client.
-
-    This creates a task via ITaskManager and publishes a TASK_CREATED message via IMessageBroker.
+    """This creates a task via ITaskManager and publishes a TASK_CREATED message via IMessageBroker.
     The edge Dum-E agent should pick up the task, execute it, and publish streaming updates.
 
     All updates are forwarded to the MCP client through ctx.report_progress,

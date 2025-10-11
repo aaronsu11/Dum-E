@@ -7,12 +7,27 @@
 # 1) Mock agent (no hardware required) -> set agent.use_mock: true
 # 2) Real robot (hardware required)     -> set agent.use_mock: false and fill controller fields
 
+voice:
+  # Voice processing mode
+  # - "cascaded": STT -> LLM -> TTS (supports voice updates)
+  # - "speech_to_speech": Direct speech-to-speech with AWS Nova Sonic
+  mode: "cascaded"
+
+  # Language configuration for voice interface
+  # Supported languages: en (English), zh (Mandarin), ja (Japanese), es (Spanish)
+  language: "en"
+  
+  # Service profile for voice interface
+  # - "default": Deepgram (STT) + Anthropic (LLM) + ElevenLabs (TTS)
+  # - "aws": AWS Transcribe (STT) + AWS Bedrock (LLM) + AWS Polly (TTS)
+  profile: "default"
+
 backend:
-  # Logical namespace to isolate local shared-memory backends
+  # Option 1 (Default): Shared-memory backends
   # Change this to run multiple independent stacks on the same machine
   namespace: "default"
 
-  # Optional cloud backends (not required for local SHM mode)
+  # Option 2: Cloud backends
   aws_region: null          # e.g. "us-west-2"
   mqtt_endpoint: null       # e.g. "a1b2c3d4e5f6-ats.iot.us-west-2.amazonaws.com"
   mqtt_topic_prefix: null   # e.g. "dum-e/dev"
@@ -24,7 +39,7 @@ agent:
   # - false: starts the real SO-ARM10x agent (requires a robot connected)
   use_mock: false
 
-  # Agent profile (reserved for future profiles/configs)
+  # Model provider profile
   profile: "default" # "default" or "aws"
 
 controller:

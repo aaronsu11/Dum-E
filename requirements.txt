@@ -2,12 +2,13 @@ python-dotenv
 loguru
 uv
 pydantic>=2.0
-pipecat-ai[webrtc,silero,aws-nova-sonic,deepgram,aws,anthropic,elevenlabs]==0.0.86
+pipecat-ai[webrtc,silero,aws-nova-sonic,deepgram,aws,anthropic,elevenlabs]==0.0.90
 pipecat-ai-small-webrtc-prebuilt
 uvicorn
 fastapi
 fastmcp
-strands-agents[anthropic]==1.10.0
+strands-agents[anthropic,otel]==1.12.0
 lerobot[feetech]==0.3.3
 pyzmq
 matplotlib
+langfuse

@@ -60,7 +60,9 @@ def _spawn_mcp_server(
 
 
 def _spawn_pipecat_server(
-    config: BackendConfig, extra_env: Optional[Dict[str, str]] = None
+    config: BackendConfig,
+    voice_config: Optional[Dict[str, Any]] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ):
     env = os.environ.copy()
     env.update(
@@ -68,11 +70,28 @@ def _spawn_pipecat_server(
             "DUME_NAMESPACE": config.namespace,
         }
     )
+
+    # Pass voice configuration via environment variables for pipecat runner
+    if voice_config:
+        language = voice_config.get("language", "en")
+        mode = voice_config.get("mode", "cascaded")
+        profile = voice_config.get("profile", "default")
+
+        env["DUME_VOICE_LANGUAGE"] = language
+        env["DUME_VOICE_MODE"] = mode
+        env["DUME_VOICE_PROFILE"] = profile
+
     if extra_env:
         env.update(extra_env)
 
     cmd = [sys.executable, "pipecat_server.py"]
-    logger.info("Starting Pipecat server with namespace={}", config.namespace)
+    language_display = env.get("DUME_VOICE_LANGUAGE", "en")
+    mode_display = env.get("DUME_VOICE_MODE", "cascaded")
+    profile_display = env.get("DUME_VOICE_PROFILE", "default")
+    logger.info(
+        f"Starting Pipecat server with namespace={config.namespace} "
+        f"language={language_display} mode={mode_display} profile={profile_display}"
+    )
     return subprocess.Popen(cmd, env=env)
 
 
@@ -231,7 +250,10 @@ def main():
             if args.node in ("servers", "all"):
                 server_proc = _spawn_mcp_server(backend_config, env_common)
                 procs.append(server_proc)
-                pipecat_proc = _spawn_pipecat_server(backend_config)
+                voice_cfg = (
+                    cfg.get("voice", {}) if isinstance(cfg.get("voice"), dict) else {}
+                )
+                pipecat_proc = _spawn_pipecat_server(backend_config, voice_cfg)
                 procs.append(pipecat_proc)
 
             if args.node in ("agent", "all"):

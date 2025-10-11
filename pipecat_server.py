@@ -1,14 +1,17 @@
+import base64
 import os
+import time
+from dotenv import load_dotenv
 from typing import Callable, Literal, List
 
 
 print("🚀 Starting Pipecat bot...")
 
-from dotenv import load_dotenv
 from loguru import logger
 from mcp import ClientSession, ListToolsResult
 from mcp.client.session_group import StreamableHttpParameters
 from mcp.shared.session import ProgressFnT
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -16,21 +19,22 @@ from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
 from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMContext
 from pipecat.services.aws.llm import AWSBedrockLLMService, AWSBedrockLLMContext
 from pipecat.services.aws.stt import AWSTranscribeSTTService
 from pipecat.services.aws.tts import AWSPollyTTSService
-from pipecat.services.aws_nova_sonic.aws import AWSNovaSonicLLMService
-from pipecat.services.aws_nova_sonic.context import AWSNovaSonicLLMContext
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
+from pipecat.services.aws.nova_sonic.context import AWSNovaSonicLLMContext
+from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import FunctionCallResultCallback, LLMService
 from pipecat.services.mcp_service import MCPClient
 from pipecat.transports.base_transport import BaseTransport, TransportParams
-from pipecat.transports.network.fastapi_websocket import FastAPIWebsocketParams
-from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
-from pipecat.runner.types import RunnerArguments
-from pipecat.runner.utils import create_transport
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+from pipecat.utils.tracing.setup import setup_tracing
 
 logger.info("✅ All components loaded successfully!")
 
@@ -38,6 +42,86 @@ load_dotenv(override=True)
 
 # Setup clean logging for voice assistant (but preserve loguru for pipecat)
 # setup_robot_logging(log_level="INFO", include_timestamps=True)
+
+# Language presets for STT and TTS services in cascaded mode
+LANGUAGE_PRESETS = {
+    "en": {
+        "deepgram": {
+            "model": "nova-3",
+            "language": "en",
+        },
+        "aws_transcribe": {
+            "language": "en-US",
+        },
+        "elevenlabs": {
+            "voice_id": "iP95p4xoKVk53GoZ742B",  # Default English voice
+            "language": Language.EN,
+        },
+        "aws_polly": {
+            "voice_id": "Matthew",
+            "language": "en-US",
+            "engine": "generative",
+        },
+        "greeting": "At your service, sir.",
+    },
+    "zh": {
+        "deepgram": {
+            "model": "nova-2",
+            "language": "zh",
+        },
+        "aws_transcribe": {
+            "language": "zh-CN",
+        },
+        "elevenlabs": {
+            "voice_id": "hkfHEbBvdQFNX4uWHqRF",  # Mandarin voice
+            "language": Language.CMN,
+        },
+        "aws_polly": {
+            "voice_id": "Zhiyu",
+            "language": "cmn-CN",
+            "engine": "neural",
+        },
+        "greeting": "你好呀，主人",  # "Hello, master" in Mandarin
+    },
+    "ja": {
+        "deepgram": {
+            "model": "nova-2",
+            "language": "ja",
+        },
+        "aws_transcribe": {
+            "language": "ja-JP",
+        },
+        "elevenlabs": {
+            "voice_id": "8kgj5469z1URcH4MB2G4",  # Japanese voice
+            "language": Language.JA,
+        },
+        "aws_polly": {
+            "voice_id": "Kazuha",
+            "language": "ja-JP",
+            "engine": "neural",
+        },
+        "greeting": "準備完了。",  # "Preparations complete" in Japanese
+    },
+    "es": {
+        "deepgram": {
+            "model": "nova-3",
+            "language": "es",
+        },
+        "aws_transcribe": {
+            "language": "es-ES",
+        },
+        "elevenlabs": {
+            "voice_id": "htFfPSZGJwjBv1CL0aMD",  # Spanish voice
+            "language": Language.ES,
+        },
+        "aws_polly": {
+            "voice_id": "Sergio",
+            "language": "es-ES",
+            "engine": "generative",
+        },
+        "greeting": "Listo para ayudar",  # "Ready to help" in Spanish
+    },
+}
 
 # We store functions so objects (e.g. SileroVADAnalyzer) don't get
 # instantiated. The function will be called when the desired transport gets
@@ -160,11 +244,11 @@ class AsyncMCPClient(MCPClient):
 system_prompt = """You are a helpful robot assistant speaking out loud to users.
 
 CRITICAL RULES FOR VOICE OUTPUT:
+- Use the language of the user to respond
 - Speak naturally as if in conversation - no special characters ever
 - No markdown, asterisks, brackets, quotes, dashes, or number points
 - No lists or bullet points - speak in flowing sentences
 - Keep responses to 1-3 short sentences maximum
-- If multiple pieces of information, use words like "first, second, also, and"
 
 RESPONSE STYLE:
 - Be direct and conversational
@@ -173,24 +257,37 @@ RESPONSE STYLE:
 - Use natural speech patterns"""
 
 
-async def run_dum_e(
+async def run_jarvis(
     transport: BaseTransport,
     runner_args: RunnerArguments,
     mode: Literal["cascaded", "speech_to_speech"] = "cascaded",
     profile: Literal["default", "aws"] = "default",
     voice_updates: bool = True,  # only supported in cascaded mode
+    language: str = "en",
 ):
     """
-    Run Dum-E with the given transport, runner arguments, mode, and profile.
+    Run JARVIS voice agent with the given transport, runner arguments, mode, and profile.
 
     Args:
         transport: The transport to use for the bot
         runner_args: The runner arguments to use for the bot
         mode: The mode to use for the bot. Voice status update is only supported in cascaded mode.
         profile: The profile to use for the bot
+        language: Language code for voice interface (en, zh, ja, es)
     """
 
     logger.info(f"Starting bot")
+
+    # Get language configuration from presets
+    language_code = language
+    if language_code not in LANGUAGE_PRESETS:
+        logger.warning(
+            f"Unsupported language code '{language_code}', falling back to 'en'"
+        )
+        language_code = "en"
+
+    language_preset = LANGUAGE_PRESETS[language_code]
+    logger.info(f"Using language: {language_code}")
 
     # Speech to speech
     if mode == "speech_to_speech":
@@ -207,11 +304,13 @@ async def run_dum_e(
             )
     else:  # Cascaded
         if profile == "aws":
+            transcribe_config = language_preset["aws_transcribe"]
             stt = AWSTranscribeSTTService(
                 api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
                 aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
                 # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
                 region=os.getenv("AWS_REGION"),
+                language=transcribe_config["language"],
             )
 
             llm = AWSBedrockLLMService(
@@ -226,18 +325,28 @@ async def run_dum_e(
                 ),
             )
 
+            polly_config = language_preset["aws_polly"]
             tts = AWSPollyTTSService(
                 api_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
                 aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
                 # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
                 region=os.getenv("AWS_REGION"),
-                voice_id="Matthew",
+                voice_id=polly_config["voice_id"],
                 params=AWSPollyTTSService.InputParams(
-                    engine="generative", language="en-AU", rate="1.3"
+                    engine=polly_config["engine"],
+                    language=polly_config["language"],
+                    rate="1.3",
                 ),
             )
         else:
-            stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+            deepgram_config = language_preset["deepgram"]
+            stt = DeepgramSTTService(
+                api_key=os.getenv("DEEPGRAM_API_KEY"),
+                live_options=LiveOptions(
+                    model=deepgram_config["model"],
+                    language=deepgram_config["language"],
+                ),
+            )
 
             llm = AnthropicLLMService(
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -245,11 +354,14 @@ async def run_dum_e(
                 params=AnthropicLLMService.InputParams(temperature=0.1, max_tokens=500),
             )
 
+            elevenlabs_config = language_preset["elevenlabs"]
             tts = ElevenLabsTTSService(
                 api_key=os.getenv("ELEVENLABS_API_KEY"),
-                voice_id="iP95p4xoKVk53GoZ742B",
+                voice_id=elevenlabs_config["voice_id"],
                 sample_rate=24000,
-                params=ElevenLabsTTSService.InputParams(language=Language.EN),
+                params=ElevenLabsTTSService.InputParams(
+                    language=elevenlabs_config["language"]
+                ),
             )
 
     # Use enhanced MCPClient to avoid interrupting long-running tools and enable voice updates on progress
@@ -344,6 +456,11 @@ async def run_dum_e(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        enable_tracing=True,  # Enables both turn and conversation tracing
+        additional_span_attributes={
+            "langfuse.session.id": time.strftime("%Y-%m-%d"),
+            "langfuse.tags": ["pipecat-server"],
+        },
         observers=[RTVIObserver(rtvi)],
     )
 
@@ -357,7 +474,9 @@ async def run_dum_e(
             await task.queue_frames([LLMRunFrame()])
             await llm.trigger_assistant_response()
         else:
-            await task.queue_frames([TTSSpeakFrame(f"At your service, sir.")])
+            # Use language-specific greeting
+            greeting = language_preset["greeting"]
+            await task.queue_frames([TTSSpeakFrame(greeting)])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
@@ -384,7 +503,49 @@ async def bot(runner_args: RunnerArguments):
 
     transport = await create_transport(runner_args, transport_params)
 
-    await run_dum_e(transport, runner_args, mode="cascaded", profile="default")
+    # Get configuration from environment variables (for pipecat runner compatibility)
+    language = os.getenv("DUME_VOICE_LANGUAGE", "en")
+    mode = os.getenv("DUME_VOICE_MODE", "cascaded")
+    profile = os.getenv("DUME_VOICE_PROFILE", "default")
+
+    # Validate mode
+    if mode not in ["cascaded", "speech_to_speech"]:
+        logger.warning(f"Invalid mode '{mode}', falling back to 'cascaded'")
+        mode = "cascaded"
+
+    # Validate profile
+    if profile not in ["default", "aws"]:
+        logger.warning(f"Invalid profile '{profile}', falling back to 'default'")
+        profile = "default"
+
+    # Configure Langfuse for OpenTelemetry tracing
+    # See https://langfuse.com/integrations/frameworks/pipecat for more information
+    if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+        # Build Langfuse Auth header.
+        LANGFUSE_AUTH = base64.b64encode(
+            f"{os.environ.get('LANGFUSE_PUBLIC_KEY')}:{os.environ.get('LANGFUSE_SECRET_KEY')}".encode()
+        ).decode()
+
+        # Configure OpenTelemetry endpoint & headers
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = (
+            os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
+            + "/api/public/otel"
+        )
+        os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = (
+            f"Authorization=Basic {LANGFUSE_AUTH}"
+        )
+
+        # Configured automatically from .env
+        exporter = OTLPSpanExporter()
+
+        setup_tracing(
+            service_name="pipecat-demo",
+            exporter=exporter,
+        )
+
+    await run_jarvis(
+        transport, runner_args, mode=mode, profile=profile, language=language
+    )
 
 
 if __name__ == "__main__":

@@ -7,7 +7,8 @@ pipecat-ai-small-webrtc-prebuilt
 uvicorn
 fastapi
 fastmcp
-strands-agents[anthropic]==1.12.0
+strands-agents[anthropic,otel]==1.12.0
 lerobot[feetech]==0.3.3
 pyzmq
 matplotlib
+langfuse

@@ -1,15 +1,17 @@
+import base64
 import os
+import time
+from dotenv import load_dotenv
 from typing import Callable, Literal, List
 
 
 print("🚀 Starting Pipecat bot...")
 
-from dotenv import load_dotenv
 from loguru import logger
-from pipecat.services.deepgram.stt import LiveOptions
 from mcp import ClientSession, ListToolsResult
 from mcp.client.session_group import StreamableHttpParameters
 from mcp.shared.session import ProgressFnT
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -17,21 +19,22 @@ from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
+from pipecat.runner.types import RunnerArguments
+from pipecat.runner.utils import create_transport
 from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMContext
 from pipecat.services.aws.llm import AWSBedrockLLMService, AWSBedrockLLMContext
 from pipecat.services.aws.stt import AWSTranscribeSTTService
 from pipecat.services.aws.tts import AWSPollyTTSService
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
 from pipecat.services.aws.nova_sonic.context import AWSNovaSonicLLMContext
-from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import FunctionCallResultCallback, LLMService
 from pipecat.services.mcp_service import MCPClient
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
-from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
-from pipecat.runner.types import RunnerArguments
-from pipecat.runner.utils import create_transport
+from pipecat.utils.tracing.setup import setup_tracing
 
 logger.info("✅ All components loaded successfully!")
 
@@ -453,6 +456,11 @@ async def run_jarvis(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        enable_tracing=True,  # Enables both turn and conversation tracing
+        additional_span_attributes={
+            "langfuse.session.id": time.strftime("%Y-%m-%d"),
+            "langfuse.tags": ["pipecat-server"],
+        },
         observers=[RTVIObserver(rtvi)],
     )
 
@@ -509,6 +517,31 @@ async def bot(runner_args: RunnerArguments):
     if profile not in ["default", "aws"]:
         logger.warning(f"Invalid profile '{profile}', falling back to 'default'")
         profile = "default"
+
+    # Configure Langfuse for OpenTelemetry tracing
+    # See https://langfuse.com/integrations/frameworks/pipecat for more information
+    if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+        # Build Langfuse Auth header.
+        LANGFUSE_AUTH = base64.b64encode(
+            f"{os.environ.get('LANGFUSE_PUBLIC_KEY')}:{os.environ.get('LANGFUSE_SECRET_KEY')}".encode()
+        ).decode()
+
+        # Configure OpenTelemetry endpoint & headers
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = (
+            os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
+            + "/api/public/otel"
+        )
+        os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = (
+            f"Authorization=Basic {LANGFUSE_AUTH}"
+        )
+
+        # Configured automatically from .env
+        exporter = OTLPSpanExporter()
+
+        setup_tracing(
+            service_name="pipecat-demo",
+            exporter=exporter,
+        )
 
     await run_jarvis(
         transport, runner_args, mode=mode, profile=profile, language=language

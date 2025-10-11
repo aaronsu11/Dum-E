@@ -21,20 +21,18 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
 
 ### ✨ Key Features
 
-- 🎤 **Real-time Voice Interface** - Natural voice conversation with configurable voice and language support
+- 🎤 **Real-time Voice Interface** - Natural voice conversation with configurable voice and multi-language support
 - 🧠 **Long-horizon Tasks Planning** - Orchestrated by state-of-the-art VLMs with multi-modal reasoning and tool use
 - 📡 **Asynchronous Tasks Execution** - Support for asynchronous task execution with streaming updates
-- 👁️ **Hybrid Robot Control** - deep learning policies for generalized physical operations combined with classical control for precise manipulation
-- 🔧 **Modular Architecture** - Flexible interfaces to add your own custom embodiments and tools
+- 👁️ **Hybrid Robot Control** - Deep learning policies for generalizable physical operations combined with classical control for precise manipulation
+- 🔧 **Modular Architecture** - Flexible interfaces to add your own custom backends, embodiments and tools
 - 🌐 **MCP Support** - Agents and tools available via MCP for custom client integration
 
 ## 📺 Demo
 
->As part of the [LeRobot Worldwide Hackathon](https://huggingface.co/LeRobot-worldwide-hackathon) for grabbing fries.
-
 <div align="center">
 
-<video src="https://huggingface.co/datasets/LeRobot-worldwide-hackathon/submissions/resolve/main/191-Dum-E.mp4" controls></video>
+<video src="https://github.com/user-attachments/assets/035d252a-e437-484f-a502-9f95a5bceb6f" controls></video>
 
 </div>
 
@@ -43,7 +41,7 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
 This project supports two deployment patterns:
 
 1. **Single Workstation**: Run everything locally on a single machine with GPU
-2. **Client-Server**: Run policy server on a remote GPU machine while keeping lightweight client components local, useful when your local machine doesn't meet the GPU requirements
+2. **Client-Server**: Run policy server on a separate GPU server while keeping lightweight client components local, useful when your local machine doesn't meet the GPU requirements
 
 Choose the setup that best matches your needs and hardware availability. The following sections will guide you through the installation process.
 
@@ -56,19 +54,19 @@ Choose the setup that best matches your needs and hardware availability. The fol
 
 #### For Single Workstation
 
-- **GPU**: Nvidia RTX 3060 (12GB VRAM) or better for local policy inference
-- **OS**: Linux (Ubuntu 22.04+) or Windows with WSL2
+- **GPU**: NVIDIA Ampere or later with at least 12GB VRAM (tested on RTX 3060) and driver ≥ 535.0
+- **OS**: Ubuntu 22.04/24.04 LTS or Windows with WSL2
 
 #### For Client-Server
 
-- **Server**: Any machine with 12GB+ VRAM Nvidia GPU, e.g. EC2 g4dn/g5/g6
+- **Server**: Any machine with 12GB+ VRAM NVIDIA GPU, e.g. EC2 g4dn/g5/g6
 - **Client**: Any machine with 4GB+ RAM
 - **OS**: Any OS (MacOS/Windows/Linux)
 
 ### 🔧 Installation
 
 #### 📦 On Single Workstation or Server
-> Requires 1) Nvidia GPU 2) Linux or WSL2
+> Requires 1) NVIDIA GPU 2) Linux or WSL2
 
 1. Install required system dependencies
 
@@ -150,6 +148,7 @@ Choose the setup that best matches your needs and hardware availability. The fol
     pip install -r requirements.txt
     ```
 
+    > [!NOTE]
     > If you have never set up SO-ARM before:
     > - Find the `wrist_cam_idx` and `front_cam_idx` by running `lerobot-find-cameras`
     > - Find the `robot_port` of by running `lerobot-find-port`
@@ -174,13 +173,16 @@ Choose the setup that best matches your needs and hardware availability. The fol
     python -m embodiment.so_arm10x.controller --config my-dum-e.yaml --instruction "<your-instruction>"
     ```
 
+    > [!NOTE]
     > If the robot is not moving, check if the gr00t policy server is running and the port is accessible from the client by running 
     > * `nc -zv <policy_host> 5555` (on MacOS/Linux) or 
     > * `Test-NetConnection -ComputerName <policy_host> -Port 5555` (on Windows PowerShell).
 
 6. Environment configuration for agent and voice
 
-    Sign up for free accounts at [ElevenLabs](https://elevenlabs.io/), [Deepgram](https://deepgram.com/), [Anthropic](https://www.anthropic.com/api) and obtain the API keys if you are using the default profile, or get your AWS credentials if you are using the `aws` profile. Then copy the environment template and update the `.env` file with your credentials:
+    > Sign up for free accounts at [ElevenLabs](https://elevenlabs.io/), [Deepgram](https://deepgram.com/), [Anthropic](https://www.anthropic.com/api) and obtain the API keys if you are using the default profile, or get your AWS credentials if you are using the `aws` profile.
+    
+    Copy the environment template and update the `.env` file with your credentials:
     ```bash
     cp .env.example .env
     ```
@@ -193,6 +195,9 @@ Choose the setup that best matches your needs and hardware availability. The fol
         - AWS Access Key ID
         - AWS Secret Access Key
         - AWS Region
+
+    > [!NOTE]
+    > You can optionally configure [Langfuse](https://langfuse.com/) observability for agent and voice by setting `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_HOST` in the `.env` file.
 
 7. Test the robot agent
 
@@ -251,7 +256,7 @@ graph TB
 
 ### 🔄 Data Flow
 
-1. **Voice Interaction**: Voice Streams → Cascaded / Speech-to-Speech Processor → Conversation and Delegation
+1. **Voice Interaction**: Voice Streams → Cascaded / Speech-to-Speech Processor → Conversation and Task Delegation
 2. **Task Execution**: Task Manager → Robot Agent → VLM Reasoning → Robot Controller Tools → Robot Hardware
 3. **Robot Control**: Task Instruction + Camera Images → DL Policy / Classical Control → Joint Commands
 4. **Streaming Feedback**: Agent Streaming Responses → Message Broker → MCP Context → Voice Updates
@@ -345,6 +350,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 This project builds on top of the following open-source projects:
 
 - [Pipecat Framework](https://github.com/pipecat-ai/pipecat/blob/main/LICENSE)
+- [FastMCP](https://github.com/jlowin/fastmcp/blob/main/LICENSE)
 - [Strands Agents](https://github.com/strands-agents/sdk-python/blob/main/LICENSE)
 - [Isaac GR00T](https://github.com/NVIDIA/Isaac-GR00T/blob/main/LICENSE)
 - [LeRobot](https://github.com/huggingface/lerobot/blob/main/LICENSE)

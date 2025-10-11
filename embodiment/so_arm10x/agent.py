@@ -22,6 +22,7 @@ python -m embodiment.so_arm10x.agent \
 """
 
 import asyncio
+import base64
 import os
 import time
 from datetime import datetime
@@ -35,6 +36,7 @@ from strands import Agent, tool
 from strands.agent import AgentResult
 from strands.models import BedrockModel
 from strands.models.anthropic import AnthropicModel
+from strands.telemetry import StrandsTelemetry
 from tqdm import tqdm
 
 
@@ -329,7 +331,7 @@ Note: Colors in images may appear different due to reflections.""",
             trace_attributes={
                 "session.id": time.strftime("%Y-%m-%d"),
                 "user.id": "SO-ARM101",
-                "langfuse.tags": ["GR00T-N1.5-3B"],
+                "langfuse.tags": ["agent"],
             },
         )
 
@@ -702,6 +704,27 @@ async def _agent_worker_loop(
 if __name__ == "__main__":
     # Configure logging for main execution
     setup_robot_logging(log_level="INFO", include_timestamps=False)
+
+    # Configure Langfuse for OpenTelemetry tracing
+    # See https://langfuse.com/integrations/frameworks/strands-agents for more information
+    if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+        # Build Langfuse Auth header.
+        LANGFUSE_AUTH = base64.b64encode(
+            f"{os.environ.get('LANGFUSE_PUBLIC_KEY')}:{os.environ.get('LANGFUSE_SECRET_KEY')}".encode()
+        ).decode()
+
+        # Configure OpenTelemetry endpoint & headers
+        os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = (
+            os.environ.get("LANGFUSE_HOST", "https://us.cloud.langfuse.com")
+            + "/api/public/otel"
+        )
+        os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = (
+            f"Authorization=Basic {LANGFUSE_AUTH}"
+        )
+
+        # Configure the telemetry
+        # (Creates new tracer provider and sets it as global)
+        strands_telemetry = StrandsTelemetry().setup_otlp_exporter()
 
     async def main():
         import argparse

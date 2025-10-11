@@ -207,6 +207,104 @@ class TestSpawnPipecatServer:
         assert env["DUME_NAMESPACE"] == "test"
 
     @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_with_voice_config(self, mock_popen):
+        """Test Pipecat server spawning with voice configuration."""
+        config = BackendConfig(namespace="test")
+        voice_config = {"language": "zh", "mode": "cascaded", "profile": "default"}
+
+        dum_e._spawn_pipecat_server(config, voice_config)
+
+        mock_popen.assert_called_once()
+        call_args = mock_popen.call_args
+        env = call_args[1]["env"]
+
+        assert env["DUME_NAMESPACE"] == "test"
+        assert env["DUME_VOICE_LANGUAGE"] == "zh"
+        assert env["DUME_VOICE_MODE"] == "cascaded"
+        assert env["DUME_VOICE_PROFILE"] == "default"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_voice_config_defaults(self, mock_popen):
+        """Test Pipecat server spawning with partial voice configuration uses defaults."""
+        config = BackendConfig(namespace="test")
+        voice_config = {"language": "ja"}  # Only language specified
+
+        dum_e._spawn_pipecat_server(config, voice_config)
+
+        call_args = mock_popen.call_args
+        env = call_args[1]["env"]
+
+        assert env["DUME_VOICE_LANGUAGE"] == "ja"
+        assert env["DUME_VOICE_MODE"] == "cascaded"  # default
+        assert env["DUME_VOICE_PROFILE"] == "default"  # default
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_no_voice_config(self, mock_popen):
+        """Test Pipecat server spawning without voice configuration."""
+        config = BackendConfig(namespace="test")
+
+        dum_e._spawn_pipecat_server(config, None)
+
+        call_args = mock_popen.call_args
+        env = call_args[1]["env"]
+
+        assert env["DUME_NAMESPACE"] == "test"
+        # Voice config env vars should not be set when voice_config is None
+        assert "DUME_VOICE_LANGUAGE" not in env
+        assert "DUME_VOICE_MODE" not in env
+        assert "DUME_VOICE_PROFILE" not in env
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_all_languages(self, mock_popen):
+        """Test Pipecat server spawning with all supported languages."""
+        config = BackendConfig(namespace="test")
+
+        for language in ["en", "zh", "ja", "es"]:
+            voice_config = {
+                "language": language,
+                "mode": "cascaded",
+                "profile": "default",
+            }
+            dum_e._spawn_pipecat_server(config, voice_config)
+
+        # Should be called 4 times
+        assert mock_popen.call_count == 4
+
+        # Check each call has correct language
+        for i, language in enumerate(["en", "zh", "ja", "es"]):
+            call_args = mock_popen.call_args_list[i]
+            env = call_args[1]["env"]
+            assert env["DUME_VOICE_LANGUAGE"] == language
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_speech_to_speech_mode(self, mock_popen):
+        """Test Pipecat server spawning with speech-to-speech mode."""
+        config = BackendConfig(namespace="test")
+        voice_config = {"language": "en", "mode": "speech_to_speech", "profile": "aws"}
+
+        dum_e._spawn_pipecat_server(config, voice_config)
+
+        call_args = mock_popen.call_args
+        env = call_args[1]["env"]
+
+        assert env["DUME_VOICE_MODE"] == "speech_to_speech"
+        assert env["DUME_VOICE_PROFILE"] == "aws"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_aws_profile(self, mock_popen):
+        """Test Pipecat server spawning with AWS profile."""
+        config = BackendConfig(namespace="test")
+        voice_config = {"language": "es", "mode": "cascaded", "profile": "aws"}
+
+        dum_e._spawn_pipecat_server(config, voice_config)
+
+        call_args = mock_popen.call_args
+        env = call_args[1]["env"]
+
+        assert env["DUME_VOICE_LANGUAGE"] == "es"
+        assert env["DUME_VOICE_PROFILE"] == "aws"
+
+    @mock.patch("subprocess.Popen")
     def test_spawn_pipecat_server_env_inheritance(self, mock_popen):
         """Test that Pipecat server inherits current environment."""
         config = BackendConfig(namespace="test")
@@ -219,6 +317,40 @@ class TestSpawnPipecatServer:
 
         assert env["EXISTING_VAR"] == "existing_value"
         assert env["DUME_NAMESPACE"] == "test"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_extra_env_with_voice_config(self, mock_popen):
+        """Test Pipecat server spawning with both voice config and extra env."""
+        config = BackendConfig(namespace="test")
+        voice_config = {"language": "zh", "mode": "cascaded", "profile": "default"}
+        extra_env = {"CUSTOM_VAR": "custom_value"}
+
+        dum_e._spawn_pipecat_server(config, voice_config, extra_env)
+
+        call_args = mock_popen.call_args
+        env = call_args[1]["env"]
+
+        assert env["DUME_NAMESPACE"] == "test"
+        assert env["DUME_VOICE_LANGUAGE"] == "zh"
+        assert env["DUME_VOICE_MODE"] == "cascaded"
+        assert env["DUME_VOICE_PROFILE"] == "default"
+        assert env["CUSTOM_VAR"] == "custom_value"
+
+    @mock.patch("dum_e.logger")
+    @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_logging(self, mock_popen, mock_logger):
+        """Test that Pipecat server spawning logs configuration."""
+        config = BackendConfig(namespace="test")
+        voice_config = {"language": "ja", "mode": "cascaded", "profile": "aws"}
+
+        dum_e._spawn_pipecat_server(config, voice_config)
+
+        # Check that info was logged
+        mock_logger.info.assert_called()
+        log_call = mock_logger.info.call_args[0][0]
+        assert "Starting Pipecat server" in log_call
+        assert "namespace=test" in log_call or "test" in str(mock_logger.info.call_args)
+        assert "language=ja" in log_call or "ja" in str(mock_logger.info.call_args)
 
 
 class TestSpawnAgentWorker:
@@ -430,8 +562,9 @@ class TestEnvironmentInjection:
 
         with mock.patch("subprocess.Popen", DummyPopen):
             cfg = BackendConfig(namespace="unit")
+            voice_config = None  # No voice config
             extra_env = {"FOO": "BAR"}
-            dum_e._spawn_pipecat_server(cfg, extra_env)
+            dum_e._spawn_pipecat_server(cfg, voice_config, extra_env)
 
         assert len(popen_calls) == 1
         cmd, env = popen_calls[0]

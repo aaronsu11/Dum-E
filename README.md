@@ -26,7 +26,7 @@ Inspired by Tony Stark's robotic assistant [Dum-E](https://marvelcinematicuniver
 - 📡 **Asynchronous Tasks Execution** - Support for asynchronous task execution with streaming updates
 - 👁️ **Hybrid Robot Control** - deep learning policies for generalized physical operations combined with classical control for precise manipulation
 - 🔧 **Modular Architecture** - Flexible interfaces to add your own custom embodiments and tools
-- 🌐 **MCP Protocol Support** - Agents and tools available via MCP for custom client integration (coming soon)
+- 🌐 **MCP Support** - Agents and tools available via MCP for custom client integration
 
 ## 📺 Demo
 
@@ -164,7 +164,7 @@ Choose the setup that best matches your needs and hardware availability. The fol
     Edit my-dum-e.yaml:
     - Set `controller.robot_type`/`robot_port`/`robot_id`/`wrist_cam_idx`/`front_cam_idx`
     - Set `controller.policy_host` to your gr00t policy server IP (or `localhost`)
-    - Optionally set `agent.profile` to use different model presets
+    - Optionally set `agent.profile` and `voice.mode`/`profile` to use different model presets
 
 
 5. Test policy execution
@@ -220,53 +220,47 @@ Choose the setup that best matches your needs and hardware availability. The fol
 
 ```mermaid
 graph TB
-    subgraph Interface Layer
-        A[Voice Interface<br/>Pipecat]
-        B[Third-party Clients<br/>Dum-E MCP Server]
-    end
-
-    subgraph Agent Layer
-        C[Robot Agent<br/>Reasoning VLM]
-        D[Task Manager<br/>Lifecycle Tracking]
-        E[Tool Registry<br/>Shared Tools]
-        F[Event Publisher<br/>Streaming Updates]
-    end
-
-    subgraph Tool Layer
-        G[Classical Control<br/>MoveIt]
-        H[VLA Policy<br/>Gr00t Inference]
-        I[Custom Tools<br/>Public MCP Servers]
-    end
-
-    subgraph Hardware Layer
-        J[Physical Robot<br/>SO10x]
-    end
-
+ subgraph subGraph0["Frontend"]
+        A["Voice Interface<br>Pipecat"]
+        B["External MCP Clients"]
+  end
+ subgraph subGraph1["Backend"]
+        C["MCP Server<br>Streamable HTTP"]
+        D["Fleet Manager<br>Multi-agent Management"]
+        E["Task Manager<br>Task Management"]
+        F["Message Broker<br>Event Streaming"]
+  end
+ subgraph subGraph2["Agent Layer"]
+        G["Robot Agent<br>Multi-modal Orchestration"]
+  end
+ subgraph subGraph3["Controller Layer"]
+        H["Classical Control<br>MoveIt"]
+        I["VLA Policy<br>Gr00t Inference"]
+        J["Custom Tools<br>Public MCP Servers"]
+  end
+ subgraph subGraph4["Hardware Layer"]
+        K["Physical Robot<br>SO-ARM10x"]
+  end
     A --> C
     B --> C
-    C --> D
-    C --> E
-    C --> F
-    E --> G
-    E --> H 
-    E --> I
-    G --> J
-    H --> J
+    C --> D & E & F & G
+    G --> H & I & J
+    H --> K
+    I --> K
 ```
 
 ### 🔄 Data Flow
 
-1. **Voice Interaction** → Voice / Vision Streams → Pipecat → Conversation and Task Delegation
-2. **Task Planning** → Task Manager → Reasoning VLM → Multi-step Instruction Breakdown  
-3. **Task Execution** → Tool Registry → Hardware Interface → SO10xRobot
-4. **Robot Control** → Camera Images → DL Policy / Classical Control → Joint Commands
-5. **Feedback Loop** → Progress Events → Model Context → Voice Updates
+1. **Voice Interaction**: Voice Streams → Cascaded / Speech-to-Speech Processor → Conversation and Delegation
+2. **Task Execution**: Task Manager → Robot Agent → VLM Reasoning → Robot Controller Tools → Robot Hardware
+3. **Robot Control**: Task Instruction + Camera Images → DL Policy / Classical Control → Joint Commands
+4. **Streaming Feedback**: Agent Streaming Responses → Message Broker → MCP Context → Voice Updates
 
 ## 🗺️ Roadmap
 
 ### Q3 2025
 - [x] **Voice Interaction**
-  - [ ] Multi-language support (Mandarin, Japanese, Spanish etc.)
+  - [x] Multi-language support (Mandarin, Japanese, Spanish etc.)
   - [x] Emotional understanding with speech-to-speech models
 
 - [x] **MCP Servers**

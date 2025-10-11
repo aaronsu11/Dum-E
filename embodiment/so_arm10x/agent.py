@@ -144,8 +144,15 @@ def create_robot_tools(
         return robot_controller.get_current_images()
 
     @tool
-    def start_pick(item: Literal["a banana", "an apple", "an orange"]) -> dict:
-        """Start picking up an item and put it on the plate"""
+    def start_pick(item: str) -> dict:
+        """Start picking up an item and put it on the plate
+
+        Args:
+            item: The item to pick up, e.g. "a banana", "an apple", "an orange"
+
+        Returns:
+            A dictionary containing the status of the pick operation
+        """
         language_instruction = f"Grab {item} and put it on the plate"
         gr00t_client_instance.set_lang_instruction(language_instruction)
         latest_images = pick(pose="initial", language_instruction=language_instruction)
@@ -264,7 +271,7 @@ class SO10xRobotAgent(IRobotAgent):
         if self.profile == "aws":
             model = BedrockModel(
                 # Use the cross-region inference profile prefix "us." with Sonnet 4
-                model_id="us.anthropic.claude-sonnet-4-20250514-v1:0",
+                model_id="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
                 region_name=os.getenv("AWS_REGION"),
                 max_tokens=8000,
                 additional_request_fields={
@@ -280,7 +287,7 @@ class SO10xRobotAgent(IRobotAgent):
                 client_args={
                     "api_key": os.getenv("ANTHROPIC_API_KEY"),
                 },
-                model_id="claude-sonnet-4-20250514",
+                model_id="claude-sonnet-4-5-20250929",
                 max_tokens=8000,
                 params={
                     "thinking": {
@@ -372,6 +379,18 @@ Note: Colors in images may appear different due to reflections.""",
             }
 
         except Exception as e:
+            # Ensure robot is properly disconnected on error
+            try:
+                if self.robot_controller.is_connected():
+                    logger.warning(
+                        f"⚠️  Error during execution, disconnecting robot: {e}"
+                    )
+                    self.robot_controller.disconnect()
+            except Exception as disconnect_error:
+                logger.error(
+                    f"❌ Failed to disconnect robot after error: {disconnect_error}"
+                )
+
             if self.task_manager is not None and task_id is not None:
                 await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
 
@@ -500,6 +519,18 @@ Note: Colors in images may appear different due to reflections.""",
                     )
 
         except Exception as e:
+            # Ensure robot is properly disconnected on error
+            try:
+                if self.robot_controller.is_connected():
+                    logger.warning(
+                        f"⚠️  Error during execution, disconnecting robot: {e}"
+                    )
+                    self.robot_controller.disconnect()
+            except Exception as disconnect_error:
+                logger.error(
+                    f"❌ Failed to disconnect robot after error: {disconnect_error}"
+                )
+
             if self.task_manager is not None and task_id is not None:
                 await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
 

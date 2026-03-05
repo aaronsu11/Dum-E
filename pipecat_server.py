@@ -15,23 +15,24 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMContext
-from pipecat.services.aws.llm import AWSBedrockLLMService, AWSBedrockLLMContext
+from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.services.aws.stt import AWSTranscribeSTTService
 from pipecat.services.aws.tts import AWSPollyTTSService
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
-from pipecat.services.aws.nova_sonic.context import AWSNovaSonicLLMContext
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
-from pipecat.services.llm_service import FunctionCallResultCallback, LLMService
+from pipecat.services.llm_service import FunctionCallParams, LLMService
 from pipecat.services.mcp_service import MCPClient
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -131,12 +132,10 @@ transport_params = {
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(),
     ),
 }
 
@@ -154,7 +153,7 @@ class AsyncMCPClient(MCPClient):
         session: ClientSession,
         function_name: str,
         arguments: dict,
-        result_callback: FunctionCallResultCallback,
+        params: FunctionCallParams,
     ):
         """Override the _call_tool method to use the progress callback."""
         logger.debug(f"Calling mcp tool '{function_name}'")
@@ -186,7 +185,7 @@ class AsyncMCPClient(MCPClient):
         final_response = (
             response if len(response) else "Sorry, could not call the mcp tool"
         )
-        await result_callback(final_response)
+        await params.result_callback(final_response)
 
     async def _list_tools(
         self, session: ClientSession, mcp_tool_wrapper: Callable, llm: LLMService
@@ -386,7 +385,7 @@ async def run_jarvis(
         # For Nova Sonic speech-to-speech, append the special trigger instruction so the
         # assistant will start speaking when it hears the synthetic "ready" trigger.
         if mode == "speech_to_speech":
-            context = AWSNovaSonicLLMContext(
+            context = LLMContext(
                 messages=[
                     {
                         "role": "system",
@@ -406,7 +405,7 @@ async def run_jarvis(
                 tools=tools,
             )
         else:
-            context = AWSBedrockLLMContext(
+            context = LLMContext(
                 messages=[
                     {
                         "role": "system",
@@ -416,7 +415,7 @@ async def run_jarvis(
                 tools=tools,
             )
     else:
-        context = AnthropicLLMContext(
+        context = LLMContext(
             messages=[
                 {
                     "role": "system",
@@ -426,32 +425,33 @@ async def run_jarvis(
             tools=tools,
         )
 
-    context_aggregator = llm.create_context_aggregator(context)
-
-    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8))
+        ),
+    )
 
     if mode == "cascaded":
         pipeline = Pipeline(
             [
                 transport.input(),  # Transport user input
-                rtvi,  # RTVI processor
                 stt,  # Speech-to-text
-                context_aggregator.user(),  # User responses
+                user_aggregator,  # User responses
                 llm,  # LLM
                 tts,  # Text-to-speech
                 transport.output(),  # Transport bot output
-                context_aggregator.assistant(),  # Assistant spoken responses
+                assistant_aggregator,  # Assistant spoken responses
             ]
         )
     elif mode == "speech_to_speech":
         pipeline = Pipeline(
             [
                 transport.input(),
-                rtvi,
-                context_aggregator.user(),
+                user_aggregator,
                 llm,
                 transport.output(),
-                context_aggregator.assistant(),
+                assistant_aggregator,
             ]
         )
 
@@ -466,7 +466,6 @@ async def run_jarvis(
             "langfuse.session.id": time.strftime("%Y-%m-%d"),
             "langfuse.tags": ["pipecat-server"],
         },
-        observers=[RTVIObserver(rtvi)],
     )
 
     @transport.event_handler("on_client_connected")

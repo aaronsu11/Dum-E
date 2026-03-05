@@ -196,6 +196,5 @@ cython_debug/
 #VSCode
 .vscode/
 
-# Debug images
-sample_images/
-outputs/
+# Planning files
+.planning/

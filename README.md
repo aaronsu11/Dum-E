@@ -136,18 +136,17 @@ Choose the setup that best matches your needs and hardware availability. The fol
     git clone https://github.com/aaronsu11/Dum-E.git
     ```
 
-2. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.12 for dum-e client:
+2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (if not already installed):
     ```bash
-    conda create -y -n dum-e python=3.12
-    conda activate dum-e
+    curl -LsSf https://astral.sh/uv/install.sh | sh
     ```
 
 3. Install Dum-E Dependencies
-    
+
     ```bash
     cd Dum-E
-    # conda activate dum-e
-    pip install -r requirements.txt
+    uv sync
+    source .venv/bin/activate
     ```
 
 > [!NOTE]

@@ -29,6 +29,7 @@ from pipecat.services.aws.tts import AWSPollyTTSService
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
 from pipecat.services.aws.nova_sonic.context import AWSNovaSonicLLMContext
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
+from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import FunctionCallResultCallback, LLMService
 from pipecat.services.mcp_service import MCPClient
@@ -318,7 +319,7 @@ async def run_jarvis(
                 aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
                 # aws_session_token=os.getenv("AWS_SESSION_TOKEN"),
                 aws_region=os.getenv("AWS_REGION"),
-                model="us.anthropic.claude-3-5-haiku-20241022-v1:0",
+                model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
                 params=AWSBedrockLLMService.InputParams(
                     temperature=0.1,
                     max_tokens=500,
@@ -350,18 +351,22 @@ async def run_jarvis(
 
             llm = AnthropicLLMService(
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
-                model="claude-3-5-haiku-20241022",
+                model="claude-haiku-4-5",
                 params=AnthropicLLMService.InputParams(temperature=0.1, max_tokens=500),
             )
 
             elevenlabs_config = language_preset["elevenlabs"]
-            tts = ElevenLabsTTSService(
-                api_key=os.getenv("ELEVENLABS_API_KEY"),
-                voice_id=elevenlabs_config["voice_id"],
-                sample_rate=24000,
-                params=ElevenLabsTTSService.InputParams(
-                    language=elevenlabs_config["language"]
-                ),
+            # tts = ElevenLabsTTSService(
+            #     api_key=os.getenv("ELEVENLABS_API_KEY"),
+            #     voice_id=elevenlabs_config["voice_id"],
+            #     sample_rate=24000,
+            #     params=ElevenLabsTTSService.InputParams(
+            #         language=elevenlabs_config["language"]
+            #     ),
+            # )
+            tts = DeepgramTTSService(
+                api_key=os.getenv("DEEPGRAM_API_KEY"),
+                voice="aura-2-hermes-en"
             )
 
     # Use enhanced MCPClient to avoid interrupting long-running tools and enable voice updates on progress

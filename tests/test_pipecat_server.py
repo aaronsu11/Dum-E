@@ -20,10 +20,10 @@ class TestLanguageSpecificConfigs:
     @pytest.mark.parametrize(
         "lang,model,el_lang,polly_voice,polly_lang",
         [
-            ("en", None, Language.EN, "Matthew", "en-US"),
+            ("en", "nova-3", Language.EN, "Matthew", "en-US"),
             ("zh", "nova-2", Language.CMN, "Zhiyu", "cmn-CN"),
-            ("ja", "nova-2", Language.JA, "Takumi", "ja-JP"),
-            ("es", "nova-2", Language.ES, "Sergio", "es-ES"),
+            ("ja", "nova-2", Language.JA, "Kazuha", "ja-JP"),
+            ("es", "nova-3", Language.ES, "Sergio", "es-ES"),
         ],
     )
     def test_language_configurations(
@@ -106,13 +106,13 @@ class TestLanguageFeatures:
     """Test language-specific features and requirements."""
 
     def test_deepgram_model_selection(self):
-        """Test Deepgram model selection: default for English, nova-2 for others."""
+        """Test Deepgram model selection per language."""
         from pipecat_server import LANGUAGE_PRESETS
 
-        assert LANGUAGE_PRESETS["en"]["deepgram"]["model"] is None
-
-        for lang in ["zh", "ja", "es"]:
-            assert LANGUAGE_PRESETS[lang]["deepgram"]["model"] == "nova-2"
+        assert LANGUAGE_PRESETS["en"]["deepgram"]["model"] == "nova-3"
+        assert LANGUAGE_PRESETS["zh"]["deepgram"]["model"] == "nova-2"
+        assert LANGUAGE_PRESETS["ja"]["deepgram"]["model"] == "nova-2"
+        assert LANGUAGE_PRESETS["es"]["deepgram"]["model"] == "nova-3"
 
     def test_all_profiles_supported(self):
         """Test that all languages support both default and AWS profiles."""

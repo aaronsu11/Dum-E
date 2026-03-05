@@ -32,7 +32,7 @@ from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
-from pipecat.services.llm_service import FunctionCallParams, LLMService
+from pipecat.services.llm_service import LLMService
 from pipecat.services.mcp_service import MCPClient
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -153,7 +153,7 @@ class AsyncMCPClient(MCPClient):
         session: ClientSession,
         function_name: str,
         arguments: dict,
-        params: FunctionCallParams,
+        result_callback,
     ):
         """Override the _call_tool method to use the progress callback."""
         logger.debug(f"Calling mcp tool '{function_name}'")
@@ -166,6 +166,8 @@ class AsyncMCPClient(MCPClient):
         except Exception as e:
             error_msg = f"Error calling mcp tool {function_name}: {str(e)}"
             logger.error(error_msg)
+            await result_callback(error_msg)
+            return
 
         response = ""
         if results:
@@ -185,7 +187,7 @@ class AsyncMCPClient(MCPClient):
         final_response = (
             response if len(response) else "Sorry, could not call the mcp tool"
         )
-        await params.result_callback(final_response)
+        await result_callback(final_response)
 
     async def _list_tools(
         self, session: ClientSession, mcp_tool_wrapper: Callable, llm: LLMService

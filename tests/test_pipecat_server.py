@@ -467,3 +467,273 @@ class TestLangfuseTraceIO:
             "the existing Authorization=Basic header must remain intact "
             "(the ingestion-version token is appended, not substituted)"
         )
+
+
+# --- Phase 2 speech-model wiring tests (SPCH-06 / D-06) ---------------------
+#
+# These keyless, no-network tests pin every Phase 2 speech-model change so a
+# regression in the model swap is caught in CI. The behavioural acceptance
+# evidence (multi-language conversation, the zh Aura-2->ElevenLabs fallback, and
+# a >8-min Nova Sonic 2 session) is the documented manual live smoke test in the
+# README — CI wiring is not the sole evidence (threat T-02-07/08).
+
+
+class TestDeepgramSTTSettingsMigration:
+    """SPCH-01 / D-01: the default-profile STT migrated off the deprecated
+    LiveOptions to settings=DeepgramSTTSettings(...). Pattern B (string + AST).
+    """
+
+    def test_deepgram_stt_settings_constructed(self):
+        """DeepgramSTTSettings(...) is constructed (the 1.x settings= idiom)."""
+        tree = _server_ast()
+        assert _calls_to(tree, "DeepgramSTTSettings"), (
+            "expected a DeepgramSTTSettings(...) call — the 1.x replacement for "
+            "live_options=LiveOptions(...)"
+        )
+
+    def test_live_options_absent_from_source(self):
+        """The deprecated LiveOptions name must not appear anywhere in source."""
+        source = _server_source()
+        assert "LiveOptions" not in source, (
+            "deprecated LiveOptions must not appear — STT migrated to "
+            "settings=DeepgramSTTSettings(...) (D-01)"
+        )
+
+
+class TestNova3MultiSTTPresets:
+    """SPCH-01 / D-01: the CONSTRUCTED default-profile STT resolves to Nova-3
+    `multi` (the value the constructor consumes from the preset), and `zh` is
+    the explicit non-`multi` override. Pattern C — assert the preset value, NOT
+    mere token presence (Warning-1 fix).
+    """
+
+    @pytest.mark.parametrize("lang", ["en", "es", "ja"])
+    def test_multi_covered_presets_use_nova3_multi(self, lang):
+        """en/es/ja presets carry model=nova-3 + language=multi (what the
+        default-profile STT constructor reads at runtime; run_jarvis also falls
+        back to the `en` preset for unknown/unspecified languages)."""
+        from pipecat_server import LANGUAGE_PRESETS
+
+        assert LANGUAGE_PRESETS[lang]["deepgram"]["model"] == "nova-3"
+        assert LANGUAGE_PRESETS[lang]["deepgram"]["language"] == "multi"
+
+    def test_zh_is_explicit_non_multi_override(self):
+        """zh is NOT in Nova-3 `multi`; it carries an explicit override."""
+        from pipecat_server import LANGUAGE_PRESETS
+
+        zh_lang = LANGUAGE_PRESETS["zh"]["deepgram"]["language"]
+        assert zh_lang != "multi", (
+            "Mandarin is not covered by Nova-3 `multi`; it must carry an explicit "
+            "language override"
+        )
+        assert zh_lang in ("zh", "zh-CN")
+        assert LANGUAGE_PRESETS["zh"]["deepgram"]["model"] == "nova-3"
+
+
+class TestPerLanguageTTSRouting:
+    """SPCH-02 / D-02/D-03: static per-language TTS routing — en/es/ja resolve to
+    a Deepgram Aura-2 voice; zh resolves to ElevenLabs (Aura-2 has no Mandarin
+    voice). The routing decision lives in LANGUAGE_PRESETS via a `tts_engine`
+    key (per 02-01-SUMMARY). Pattern C (data assertion).
+    """
+
+    @pytest.mark.parametrize("lang", ["en", "es", "ja"])
+    def test_aura2_languages_route_to_deepgram(self, lang):
+        from pipecat_server import LANGUAGE_PRESETS
+
+        preset = LANGUAGE_PRESETS[lang]
+        assert preset["tts_engine"] == "deepgram", (
+            f"{lang} is Aura-2-supported and must route to the Deepgram TTS engine"
+        )
+        # The Aura-2 voice token the DeepgramTTSService is constructed with.
+        assert preset["aura2_voice"].startswith("aura-2-"), (
+            f"{lang} must carry an aura-2-* voice token for Aura-2 routing"
+        )
+
+    def test_zh_routes_to_elevenlabs(self):
+        from pipecat_server import LANGUAGE_PRESETS
+
+        assert LANGUAGE_PRESETS["zh"]["tts_engine"] == "elevenlabs", (
+            "Mandarin must fall back to ElevenLabs (Aura-2 has no zh voice) — "
+            "Pitfall 3: a wrong route here produces silence on zh"
+        )
+
+    def test_elevenlabs_tts_service_is_live_code(self):
+        """SPCH-02 / D-03: the ElevenLabs fallback is now LIVE code (it was a
+        commented-out block before the swap). Pattern B."""
+        tree = _server_ast()
+        assert _calls_to(tree, "ElevenLabsTTSService"), (
+            "ElevenLabsTTSService(...) must be constructed in the zh fallback "
+            "branch — it is live code now, not a comment"
+        )
+
+
+class TestNovaSonic2Wiring:
+    """SPCH-04 / D-04: Nova Sonic 2 is wired with an explicit
+    model=amazon.nova-2-sonic-v1:0 AND a native session_continuation= kwarg,
+    while PRESERVING function_call_timeout_secs (PIPE-04 — guarded separately by
+    TestLLMFunctionCallTimeout, which must NOT be weakened). Pattern A (AST kwarg).
+    """
+
+    def test_nova_sonic_has_session_continuation_kwarg(self):
+        tree = _server_ast()
+        calls = _calls_to(tree, "AWSNovaSonicLLMService")
+        assert calls, "expected an AWSNovaSonicLLMService(...) constructor call"
+        assert any(
+            _kwarg(call, "session_continuation") is not None for call in calls
+        ), (
+            "AWSNovaSonicLLMService must be constructed with a session_continuation= "
+            "kwarg (D-04 native ~8-min context-carrying session rotation)"
+        )
+
+    def test_nova_sonic_model_is_nova_2_sonic(self):
+        tree = _server_ast()
+        calls = _calls_to(tree, "AWSNovaSonicLLMService")
+        assert calls, "expected an AWSNovaSonicLLMService(...) constructor call"
+
+        models = []
+        for call in calls:
+            node = _kwarg(call, "model")
+            if isinstance(node, ast.Constant):
+                models.append(node.value)
+        assert "amazon.nova-2-sonic-v1:0" in models, (
+            "AWSNovaSonicLLMService must set model='amazon.nova-2-sonic-v1:0' "
+            "explicitly (SPCH-04 / D-04 — Nova 2 Sonic)"
+        )
+
+    def test_nova_sonic_timeout_guard_intact_post_swap(self):
+        """PIPE-04 regression guard (Pitfall 4): after adding session_continuation
+        + model, the Nova Sonic constructor STILL carries a non-None
+        function_call_timeout_secs. This mirrors the assertion in
+        TestLLMFunctionCallTimeout and proves the swap did not weaken it."""
+        tree = _server_ast()
+        calls = _calls_to(tree, "AWSNovaSonicLLMService")
+        assert calls, "expected an AWSNovaSonicLLMService(...) constructor call"
+        for call in calls:
+            timeout = _kwarg(call, "function_call_timeout_secs")
+            assert timeout is not None, (
+                "AWSNovaSonicLLMService lost function_call_timeout_secs after the "
+                "Nova Sonic 2 swap (PIPE-04 regression)"
+            )
+            assert not (
+                isinstance(timeout, ast.Constant) and timeout.value is None
+            ), "function_call_timeout_secs must be a real bound, not None"
+
+
+class TestSageMakerBackendSelector:
+    """SPCH-05 / D-05: the DUME_DEEPGRAM_BACKEND=sagemaker path is WIRED but the
+    endpoint is NOT deployed this milestone — it raises ValueError on a missing
+    endpoint (never silently falls back to hosted), and references the
+    Deepgram-on-SageMaker services. Pattern D (behavioural, via run_jarvis) +
+    Pattern B (AST/source).
+    """
+
+    def test_sagemaker_stt_service_referenced(self):
+        """Pattern B: the SageMaker STT service is referenced (wired) in source."""
+        source = _server_source()
+        assert "DeepgramSageMakerSTTService" in source, (
+            "DeepgramSageMakerSTTService must be referenced — the sagemaker "
+            "backend is wired even though the endpoint is not deployed"
+        )
+
+    def test_sagemaker_branch_raises_value_error_on_missing_endpoint(self):
+        """AST: the sagemaker branch carries a `raise ValueError` guarding the
+        SAGEMAKER_STT_ENDPOINT_NAME read (no silent warn-and-fallback). The guard
+        lives inline in run_jarvis (no extractable selector callable per
+        02-01-SUMMARY), so assert structurally that a ValueError raise co-occurs
+        with the endpoint env-var name."""
+        source = _server_source()
+        tree = _server_ast()
+
+        # The endpoint env-var name is read.
+        assert "SAGEMAKER_STT_ENDPOINT_NAME" in source, (
+            "the sagemaker branch must read SAGEMAKER_STT_ENDPOINT_NAME"
+        )
+        # A `raise ValueError(...)` exists in the module (the guard).
+        value_error_raises = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+            and node.exc.func.id == "ValueError"
+        ]
+        assert value_error_raises, (
+            "the sagemaker-without-endpoint case must `raise ValueError` "
+            "(D-05 guarded behaviour — no silent fallback)"
+        )
+        # At least one ValueError message names the SageMaker endpoint env var,
+        # proving the raise guards the missing-endpoint case (not some other input).
+        named = False
+        for node in value_error_raises:
+            for arg in ast.walk(node.exc):
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and (
+                    "SAGEMAKER_STT_ENDPOINT_NAME" in arg.value
+                    or "SAGEMAKER_TTS_ENDPOINT_NAME" in arg.value
+                ):
+                    named = True
+        assert named, (
+            "a raised ValueError message must name the missing SAGEMAKER_*_ENDPOINT_NAME "
+            "(the guarded missing-endpoint case)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_jarvis_sagemaker_without_endpoint_raises(self):
+        """Pattern D (behavioural): drive run_jarvis with the sagemaker backend
+        and NO endpoint env vars; it must raise ValueError before any service is
+        constructed. Keyless — fails fast on the guard, never reaching a live
+        service constructor or the network."""
+        import pipecat_server
+
+        transport = mock.MagicMock(name="transport")
+        runner_args = mock.MagicMock(name="runner_args")
+
+        # clear=True removes any SAGEMAKER_*_ENDPOINT_NAME from the environment.
+        with mock.patch.dict(
+            os.environ, {"DUME_DEEPGRAM_BACKEND": "sagemaker"}, clear=True
+        ):
+            with pytest.raises(ValueError, match="SAGEMAKER_STT_ENDPOINT_NAME"):
+                await pipecat_server.run_jarvis(
+                    transport,
+                    runner_args,
+                    mode="cascaded",
+                    profile="default",
+                    language="en",
+                    backend="sagemaker",
+                )
+
+
+class TestAwsProfileRegression:
+    """SPCH-06 regression guard: the aws-profile (Transcribe/Bedrock/Polly) path
+    is untouched by the Phase 2 default-profile model swap. Re-asserts the
+    existing aws preset facts so a future swap that accidentally disturbs the aws
+    branch is caught here too."""
+
+    @pytest.mark.parametrize(
+        "lang,polly_voice,polly_lang,transcribe_lang",
+        [
+            ("en", "Matthew", "en-US", "en-US"),
+            ("zh", "Zhiyu", "cmn-CN", "zh-CN"),
+            ("ja", "Kazuha", "ja-JP", "ja-JP"),
+            ("es", "Sergio", "es-ES", "es-ES"),
+        ],
+    )
+    def test_aws_profile_presets_unchanged(
+        self, lang, polly_voice, polly_lang, transcribe_lang
+    ):
+        from pipecat_server import LANGUAGE_PRESETS
+
+        preset = LANGUAGE_PRESETS[lang]
+        assert preset["aws_polly"]["voice_id"] == polly_voice
+        assert preset["aws_polly"]["language"] == polly_lang
+        assert preset["aws_transcribe"]["language"] == transcribe_lang
+
+    def test_no_stale_nova2_stt_model_in_presets(self):
+        """No preset claims a nova-2 STT model (the OLD zh/ja matrix is gone).
+        Nova Sonic's nova-2-sonic id is a different thing and is NOT an STT model."""
+        from pipecat_server import LANGUAGE_PRESETS
+
+        for lang, preset in LANGUAGE_PRESETS.items():
+            assert preset["deepgram"]["model"] != "nova-2", (
+                f"{lang} still claims a nova-2 STT model — the stale matrix must be gone"
+            )

@@ -266,6 +266,50 @@ verify the full speech loop end-to-end in a real browser:
 
 If all of the above hold, the PIPE-06 gate is satisfied.
 
+## ✅ Speech-Model Smoke Test (manual acceptance gate)
+
+> [!NOTE]
+> This is the **D-06 manual acceptance gate** for the Phase 2 speech-model swap
+> (Deepgram Nova-3 `multi` STT, Aura-2 TTS with the ElevenLabs Mandarin fallback,
+> and Nova 2 Sonic speech-to-speech). The CI suite (`tests/test_pipecat_server.py`)
+> covers the **wiring** (which services/models/kwargs are constructed) with no live
+> keys; this manual gate is the documented sign-off for the **runtime behavior**,
+> which cannot run keyless in CI. Together they are the acceptance evidence for
+> SPCH-01 / SPCH-02 / SPCH-03 / SPCH-04.
+
+**Prerequisites**
+
+- The same launch as the PIPE-06 gate above (`python dum_e.py --config my-dum-e.yaml`),
+  with `DEEPGRAM_API_KEY`, `ANTHROPIC_API_KEY`, and `ELEVENLABS_API_KEY` set in `.env`.
+- For scenario (c) — Nova 2 Sonic speech-to-speech — set `DUME_VOICE_MODE=speech_to_speech`
+  and `DUME_VOICE_PROFILE=aws`, and ensure **`AWS_REGION` is one of `us-east-1`,
+  `us-west-2`, or `ap-northeast-1`** — Nova 2 Sonic is only offered in those regions
+  (OQ2). The cascaded scenarios (a) and (b) use the default profile.
+
+**Scenarios** — open `http://localhost:7860`, allow the microphone, and connect on `/start`:
+
+1. **Multi-language conversation (Nova-3 `multi` auto-detect).** In a single default-profile
+   session, speak a few turns in English and at least one other Nova-3-`multi`-covered language
+   (e.g. Spanish or Japanese) **without** switching the language setting. Confirm Dum-E
+   transcribes and replies coherently in each — the STT auto-detects the language (one
+   `nova-3` `multi` STT, no per-language STT reconfiguration). _Covers SPCH-01._
+
+2. **Mandarin (`zh`) Aura-2 → ElevenLabs fallback.** Launch with `DUME_VOICE_LANGUAGE=zh` and
+   hold a short Mandarin turn. Confirm Dum-E **produces audible spoken audio** — silence on
+   `zh` is the Pitfall-3 routing bug (Aura-2 has no Mandarin voice, so `zh` must route to the
+   ElevenLabs fallback). _Covers SPCH-02 / SPCH-03._
+
+3. **>8-minute Nova 2 Sonic speech-to-speech session.** With the speech-to-speech prerequisites
+   above, hold a continuous conversation lasting **more than 8 minutes** so the session crosses
+   Nova 2 Sonic's native ~8-minute context window. Confirm the conversation continues with **no
+   user-perceptible interruption** across the renewal (the native `session_continuation` carries
+   context across the rotation — there is no hand-rolled reconnect). _Covers SPCH-04._
+
+While you are at it, confirm the `es` / `ja` Aura-2 voice tokens sound correct (a wrong token is
+a one-line preset fix — see `LANGUAGE_PRESETS` in `pipecat_server.py`).
+
+If all three scenarios hold, the D-06 speech-model gate is satisfied.
+
 ## 🏗️ Architecture Overview
 
 ### Core Components

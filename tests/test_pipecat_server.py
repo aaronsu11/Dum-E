@@ -416,3 +416,52 @@ class TestPipelineWorkerTracing:
         }
         assert "langfuse.session.id" in keys, "tracing span attrs must carry langfuse.session.id"
         assert "langfuse.tags" in keys, "tracing span attrs must carry langfuse.tags"
+
+
+class TestLangfuseTraceIO:
+    """Catches LANGFUSE-TRACE-IO / LANGFUSE-INGESTION-VERSION: the trace-level
+    input/output patch and the OTEL ingestion-version header (per the official
+    Langfuse Pipecat doc, "Add Trace Input and Output").
+
+    Asserted by AST/source introspection — keyless, no live Langfuse creds or
+    network — consistent with the other wiring tests in this file.
+    """
+
+    def test_patch_function_defined(self):
+        """patch_trace_input_output is defined as a module-level function."""
+        tree = _server_ast()
+        assert any(
+            isinstance(node, ast.FunctionDef)
+            and node.name == "patch_trace_input_output"
+            for node in ast.walk(tree)
+        ), "expected a patch_trace_input_output function definition in pipecat_server.py"
+
+    def test_patch_called_before_setup_tracing(self):
+        """The patch is invoked before setup_tracing(...) in source order.
+
+        Mirrors the wiring-test style; the runtime guarantee is "called before
+        setup_tracing" so the wrapped add_llm_span_attributes is installed before
+        tracing starts emitting spans.
+        """
+        source = _server_source()
+        assert "patch_trace_input_output()" in source, (
+            "patch_trace_input_output() must be called inside the Langfuse block"
+        )
+        assert source.index("patch_trace_input_output()") < source.index(
+            "setup_tracing("
+        ), "patch_trace_input_output() must be called before setup_tracing(...)"
+
+    def test_ingestion_version_header_present(self):
+        """OTEL headers carry x-langfuse-ingestion-version=4 AND keep Basic auth.
+
+        Asserting both proves the append is additive, not a replacement of the
+        existing Authorization=Basic header.
+        """
+        source = _server_source()
+        assert "x-langfuse-ingestion-version=4" in source, (
+            "OTEL_EXPORTER_OTLP_HEADERS must carry x-langfuse-ingestion-version=4"
+        )
+        assert "Authorization=Basic" in source, (
+            "the existing Authorization=Basic header must remain intact "
+            "(the ingestion-version token is appended, not substituted)"
+        )

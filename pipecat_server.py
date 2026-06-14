@@ -190,58 +190,57 @@ class AsyncMCPClient(MCPClient):
         )
         await result_callback(final_response)
 
-    async def _list_tools(
-        self, session: ClientSession, mcp_tool_wrapper: Callable, llm: LLMService
-    ):
-        """Override the _list_tools method to use long_running flag from the tool metadata for setting cancel_on_interruption."""
-        available_tools: ListToolsResult = await session.list_tools()
-        tool_schemas: List[FunctionSchema] = []
+    # Normal (non-long-running) tool timeout. The Pipecat 1.x default for
+    # function_call_timeout_secs flipped to None, so without an explicit bound a
+    # stalled normal tool would hang the voice loop forever (PIPE-04 / D-02).
+    NORMAL_TOOL_TIMEOUT_SECS: float = 30.0
 
+    async def register_tools_schema(self, tools_schema, llm):
+        """Register MCP tools, deriving cancel_on_interruption + timeout_secs from long_running metadata.
+
+        Replaces the dead per-transport list-tools override (which never ran under 0.0.104 or 1.x).
+        The 1.x parent `register_tools_schema(self, tools_schema, llm)` receives a
+        ToolsSchema of FunctionSchema objects that no longer carry the FastMCP `.meta`
+        flag, so we re-list tools from the live session to recover the `long_running`
+        flag, then register each tool with the parent's `self._tool_wrapper`.
+
+        - long_running tools: cancel_on_interruption=False, timeout_secs=None (exempt —
+          legitimate multi-minute robot tasks must not be killed; D-02).
+        - normal tools: cancel_on_interruption=True, timeout_secs=NORMAL_TOOL_TIMEOUT_SECS
+          (true hangs are bounded; PIPE-04).
+        """
+        # Recover the long_running flag per tool name from the live MCP session.
+        long_running_by_name: dict[str, bool] = {}
         try:
-            logger.debug(f"Found {len(available_tools)} available tools")
-        except:
-            pass
+            session = self._ensure_connected()
+            available_tools = await session.list_tools()
+            for tool in available_tools.tools:
+                meta = getattr(tool, "meta", None) or {}
+                long_running_by_name[tool.name] = bool(meta.get("long_running", False))
+        except Exception as e:
+            logger.error(f"Failed to read long_running metadata from MCP session: {str(e)}")
 
-        for tool in available_tools.tools:
-            tool_name = tool.name
-            # If the tool is long running, we don't want to interrupt it on new voice input
-            cancel_on_interruption = (
-                False if tool.meta.get("long_running", False) else True
+        for function_schema in tools_schema.standard_tools:
+            tool_name = function_schema.name
+            is_long_running = long_running_by_name.get(tool_name, False)
+            # If the tool is long running, we don't want to interrupt it on new voice input.
+            cancel_on_interruption = not is_long_running
+            timeout_secs = None if is_long_running else self.NORMAL_TOOL_TIMEOUT_SECS
+            logger.debug(
+                f"Registering function handler for '{tool_name}' with "
+                f"cancel_on_interruption={cancel_on_interruption}, timeout_secs={timeout_secs}"
             )
-            logger.debug(f"Processing tool: {tool_name}")
-            logger.debug(f"Tool description: {tool.description}")
-            logger.debug(f"Tool metadata: {tool.meta}")
-
             try:
-                # Convert the schema
-                function_schema = self._convert_mcp_schema_to_pipecat(
-                    tool_name,
-                    {"description": tool.description, "input_schema": tool.inputSchema},
-                )
-
-                # Register the wrapped function
-                logger.debug(
-                    f"Registering function handler for '{tool_name}' with cancel_on_interruption: {cancel_on_interruption}"
-                )
                 llm.register_function(
                     tool_name,
-                    mcp_tool_wrapper,
+                    self._tool_wrapper,
                     cancel_on_interruption=cancel_on_interruption,
+                    timeout_secs=timeout_secs,
                 )
-
-                # Add to list of schemas
-                tool_schemas.append(function_schema)
-                logger.debug(f"Successfully registered tool '{tool_name}'")
-
             except Exception as e:
                 logger.error(f"Failed to register tool '{tool_name}': {str(e)}")
                 logger.exception("Full exception details:")
                 continue
-
-        logger.debug(f"Completed registration of {len(tool_schemas)} tools")
-        tools_schema = ToolsSchema(standard_tools=tool_schemas)
-
-        return tools_schema
 
 
 system_prompt = """You are a helpful robot assistant speaking out loud to users.
@@ -300,6 +299,7 @@ async def run_jarvis(
                 access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
                 region=os.getenv("AWS_REGION"),
                 voice_id="matthew",  # Voices: matthew, tiffany, amy
+                function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
             )
         else:
             raise NotImplementedError(
@@ -326,6 +326,7 @@ async def run_jarvis(
                     temperature=0.1,
                     max_tokens=500,
                 ),
+                function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
             )
 
             polly_config = language_preset["aws_polly"]
@@ -355,6 +356,7 @@ async def run_jarvis(
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
                 model="claude-haiku-4-5",
                 params=AnthropicLLMService.InputParams(temperature=0.1, max_tokens=500),
+                function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
             )
 
             elevenlabs_config = language_preset["elevenlabs"]

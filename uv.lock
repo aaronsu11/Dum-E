@@ -418,6 +418,20 @@ wheels = [
 ]
 
 [[package]]
+name = "aws-sdk-sagemaker-runtime-http2"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "smithy-aws-core", extra = ["eventstream", "json"] },
+    { name = "smithy-core" },
+    { name = "smithy-http", extra = ["awscrt"] },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/55/52/655ab732fe8c974ab7b8c6f8c695bc0ae00ccdf952f70997b4802f6e8143/aws_sdk_sagemaker_runtime_http2-0.4.0.tar.gz", hash = "sha256:fa644aa80fa881b7491b6d7a57cf75665b4ec1f0310e1dbeb0296bf95fd262ea", size = 26699, upload-time = "2026-02-24T18:55:28.67Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ef/cc/95cc6a61885dcc2cbc34167bed9cfd3183cf0a0a79b0e06388d8f4a78b86/aws_sdk_sagemaker_runtime_http2-0.4.0-py3-none-any.whl", hash = "sha256:be1e3415047058a655f682cb97f2ba7cadd46a30100bb8f2ef1b1c2c8d41204b", size = 21802, upload-time = "2026-02-24T18:55:27.804Z" },
+]
+
+[[package]]
 name = "aws-sdk-signers"
 version = "0.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1097,7 +1111,7 @@ dependencies = [
     { name = "loguru" },
     { name = "matplotlib" },
     { name = "msgpack" },
-    { name = "pipecat-ai", extra = ["anthropic", "aws", "aws-nova-sonic", "deepgram", "elevenlabs", "mcp", "runner", "webrtc"] },
+    { name = "pipecat-ai", extra = ["anthropic", "aws", "aws-nova-sonic", "deepgram", "elevenlabs", "mcp", "runner", "sagemaker", "webrtc"] },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "pyzmq" },
@@ -1124,7 +1138,7 @@ requires-dist = [
     { name = "loguru", specifier = ">=0.7.3" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "msgpack", specifier = ">=1.0" },
-    { name = "pipecat-ai", extras = ["anthropic", "aws", "aws-nova-sonic", "deepgram", "elevenlabs", "silero", "webrtc", "mcp", "runner"], specifier = "==1.3.0" },
+    { name = "pipecat-ai", extras = ["anthropic", "aws", "aws-nova-sonic", "deepgram", "elevenlabs", "silero", "webrtc", "mcp", "runner", "sagemaker"], specifier = "==1.3.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "pyzmq", specifier = ">=27.1.0" },
@@ -3400,6 +3414,9 @@ runner = [
     { name = "pipecat-ai-prebuilt" },
     { name = "python-dotenv" },
     { name = "uvicorn" },
+]
+sagemaker = [
+    { name = "aws-sdk-sagemaker-runtime-http2" },
 ]
 webrtc = [
     { name = "aiortc" },

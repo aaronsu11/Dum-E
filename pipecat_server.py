@@ -243,6 +243,55 @@ class AsyncMCPClient(MCPClient):
                 continue
 
 
+def patch_trace_input_output():
+    """Promote the first LLM input and latest LLM output to the Langfuse TRACE level.
+
+    Per the official Langfuse Pipecat integration doc ("Add Trace Input and Output",
+    https://langfuse.com/integrations/frameworks/pipecat). Without this patch, live
+    traces show ``input:null, output:null`` at the TRACE level — the conversation
+    transcript and LLM responses are only captured on child ``llm`` GENERATION spans.
+
+    This wraps ``pipecat.utils.tracing.service_decorators.add_llm_span_attributes``
+    so that:
+    - On the FIRST call where the ``messages`` kwarg is truthy, it sets the span
+      attribute ``langfuse.trace.input`` to that ``messages`` value.
+    - ``span.set_attribute`` is wrapped so any ``"output"`` key also mirrors to
+      ``langfuse.trace.output`` (last write wins).
+
+    Note: installed Pipecat 1.3.0 passes ``messages`` as a JSON-serialized STRING
+    kwarg (not a list). The patch is value-agnostic and sets whatever the kwarg
+    holds, so no coercion or re-parsing is needed.
+
+    Idempotent / value-agnostic: must be called before ``setup_tracing(...)``.
+    """
+    from pipecat.utils.tracing import service_decorators
+
+    original = service_decorators.add_llm_span_attributes
+    first_call = [True]
+
+    def patched(span, *args, **kwargs):
+        original(span, *args, **kwargs)
+
+        # Mirror any "output" attribute write to the trace-level output.
+        original_set_attribute = span.set_attribute
+
+        def set_attribute(key, value):
+            original_set_attribute(key, value)
+            if key == "output":
+                original_set_attribute("langfuse.trace.output", value)
+
+        span.set_attribute = set_attribute
+
+        # Promote the first truthy messages payload to the trace-level input.
+        if first_call[0]:
+            messages = kwargs.get("messages")
+            if messages:
+                span.set_attribute("langfuse.trace.input", messages)
+                first_call[0] = False
+
+    service_decorators.add_llm_span_attributes = patched
+
+
 system_prompt = """You are a helpful robot assistant speaking out loud to users.
 
 CRITICAL RULES FOR VOICE OUTPUT:
@@ -546,11 +595,15 @@ async def bot(runner_args: RunnerArguments):
             + "/api/public/otel"
         )
         os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = (
-            f"Authorization=Basic {LANGFUSE_AUTH}"
+            f"Authorization=Basic {LANGFUSE_AUTH},x-langfuse-ingestion-version=4"
         )
 
         # Configured automatically from .env
         exporter = OTLPSpanExporter()
+
+        # Promote first LLM input + latest LLM output to the TRACE level, per the
+        # official Langfuse Pipecat doc. Must run before setup_tracing(...).
+        patch_trace_input_output()
 
         setup_tracing(
             service_name="pipecat-demo",

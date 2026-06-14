@@ -71,25 +71,27 @@ class TestLanguageSpecificConfigs:
     """Test language-specific configuration values."""
 
     @pytest.mark.parametrize(
-        "lang,model,el_lang,polly_voice,polly_lang",
+        "lang,model,dg_lang,el_lang,polly_voice,polly_lang",
         [
-            ("en", "nova-3", Language.EN, "Matthew", "en-US"),
-            ("zh", "nova-2", Language.CMN, "Zhiyu", "cmn-CN"),
-            ("ja", "nova-2", Language.JA, "Kazuha", "ja-JP"),
-            ("es", "nova-3", Language.ES, "Sergio", "es-ES"),
+            # Phase 2 (D-01): default-profile STT is Nova-3; en/es/ja carry language="multi"
+            # (Nova-3 multi auto-detect), zh is the explicit non-multi override.
+            ("en", "nova-3", "multi", Language.EN, "Matthew", "en-US"),
+            ("zh", "nova-3", "zh", Language.CMN, "Zhiyu", "cmn-CN"),
+            ("ja", "nova-3", "multi", Language.JA, "Kazuha", "ja-JP"),
+            ("es", "nova-3", "multi", Language.ES, "Sergio", "es-ES"),
         ],
     )
     def test_language_configurations(
-        self, lang, model, el_lang, polly_voice, polly_lang
+        self, lang, model, dg_lang, el_lang, polly_voice, polly_lang
     ):
         """Test each language preset has correct configuration values."""
         from pipecat_server import LANGUAGE_PRESETS
 
         preset = LANGUAGE_PRESETS[lang]
 
-        # Deepgram config
+        # Deepgram config (D-01: multi default + zh override)
         assert preset["deepgram"]["model"] == model
-        assert preset["deepgram"]["language"] == lang
+        assert preset["deepgram"]["language"] == dg_lang
 
         # ElevenLabs config
         assert preset["elevenlabs"]["language"] == el_lang
@@ -159,12 +161,12 @@ class TestLanguageFeatures:
     """Test language-specific features and requirements."""
 
     def test_deepgram_model_selection(self):
-        """Test Deepgram model selection per language."""
+        """Test Deepgram model selection per language (Phase 2 D-01: all Nova-3)."""
         from pipecat_server import LANGUAGE_PRESETS
 
         assert LANGUAGE_PRESETS["en"]["deepgram"]["model"] == "nova-3"
-        assert LANGUAGE_PRESETS["zh"]["deepgram"]["model"] == "nova-2"
-        assert LANGUAGE_PRESETS["ja"]["deepgram"]["model"] == "nova-2"
+        assert LANGUAGE_PRESETS["zh"]["deepgram"]["model"] == "nova-3"
+        assert LANGUAGE_PRESETS["ja"]["deepgram"]["model"] == "nova-3"
         assert LANGUAGE_PRESETS["es"]["deepgram"]["model"] == "nova-3"
 
     def test_all_profiles_supported(self):

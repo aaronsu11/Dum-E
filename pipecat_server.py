@@ -30,7 +30,8 @@ from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.services.aws.stt import AWSTranscribeSTTService
 from pipecat.services.aws.tts import AWSPollyTTSService
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
-from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
+from pipecat.services.aws.nova_sonic.session_continuation import SessionContinuationParams
+from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import LLMService
@@ -51,8 +52,11 @@ LANGUAGE_PRESETS = {
     "en": {
         "deepgram": {
             "model": "nova-3",
-            "language": "en",
+            "language": "multi",  # D-01: Nova-3 multi auto-detect (covers en/es/fr/de/hi/ru/pt/ja/it/nl)
         },
+        # D-02 static TTS routing: en is Aura-2-supported -> Deepgram TTS.
+        "tts_engine": "deepgram",
+        "aura2_voice": "aura-2-thalia-en",
         "aws_transcribe": {
             "language": "en-US",
         },
@@ -69,9 +73,11 @@ LANGUAGE_PRESETS = {
     },
     "zh": {
         "deepgram": {
-            "model": "nova-2",
-            "language": "zh",
+            "model": "nova-3",
+            "language": "zh",  # D-01 override: Mandarin is NOT in Nova-3 `multi`; use explicit zh
         },
+        # D-02/D-03 static TTS routing: Aura-2 does NOT support Mandarin -> ElevenLabs fallback.
+        "tts_engine": "elevenlabs",
         "aws_transcribe": {
             "language": "zh-CN",
         },
@@ -88,9 +94,12 @@ LANGUAGE_PRESETS = {
     },
     "ja": {
         "deepgram": {
-            "model": "nova-2",
-            "language": "ja",
+            "model": "nova-3",
+            "language": "multi",  # D-01: moved off nova-2 — Nova-3 multi now covers Japanese
         },
+        # D-02 static TTS routing: Japanese is Aura-2-supported -> Deepgram TTS.
+        "tts_engine": "deepgram",
+        "aura2_voice": "aura-2-fujin-ja",  # [ASSUMED A1] confirm exact ja Aura-2 token at smoke test
         "aws_transcribe": {
             "language": "ja-JP",
         },
@@ -108,8 +117,11 @@ LANGUAGE_PRESETS = {
     "es": {
         "deepgram": {
             "model": "nova-3",
-            "language": "es",
+            "language": "multi",  # D-01: Nova-3 multi covers Spanish
         },
+        # D-02 static TTS routing: Spanish is Aura-2-supported -> Deepgram TTS.
+        "tts_engine": "deepgram",
+        "aura2_voice": "aura-2-celeste-es",  # [ASSUMED A1] confirm exact es Aura-2 token at smoke test
         "aws_transcribe": {
             "language": "es-ES",
         },
@@ -315,6 +327,7 @@ async def run_jarvis(
     profile: Literal["default", "aws"] = "default",
     voice_updates: bool = True,  # only supported in cascaded mode
     language: str = "en",
+    backend: Literal["hosted", "sagemaker"] = "hosted",
 ):
     """
     Run JARVIS voice agent with the given transport, runner arguments, mode, and profile.
@@ -325,6 +338,9 @@ async def run_jarvis(
         mode: The mode to use for the bot. Voice status update is only supported in cascaded mode.
         profile: The profile to use for the bot
         language: Language code for voice interface (en, zh, ja, es)
+        backend: Deepgram backend for the default profile (D-05). "hosted" (default) uses the
+            hosted Deepgram STT/TTS; "sagemaker" uses the Deepgram-on-SageMaker services
+            (wired but NOT deployed this milestone — raises ValueError if no endpoint is set).
     """
 
     logger.info(f"Starting bot")
@@ -346,9 +362,12 @@ async def run_jarvis(
             llm = AWSNovaSonicLLMService(
                 secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
                 access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-                region=os.getenv("AWS_REGION"),
+                region=os.getenv("AWS_REGION"),  # SPCH-04: must be us-east-1 / us-west-2 / ap-northeast-1 for Nova-2 Sonic
+                model="amazon.nova-2-sonic-v1:0",  # SPCH-04 / D-04: Nova 2 Sonic (the default; explicit for testability)
                 voice_id="matthew",  # Voices: matthew, tiffany, amy
                 function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
+                # D-04: native ~8-min context-carrying session rotation (no hand-rolled reconnect).
+                session_continuation=SessionContinuationParams(),
             )
         else:
             raise NotImplementedError(
@@ -393,33 +412,75 @@ async def run_jarvis(
             )
         else:
             deepgram_config = language_preset["deepgram"]
-            stt = DeepgramSTTService(
-                api_key=os.getenv("DEEPGRAM_API_KEY"),
-                live_options=LiveOptions(
-                    model=deepgram_config["model"],
-                    language=deepgram_config["language"],
-                ),
-            )
+
+            if backend == "sagemaker":
+                # D-05 / SPCH-05: Deepgram-on-SageMaker is WIRED but NOT deployed this milestone.
+                # Require explicit endpoint env vars and raise (never silently fall back to hosted).
+                stt_endpoint = os.getenv("SAGEMAKER_STT_ENDPOINT_NAME")
+                if not stt_endpoint:
+                    raise ValueError(
+                        "DUME_DEEPGRAM_BACKEND=sagemaker requires SAGEMAKER_STT_ENDPOINT_NAME; "
+                        "the SageMaker endpoint is wired but NOT deployed this milestone"
+                    )
+                tts_endpoint = os.getenv("SAGEMAKER_TTS_ENDPOINT_NAME")
+                if not tts_endpoint:
+                    raise ValueError(
+                        "DUME_DEEPGRAM_BACKEND=sagemaker requires SAGEMAKER_TTS_ENDPOINT_NAME; "
+                        "the SageMaker endpoint is wired but NOT deployed this milestone"
+                    )
+                # Pitfall 1: lazy-import inside the branch so the default hosted path never
+                # triggers the aws_sdk_sagemaker_runtime_http2 import.
+                from pipecat.services.deepgram.sagemaker.stt import DeepgramSageMakerSTTService
+                from pipecat.services.deepgram.sagemaker.tts import DeepgramSageMakerTTSService
+
+                stt = DeepgramSageMakerSTTService(
+                    endpoint_name=stt_endpoint,
+                    region=os.getenv("AWS_REGION"),
+                    settings=DeepgramSageMakerSTTService.Settings(
+                        model=deepgram_config["model"],
+                        language=deepgram_config["language"],
+                    ),
+                )
+                tts = DeepgramSageMakerTTSService(
+                    endpoint_name=tts_endpoint,
+                    region=os.getenv("AWS_REGION"),
+                    settings=DeepgramSageMakerTTSService.Settings(
+                        voice=language_preset.get("aura2_voice", "aura-2-thalia-en"),
+                    ),
+                )
+            else:
+                # backend == "hosted" (default): hosted Deepgram STT (Nova-3 multi, D-01).
+                stt = DeepgramSTTService(
+                    api_key=os.getenv("DEEPGRAM_API_KEY"),
+                    settings=DeepgramSTTSettings(
+                        model=deepgram_config["model"],       # "nova-3"
+                        language=deepgram_config["language"],  # "multi" default; "zh" override
+                    ),
+                )
+
+                # D-02/D-03 static per-language TTS routing: Aura-2 for supported languages,
+                # ElevenLabs fallback for the rest (Mandarin — Aura-2 has no zh voice).
+                if language_preset.get("tts_engine") == "elevenlabs":
+                    elevenlabs_config = language_preset["elevenlabs"]
+                    tts = ElevenLabsTTSService(
+                        api_key=os.getenv("ELEVENLABS_API_KEY"),
+                        voice_id=elevenlabs_config["voice_id"],
+                        sample_rate=24000,
+                        params=ElevenLabsTTSService.InputParams(
+                            language=elevenlabs_config["language"]
+                        ),
+                    )
+                else:
+                    tts = DeepgramTTSService(
+                        api_key=os.getenv("DEEPGRAM_API_KEY"),
+                        voice=language_preset.get("aura2_voice", "aura-2-thalia-en"),
+                    )
 
             llm = AnthropicLLMService(
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
                 model="claude-haiku-4-5",
                 params=AnthropicLLMService.InputParams(temperature=0.1, max_tokens=500),
                 function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
-            )
-
-            elevenlabs_config = language_preset["elevenlabs"]
-            # tts = ElevenLabsTTSService(
-            #     api_key=os.getenv("ELEVENLABS_API_KEY"),
-            #     voice_id=elevenlabs_config["voice_id"],
-            #     sample_rate=24000,
-            #     params=ElevenLabsTTSService.InputParams(
-            #         language=elevenlabs_config["language"]
-            #     ),
-            # )
-            tts = DeepgramTTSService(
-                api_key=os.getenv("DEEPGRAM_API_KEY"),
-                voice="aura-2-hermes-en"
             )
 
     # Use enhanced MCPClient to avoid interrupting long-running tools and enable voice updates on progress.
@@ -570,6 +631,7 @@ async def bot(runner_args: RunnerArguments):
     language = os.getenv("DUME_VOICE_LANGUAGE", "en")
     mode = os.getenv("DUME_VOICE_MODE", "cascaded")
     profile = os.getenv("DUME_VOICE_PROFILE", "default")
+    backend = os.getenv("DUME_DEEPGRAM_BACKEND", "hosted")
 
     # Validate mode
     if mode not in ["cascaded", "speech_to_speech"]:
@@ -580,6 +642,13 @@ async def bot(runner_args: RunnerArguments):
     if profile not in ["default", "aws"]:
         logger.warning(f"Invalid profile '{profile}', falling back to 'default'")
         profile = "default"
+
+    # Validate Deepgram backend selector (D-05). An UNKNOWN value warns + falls back to
+    # hosted; the explicit "sagemaker" value (with no endpoint) is guarded downstream by a
+    # ValueError in run_jarvis — never a silent fallback.
+    if backend not in ["hosted", "sagemaker"]:
+        logger.warning(f"Invalid backend '{backend}', falling back to 'hosted'")
+        backend = "hosted"
 
     # Configure Langfuse for OpenTelemetry tracing
     # See https://langfuse.com/integrations/frameworks/pipecat for more information
@@ -611,7 +680,7 @@ async def bot(runner_args: RunnerArguments):
         )
 
     await run_jarvis(
-        transport, runner_args, mode=mode, profile=profile, language=language
+        transport, runner_args, mode=mode, profile=profile, language=language, backend=backend
     )
 
 

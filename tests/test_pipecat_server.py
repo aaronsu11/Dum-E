@@ -677,6 +677,31 @@ class TestSageMakerBackendSelector:
             "(the guarded missing-endpoint case)"
         )
 
+    def test_sagemaker_branch_honors_elevenlabs_routing(self):
+        """CR-01 regression: the sagemaker TTS branch must honor the same
+        per-language `tts_engine == "elevenlabs"` routing as the hosted path.
+        Aura-2 (Deepgram TTS, hosted or SageMaker) has no Mandarin voice, so a
+        `zh` request under the sagemaker backend must route to ElevenLabs — NOT
+        fall back to an English aura2_voice. Assert structurally that BOTH the
+        hosted and sagemaker branches gate on tts_engine == "elevenlabs" (two
+        occurrences), proving the SageMaker branch is no longer
+        unconditionally Aura-2."""
+        from pipecat_server import LANGUAGE_PRESETS
+
+        source = _server_source()
+        routing_checks = source.count('tts_engine") == "elevenlabs"')
+        assert routing_checks >= 2, (
+            "both the hosted AND sagemaker TTS branches must gate on "
+            'tts_engine == "elevenlabs" so zh routes to ElevenLabs in either '
+            f"backend (CR-01); found {routing_checks} routing check(s)"
+        )
+        # The zh preset remains the load-bearing case: elevenlabs engine, no aura2_voice.
+        assert LANGUAGE_PRESETS["zh"]["tts_engine"] == "elevenlabs"
+        assert "aura2_voice" not in LANGUAGE_PRESETS["zh"], (
+            "zh must NOT carry an aura2_voice — its presence would let the "
+            "Aura-2 fallback synthesize Mandarin with an English voice (CR-01)"
+        )
+
     @pytest.mark.asyncio
     async def test_run_jarvis_sagemaker_without_endpoint_raises(self):
         """Pattern D (behavioural): drive run_jarvis with the sagemaker backend

@@ -441,13 +441,29 @@ async def run_jarvis(
                         language=deepgram_config["language"],
                     ),
                 )
-                tts = DeepgramSageMakerTTSService(
-                    endpoint_name=tts_endpoint,
-                    region=os.getenv("AWS_REGION"),
-                    settings=DeepgramSageMakerTTSService.Settings(
-                        voice=language_preset.get("aura2_voice", "aura-2-thalia-en"),
-                    ),
-                )
+                # CR-01: honor the same per-language tts_engine routing as the hosted path.
+                # Aura-2 (Deepgram TTS, hosted or SageMaker) has no Mandarin voice, so zh must
+                # still route to ElevenLabs — otherwise the aura2_voice fallback would synthesize
+                # Mandarin with an English voice. ElevenLabs is a hosted service independent of
+                # the STT backend, so it is valid inside the SageMaker branch too.
+                if language_preset.get("tts_engine") == "elevenlabs":
+                    elevenlabs_config = language_preset["elevenlabs"]
+                    tts = ElevenLabsTTSService(
+                        api_key=os.getenv("ELEVENLABS_API_KEY"),
+                        voice_id=elevenlabs_config["voice_id"],
+                        sample_rate=24000,
+                        params=ElevenLabsTTSService.InputParams(
+                            language=elevenlabs_config["language"]
+                        ),
+                    )
+                else:
+                    tts = DeepgramSageMakerTTSService(
+                        endpoint_name=tts_endpoint,
+                        region=os.getenv("AWS_REGION"),
+                        settings=DeepgramSageMakerTTSService.Settings(
+                            voice=language_preset.get("aura2_voice", "aura-2-thalia-en"),
+                        ),
+                    )
             else:
                 # backend == "hosted" (default): hosted Deepgram STT (Nova-3 multi, D-01).
                 stt = DeepgramSTTService(

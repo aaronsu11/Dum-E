@@ -18,8 +18,9 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame, TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat.pipeline.task import PipelineParams
+from pipecat.workers.runner import WorkerRunner
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.runner.types import RunnerArguments
@@ -370,138 +371,143 @@ async def run_jarvis(
                 voice="aura-2-hermes-en"
             )
 
-    # Use enhanced MCPClient to avoid interrupting long-running tools and enable voice updates on progress
-    mcp = AsyncMCPClient(
+    # Use enhanced MCPClient to avoid interrupting long-running tools and enable voice updates on progress.
+    # Under Pipecat 1.x the MCP session must be started (async with / start()) before register_tools,
+    # otherwise _ensure_connected() raises RuntimeError. Everything that depends on the live session
+    # (tool registration, pipeline build, worker run) happens inside this session block.
+    async with AsyncMCPClient(
         server_params=StreamableHttpParameters(url="http://localhost:8000/mcp")
-    )
+    ) as mcp:
+        # This registers the tools with the LLM using register_tools_schema which sets the
+        # cancel_on_interruption flag and per-tool timeout based on the long_running metadata
+        # defined in the FastMCP server.
+        tools = await mcp.register_tools(llm)
 
-    # This registers the tools with the LLM using _list_tools which sets the cancel_on_interruption flag
-    # based on the tool metadata defined in FastMCP server
-    tools = await mcp.register_tools(llm)
+        # @llm.event_handler("on_function_calls_started")
+        # async def on_function_calls_started(service, function_calls):
+        #     await tts.queue_frame(TTSSpeakFrame("Let me check on that."))
 
-    # @llm.event_handler("on_function_calls_started")
-    # async def on_function_calls_started(service, function_calls):
-    #     await tts.queue_frame(TTSSpeakFrame("Let me check on that."))
-
-    if profile == "aws":
-        # For Nova Sonic speech-to-speech, append the special trigger instruction so the
-        # assistant will start speaking when it hears the synthetic "ready" trigger.
-        if mode == "speech_to_speech":
-            context = LLMContext(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": [
-                            {
-                                "text": "\n".join(
-                                    [
-                                        system_prompt,
-                                        AWSNovaSonicLLMService.AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION,
-                                        "Greet the user by saying 'Hello there!'",
-                                    ]
-                                )
-                            }
-                        ],
-                    }
-                ],
-                tools=tools,
-            )
+        if profile == "aws":
+            # For Nova Sonic speech-to-speech, append the special trigger instruction so the
+            # assistant will start speaking when it hears the synthetic "ready" trigger.
+            if mode == "speech_to_speech":
+                context = LLMContext(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": [
+                                {
+                                    "text": "\n".join(
+                                        [
+                                            system_prompt,
+                                            AWSNovaSonicLLMService.AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION,
+                                            "Greet the user by saying 'Hello there!'",
+                                        ]
+                                    )
+                                }
+                            ],
+                        }
+                    ],
+                    tools=tools,
+                )
+            else:
+                context = LLMContext(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": [{"text": system_prompt}],
+                        }
+                    ],
+                    tools=tools,
+                )
         else:
             context = LLMContext(
                 messages=[
                     {
                         "role": "system",
-                        "content": [{"text": system_prompt}],
-                    }
+                        "content": system_prompt,
+                    },
                 ],
                 tools=tools,
             )
-    else:
-        context = LLMContext(
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-            ],
-            tools=tools,
+
+        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(
+                vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8))
+            ),
         )
 
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8))
-        ),
-    )
+        if mode == "cascaded":
+            pipeline = Pipeline(
+                [
+                    transport.input(),  # Transport user input
+                    stt,  # Speech-to-text
+                    user_aggregator,  # User responses
+                    llm,  # LLM
+                    tts,  # Text-to-speech
+                    transport.output(),  # Transport bot output
+                    assistant_aggregator,  # Assistant spoken responses
+                ]
+            )
+        elif mode == "speech_to_speech":
+            pipeline = Pipeline(
+                [
+                    transport.input(),
+                    user_aggregator,
+                    llm,
+                    transport.output(),
+                    assistant_aggregator,
+                ]
+            )
 
-    if mode == "cascaded":
-        pipeline = Pipeline(
-            [
-                transport.input(),  # Transport user input
-                stt,  # Speech-to-text
-                user_aggregator,  # User responses
-                llm,  # LLM
-                tts,  # Text-to-speech
-                transport.output(),  # Transport bot output
-                assistant_aggregator,  # Assistant spoken responses
-            ]
+        worker = PipelineWorker(
+            pipeline,
+            params=PipelineParams(
+                enable_metrics=True,
+                enable_usage_metrics=True,
+            ),
+            enable_tracing=True,  # Enables both turn and conversation tracing
+            additional_span_attributes={
+                "langfuse.session.id": time.strftime("%Y-%m-%d"),
+                "langfuse.tags": ["pipecat-server"],
+            },
         )
-    elif mode == "speech_to_speech":
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                user_aggregator,
-                llm,
-                transport.output(),
-                assistant_aggregator,
-            ]
-        )
 
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-        enable_tracing=True,  # Enables both turn and conversation tracing
-        additional_span_attributes={
-            "langfuse.session.id": time.strftime("%Y-%m-%d"),
-            "langfuse.tags": ["pipecat-server"],
-        },
-    )
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info(f"Client connected")
+            # Kick off the conversation.
+            if mode == "speech_to_speech" and profile == "aws":
+                # For Nova Sonic (speech-to-speech), trigger the assistant to speak using the synthetic "ready" audio,
+                # so the model responds without having to wait for real user audio.
+                await worker.queue_frames([LLMRunFrame()])
+                await llm.trigger_assistant_response()
+            else:
+                # Use language-specific greeting
+                greeting = language_preset["greeting"]
+                await worker.queue_frames([TTSSpeakFrame(greeting)])
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info(f"Client connected")
-        # Kick off the conversation.
-        if mode == "speech_to_speech" and profile == "aws":
-            # For Nova Sonic (speech-to-speech), trigger the assistant to speak using the synthetic "ready" audio,
-            # so the model responds without having to wait for real user audio.
-            await task.queue_frames([LLMRunFrame()])
-            await llm.trigger_assistant_response()
-        else:
-            # Use language-specific greeting
-            greeting = language_preset["greeting"]
-            await task.queue_frames([TTSSpeakFrame(greeting)])
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"Client disconnected")
+            await worker.cancel()
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected")
-        await task.cancel()
+        async def progress_handler(
+            progress: float, total: float | None, message: str | None
+        ) -> None:
+            """Handle voice updates on MCP progress notifications."""
+            if voice_updates and mode == "cascaded" and message:
+                await worker.queue_frame(TTSSpeakFrame(message))
 
-    async def progress_handler(
-        progress: float, total: float | None, message: str | None
-    ) -> None:
-        """Handle voice updates on MCP progress notifications."""
-        if voice_updates and mode == "cascaded" and message:
-            await task.queue_frame(TTSSpeakFrame(message))
+        # Set the progress callback with reference to the worker for centralized queueing
+        mcp.set_progress_callback(progress_handler)
 
-    # Set the progress callback with reference to the task for centralized queueing
-    mcp.set_progress_callback(progress_handler)
+        runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
 
-    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
-
-    await runner.run(task)
+        # Run the worker inside the live MCP session so the session stays open for the
+        # whole conversation (tool calls reuse the persistent session).
+        await runner.run(worker)
 
 
 async def bot(runner_args: RunnerArguments):

@@ -220,6 +220,52 @@ Choose the setup that best matches your needs and hardware availability. The fol
     > python dum_e.py --node servers --config my-dum-e.yaml
     > ```
 
+## ✅ Voice Pipeline Smoke Test (manual acceptance gate)
+
+> [!NOTE]
+> This is the **PIPE-06 manual acceptance gate** for the Pipecat 1.x voice pipeline.
+> It is a deliberate, human-run browser walkthrough — an automated WebRTC /
+> recorded-audio verification harness is **deferred** to a later pass, so this manual
+> check is the documented sign-off for the migrated pipeline.
+
+After upgrading the voice stack (Pipecat 1.3.0 on the `pipecat-ai-prebuilt` runner),
+verify the full speech loop end-to-end in a real browser:
+
+1. **Set the required keys** in your `.env` file (the same ones used before the upgrade):
+   - `DEEPGRAM_API_KEY` — Deepgram STT/TTS
+   - `ANTHROPIC_API_KEY` — Anthropic Claude LLM
+   - `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` — Langfuse tracing
+     (optionally `LANGFUSE_HOST`)
+
+   Make sure the MCP server is reachable at `http://localhost:8000/mcp` and the robot/agent
+   stack is running as normal (the default `python dum_e.py --config my-dum-e.yaml` stack
+   starts all of these).
+
+2. **Launch the voice interface** (the standard launch command from step 8 above):
+   ```bash
+   python dum_e.py --config my-dum-e.yaml
+   ```
+   The prebuilt runner serves the UI on `http://localhost:7860` (the `POST /start` RTVI
+   endpoint backs the prebuilt client; `GET /` redirects to the client UI).
+
+3. **Open `http://localhost:7860`** in a real browser and allow microphone access to connect
+   on `/start`.
+
+4. **Hold a short spoken conversation** and confirm:
+   - Dum-E greets and replies with coherent spoken audio (STT → LLM → TTS works end-to-end).
+   - You issue at least **one** instruction that triggers a **robot MCP tool call** (e.g.
+     ask Dum-E to perform a robot action), and the tool runs. A long-running robot task is
+     **not** interrupted if you speak mid-task, and a normal/stalled tool does not hang the
+     conversation forever.
+
+5. **Open the Langfuse dashboard** and confirm traces appear for the session
+   (session id = today's date, tagged `pipecat-server`).
+
+6. **Watch the server stderr** — there should be **no** `DeprecationWarning` about
+   `PipelineTask`/`PipelineRunner` and **no** `RuntimeError` about an unstarted MCP session.
+
+If all of the above hold, the PIPE-06 gate is satisfied.
+
 ## 🏗️ Architecture Overview
 
 ### Core Components

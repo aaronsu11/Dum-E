@@ -239,6 +239,52 @@ class TestSpawnPipecatServer:
         assert env["DUME_VOICE_PROFILE"] == "default"  # default
 
     @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_shell_env_overrides_config(self, mock_popen):
+        """UAT gap (test 2): an inherited DUME_VOICE_* shell env var must win over
+        the my-dum-e.yaml config default. The README D-06 smoke-test gate tells
+        operators to run `DUME_VOICE_LANGUAGE=zh python dum_e.py ...`; the launcher
+        previously overwrote that with the yaml default ('en'), so the zh preset was
+        never selected. Env-wins precedence is required for all three voice vars."""
+        config = BackendConfig(namespace="test")
+        # Config file says en/cascaded/default; operator exports overrides in the shell.
+        voice_config = {"language": "en", "mode": "cascaded", "profile": "default"}
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DUME_VOICE_LANGUAGE": "zh",
+                "DUME_VOICE_MODE": "speech_to_speech",
+                "DUME_VOICE_PROFILE": "aws",
+            },
+        ):
+            dum_e._spawn_pipecat_server(config, voice_config)
+
+        call_args = mock_popen.call_args
+        env = call_args[1]["env"]
+
+        # Inherited shell values win over the config defaults.
+        assert env["DUME_VOICE_LANGUAGE"] == "zh"
+        assert env["DUME_VOICE_MODE"] == "speech_to_speech"
+        assert env["DUME_VOICE_PROFILE"] == "aws"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_pipecat_server_config_applies_without_shell_env(self, mock_popen):
+        """Complement to the precedence test: when NO DUME_VOICE_* var is exported,
+        the config file value is applied (the common single-stack case)."""
+        config = BackendConfig(namespace="test")
+        voice_config = {"language": "zh", "mode": "cascaded", "profile": "default"}
+
+        # clear=True guarantees no inherited DUME_VOICE_* leaks in from the runner env.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_pipecat_server(config, voice_config)
+
+        call_args = mock_popen.call_args
+        env = call_args[1]["env"]
+        assert env["DUME_VOICE_LANGUAGE"] == "zh"
+        assert env["DUME_VOICE_MODE"] == "cascaded"
+        assert env["DUME_VOICE_PROFILE"] == "default"
+
+    @mock.patch("subprocess.Popen")
     def test_spawn_pipecat_server_no_voice_config(self, mock_popen):
         """Test Pipecat server spawning without voice configuration."""
         config = BackendConfig(namespace="test")

@@ -76,7 +76,10 @@ class TestLanguageSpecificConfigs:
             # Phase 2 (D-01): default-profile STT is Nova-3; en/es/ja carry language="multi"
             # (Nova-3 multi auto-detect), zh is the explicit non-multi override.
             ("en", "nova-3", "multi", Language.EN, "Matthew", "en-US"),
-            ("zh", "nova-3", "zh", Language.CMN, "Zhiyu", "cmn-CN"),
+            # zh ElevenLabs language is ZH (-> "zh"), NOT CMN (-> "cmn", which
+            # eleven_turbo_v2_5 rejects with a 1008 policy violation). STT/Polly
+            # keep their own zh-CN/cmn-CN codes — only the ElevenLabs TTS code differs.
+            ("zh", "nova-3", "zh", Language.ZH, "Zhiyu", "cmn-CN"),
             ("ja", "nova-3", "multi", Language.JA, "Kazuha", "ja-JP"),
             ("es", "nova-3", "multi", Language.ES, "Sergio", "es-ES"),
         ],
@@ -556,6 +559,25 @@ class TestPerLanguageTTSRouting:
         assert LANGUAGE_PRESETS["zh"]["tts_engine"] == "elevenlabs", (
             "Mandarin must fall back to ElevenLabs (Aura-2 has no zh voice) — "
             "Pitfall 3: a wrong route here produces silence on zh"
+        )
+
+    def test_zh_elevenlabs_language_is_eleven_supported(self):
+        """UAT regression (test 2): the zh ElevenLabs language must resolve to a
+        code eleven_turbo_v2_5 accepts. Language.CMN resolves to 'cmn', which the
+        model rejects with a 1008 policy violation (connection fails 3x -> no audio).
+        Language.ZH resolves to 'zh', which is accepted. Assert the preset uses ZH
+        (not CMN) so the runtime fallback actually produces audio."""
+        from pipecat_server import LANGUAGE_PRESETS
+        from pipecat.transcriptions.language import Language
+
+        el_lang = LANGUAGE_PRESETS["zh"]["elevenlabs"]["language"]
+        assert el_lang == Language.ZH, (
+            "zh ElevenLabs language must be Language.ZH (-> 'zh'); Language.CMN "
+            "(-> 'cmn') is rejected by eleven_turbo_v2_5 with a 1008 policy violation"
+        )
+        assert el_lang != Language.CMN, (
+            "Language.CMN regresses the zh fallback to a 1008 'does not support "
+            "language_code cmn' failure — no audible Mandarin audio"
         )
 
     def test_elevenlabs_tts_service_is_live_code(self):

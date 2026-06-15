@@ -83,7 +83,11 @@ LANGUAGE_PRESETS = {
         },
         "elevenlabs": {
             "voice_id": "hkfHEbBvdQFNX4uWHqRF",  # Mandarin voice
-            "language": Language.CMN,
+            # ElevenLabs maps Language.ZH -> "zh" (the code eleven_turbo_v2_5 accepts);
+            # Language.CMN falls through to the raw "cmn" base code, which the model
+            # rejects with a 1008 policy-violation (no audio). Use ZH for ElevenLabs TTS.
+            # (STT/Polly keep their own cmn-CN/zh-CN codes above.)
+            "language": Language.ZH,
         },
         "aws_polly": {
             "voice_id": "Zhiyu",

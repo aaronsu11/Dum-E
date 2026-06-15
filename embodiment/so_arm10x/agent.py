@@ -125,11 +125,17 @@ def create_robot_tools(
         }
 
     @tool
-    def assess_situation() -> dict:
+    async def assess_situation() -> dict:
         """Assess the situation of the current state"""
-        images = robot_controller.get_current_images()
-        front_image_bytes = image_to_jpeg_bytes(images["front"], verbose=False)
-        wrist_image_bytes = image_to_jpeg_bytes(images["wrist"], verbose=False)
+        # Offload blocking camera read + JPEG encodes so the event loop stays
+        # responsive (GR-04 / T-03-04), matching the other robot @tool adapters.
+        images = await asyncio.to_thread(robot_controller.get_current_images)
+        front_image_bytes = await asyncio.to_thread(
+            image_to_jpeg_bytes, images["front"], verbose=False
+        )
+        wrist_image_bytes = await asyncio.to_thread(
+            image_to_jpeg_bytes, images["wrist"], verbose=False
+        )
 
         return {
             "status": "success",
@@ -370,8 +376,9 @@ Note: Colors in images may appear different due to reflections.""",
 
                 result = agent(instruction)
 
-                # Reset to initial pose after completion
-                self.robot_controller.move_to_initial_pose()
+                # Reset to initial pose after completion — offload the blocking
+                # move (it sleeps internally) so the event loop stays free (CR-02).
+                await asyncio.to_thread(self.robot_controller.move_to_initial_pose)
 
             if self.task_manager is not None and task_id is not None:
                 await self.task_manager.update_task(task_id, TaskStatus.COMPLETED)
@@ -513,10 +520,11 @@ Note: Colors in images may appear different due to reflections.""",
                             )
                         # don't yield the result, same data is already yielded in the assistant_message event
 
-                # Reset to initial pose after completion
+                # Reset to initial pose after completion — offload the blocking
+                # move and use async sleep so the event loop stays responsive (CR-02).
                 try:
-                    self.robot_controller.move_to_initial_pose()
-                    time.sleep(1.0)
+                    await asyncio.to_thread(self.robot_controller.move_to_initial_pose)
+                    await asyncio.sleep(1.0)
                 except Exception as pose_error:
                     # Log the error but don't fail the task - it already completed successfully
                     logger.warning(

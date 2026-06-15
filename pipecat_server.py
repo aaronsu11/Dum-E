@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import time
 from dotenv import load_dotenv
@@ -166,6 +167,38 @@ transport_params = {
 }
 
 
+def _as_tool_result_object(response: str):
+    """Coerce a tool's concatenated text response into a JSON-object result.
+
+    SPCH-04: function-call results flow through two serialization layers — the
+    universal aggregator does ``json.dumps(frame.result)`` and stores the string,
+    then Nova Sonic forwards it verbatim. Nova Sonic's Bedrock side REJECTS a
+    tool result whose top-level JSON is not an object:
+    "Unsupported JSON type in Tool Result. Please provide the Tool Result as a JSON
+    object." Returning a bare string therefore double-encodes to a JSON *string
+    literal* and fails. Returning a dict makes the aggregator emit a JSON *object*,
+    which Nova Sonic accepts and the cascaded Bedrock/Anthropic adapters handle
+    identically (Bedrock already json.loads object-looking content; Anthropic
+    re-dumps the dict to the same text).
+
+    - Empty response -> a benign object (never the old "could not call" sentinel,
+      which some tools legitimately return empty for).
+    - Response that is already a JSON object -> that object (pass-through).
+    - Any other text (incl. JSON arrays/scalars) -> wrapped as {"result": <text>}.
+    """
+    if not response:
+        return {"result": "Sorry, could not call the mcp tool"}
+    try:
+        parsed = json.loads(response)
+    except (json.JSONDecodeError, ValueError):
+        return {"result": response}
+    if isinstance(parsed, dict):
+        return parsed
+    # JSON arrays / scalars are valid JSON but not objects — wrap them so the
+    # top-level tool result is always an object.
+    return {"result": parsed}
+
+
 class AsyncMCPClient(MCPClient):
     """Override pipecat's MCPClient to work better with asynchronous/long-running tasks."""
 
@@ -192,7 +225,7 @@ class AsyncMCPClient(MCPClient):
         except Exception as e:
             error_msg = f"Error calling mcp tool {function_name}: {str(e)}"
             logger.error(error_msg)
-            await result_callback(error_msg)
+            await result_callback({"error": error_msg})
             return
 
         response = ""
@@ -210,10 +243,7 @@ class AsyncMCPClient(MCPClient):
             else:
                 logger.error(f"Error getting content from {function_name} results.")
 
-        final_response = (
-            response if len(response) else "Sorry, could not call the mcp tool"
-        )
-        await result_callback(final_response)
+        await result_callback(_as_tool_result_object(response))
 
     # Normal (non-long-running) tool timeout. The Pipecat 1.x default for
     # function_call_timeout_secs flipped to None, so without an explicit bound a

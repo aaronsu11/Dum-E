@@ -885,6 +885,127 @@ class TestNovaSonicToolSchemaSanitization:
         assert called, "sanitize_tools_for_nova_sonic must be invoked, not just defined"
 
 
+class TestNovaSonicToolResultObject:
+    """SPCH-04: function-call results pass through two serialization layers — the
+    universal aggregator json.dumps(frame.result) then Nova Sonic forwards it. Nova
+    Sonic's Bedrock side REJECTS a tool result whose top-level JSON is not an object
+    ("Unsupported JSON type in Tool Result. Please provide the Tool Result as a JSON
+    object"). The MCP tool wrapper must therefore hand the result_callback a dict so
+    the top-level JSON the model sees is always an object. Behavioural unit tests on
+    the coercion helper + the two-layer round-trip.
+    """
+
+    def _server_module(self):
+        import importlib
+
+        return importlib.import_module("pipecat_server")
+
+    def test_object_response_passthrough(self):
+        ps = self._server_module()
+        resp = '{"robots": [{"robot_id": "arm1"}]}'
+        result = ps._as_tool_result_object(resp)
+        assert isinstance(result, dict)
+        assert result == {"robots": [{"robot_id": "arm1"}]}
+
+    def test_plain_text_wrapped_as_object(self):
+        ps = self._server_module()
+        result = ps._as_tool_result_object("There are 2 robots online.")
+        assert isinstance(result, dict)
+        assert result == {"result": "There are 2 robots online."}
+
+    def test_empty_response_is_object(self):
+        ps = self._server_module()
+        result = ps._as_tool_result_object("")
+        assert isinstance(result, dict)
+        assert "result" in result
+
+    def test_json_array_wrapped_as_object(self):
+        """A JSON array is valid JSON but NOT an object — it must be wrapped so the
+        top-level result stays an object."""
+        ps = self._server_module()
+        result = ps._as_tool_result_object("[1, 2, 3]")
+        assert isinstance(result, dict)
+        assert result == {"result": [1, 2, 3]}
+
+    def test_two_layer_serialization_yields_top_level_object(self):
+        """Mirror the live failure: aggregator does json.dumps(frame.result), then
+        Nova Sonic forwards the string verbatim. Whatever the tool returns, the JSON
+        AWS parses at the top level MUST be an object (dict), never a string literal
+        or array — which is what caused 'Unsupported JSON type in Tool Result'."""
+        import json
+
+        ps = self._server_module()
+        for raw in (
+            '{"robots": [{"robot_id": "arm1"}]}',  # object
+            "There are 2 robots online.",  # plain text
+            "",  # empty
+            "[1, 2, 3]",  # array
+            "42",  # scalar
+        ):
+            obj = ps._as_tool_result_object(raw)
+            aggregated = json.dumps(obj, ensure_ascii=False)  # aggregator layer
+            top = json.loads(aggregated)  # what AWS parses
+            assert isinstance(top, dict), (
+                f"tool result for {raw!r} must serialize to a top-level JSON object, "
+                f"got {type(top).__name__}"
+            )
+
+    def test_call_tool_delivers_dict_to_callback(self):
+        """End-to-end on the wrapper: _call_tool feeds result_callback a dict for a
+        successful MCP call (so Nova Sonic gets a JSON object), not a bare string."""
+        import asyncio
+
+        ps = self._server_module()
+
+        class _Content:
+            def __init__(self, text):
+                self.text = text
+
+        class _Results:
+            content = [_Content('{"robots": []}')]
+
+        class _Session:
+            async def call_tool(self, name, arguments, progress_callback=None):
+                return _Results()
+
+        client = ps.AsyncMCPClient.__new__(ps.AsyncMCPClient)
+        client.progress_callback = None
+
+        delivered = {}
+
+        async def _cb(result):
+            delivered["value"] = result
+
+        asyncio.run(
+            client._call_tool(_Session(), "list_robots", {}, _cb)
+        )
+        assert isinstance(delivered["value"], dict)
+        assert delivered["value"] == {"robots": []}
+
+    def test_call_tool_error_delivers_dict(self):
+        """On MCP failure the wrapper still delivers a dict (object), not a bare
+        error string, so Nova Sonic's validator accepts it."""
+        import asyncio
+
+        ps = self._server_module()
+
+        class _Session:
+            async def call_tool(self, name, arguments, progress_callback=None):
+                raise RuntimeError("boom")
+
+        client = ps.AsyncMCPClient.__new__(ps.AsyncMCPClient)
+        client.progress_callback = None
+
+        delivered = {}
+
+        async def _cb(result):
+            delivered["value"] = result
+
+        asyncio.run(client._call_tool(_Session(), "list_robots", {}, _cb))
+        assert isinstance(delivered["value"], dict)
+        assert "error" in delivered["value"]
+
+
 class TestSageMakerBackendSelector:
     """SPCH-05 / D-05: the DUME_DEEPGRAM_BACKEND=sagemaker path is WIRED but the
     endpoint is NOT deployed this milestone — it raises ValueError on a missing

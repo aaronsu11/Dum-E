@@ -114,6 +114,14 @@ class Gr00tRobotInferenceClient:
                 "gripper": state[5:6].astype(np.float32),
             },
             "language": {
+                # PINNED N1.7 INFERENCE KEY (GR-02 / D-02 — do NOT "fix" this).
+                # `annotation.human.action.task_description` is the GR00T N1.6/N1.7
+                # *inference* observation key the policy server expects at request
+                # time. It is explicitly NOT the LeRobot *dataset* annotation field
+                # (`human.task_description` in modality.json), and NOT the older
+                # N1.5 form. The verified obs-build/decode below depends on this
+                # exact key; a silent edit here would surface as a wrong-embodiment
+                # decode (RESEARCH §Pitfall 1 / threat T-03-05).
                 "annotation.human.action.task_description": lang or self.language_instruction
             },
         }
@@ -399,7 +407,10 @@ class EvalConfig:
     # Policy/eval parameters
     policy_host: str = "localhost"
     policy_port: int = 5555
-    action_horizon: int = 8
+    # Default action horizon pinned to 16 to match the trained/eval checkpoint
+    # (RESEARCH §Pitfall 2 — the legacy default of 8 truncated the learned
+    # action chunk). The agent path uses PickSkill(action_horizon=16).
+    action_horizon: int = 16
     lang_instruction: str = "Grab a banana and put it on the plate"
     play_sounds: bool = False
     timeout: int = 60
@@ -497,7 +508,7 @@ if __name__ == "__main__":
             front_cam_idx=int(ctrl.get("front_cam_idx", 1)),
             policy_host=ctrl.get("policy_host", "localhost"),
             policy_port=int(ctrl.get("policy_port", 5555)),
-            action_horizon=int(ctrl.get("action_horizon", 8)),
+            action_horizon=int(ctrl.get("action_horizon", 16)),
             lang_instruction=args.instruction
             or ctrl.get("lang_instruction", "Grab a banana and put it on the plate"),
             play_sounds=bool(ctrl.get("play_sounds", False)),

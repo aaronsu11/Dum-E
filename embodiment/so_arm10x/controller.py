@@ -52,6 +52,17 @@ from utils import load_config_file
 #################################################################################
 
 
+def _recursive_add_extra_dim(obs: Dict) -> Dict:
+    for key, val in obs.items():
+        if isinstance(val, np.ndarray):
+            obs[key] = val[np.newaxis, ...]
+        elif isinstance(val, dict):
+            obs[key] = _recursive_add_extra_dim(val)
+        else:
+            obs[key] = [val]
+    return obs
+
+
 class Gr00tRobotInferenceClient:
     """Wrapper for the Isaac-GR00T inference service compatible with the new
     observation schema and Dum-E's expectations.
@@ -94,39 +105,37 @@ class Gr00tRobotInferenceClient:
     def get_action(
         self, observation_dict: Dict[str, Any], lang: Optional[str] = None
     ) -> List[Dict[str, float]]:
-        # Build obs for policy
+        # Build nested obs dict for new Isaac-GR00T API
+        state = np.array([observation_dict[k] for k in self.robot_state_keys])
         obs_dict: Dict[str, Any] = {
-            f"video.{key}": observation_dict[key] for key in self.camera_keys
+            "video": {k: observation_dict[k] for k in self.camera_keys},
+            "state": {
+                "single_arm": state[:5].astype(np.float32),
+                "gripper": state[5:6].astype(np.float32),
+            },
+            "language": {
+                "annotation.human.action.task_description": lang or self.language_instruction
+            },
         }
 
         if self.show_images:
-            view_img({k: v for k, v in obs_dict.items() if k.startswith("video.")})
+            view_img(obs_dict["video"])
 
-        # Pack state into arrays
-        state = np.array([observation_dict[k] for k in self.robot_state_keys])
-        obs_dict["state.single_arm"] = state[:5].astype(np.float64)
-        obs_dict["state.gripper"] = state[5:6].astype(np.float64)
-        obs_dict["annotation.human.task_description"] = (
-            lang or self.language_instruction
-        )
+        # Add T=1 dim then B=1 dim
+        obs_dict = _recursive_add_extra_dim(obs_dict)
+        obs_dict = _recursive_add_extra_dim(obs_dict)
 
-        # Add batch dim
-        for k in list(obs_dict.keys()):
-            if isinstance(obs_dict[k], np.ndarray):
-                obs_dict[k] = obs_dict[k][np.newaxis, ...]
-            else:
-                obs_dict[k] = [obs_dict[k]]
-
-        # Query policy
-        action_chunk = self.policy.get_action(obs_dict)
+        # Query policy — returns (action_chunk, info)
+        action_chunk, _ = self.policy.get_action(obs_dict)
 
         # Convert to list of dict[str, float]
+        # action_chunk keys are "single_arm"/"gripper" with shape (B, T, D)
         lerobot_actions: List[Dict[str, float]] = []
-        horizon = action_chunk[f"action.{self.modality_keys[0]}"].shape[0]
+        horizon = action_chunk[self.modality_keys[0]].shape[1]
         for i in range(horizon):
             concat_action = np.concatenate(
                 [
-                    np.atleast_1d(action_chunk[f"action.{key}"][i])
+                    np.atleast_1d(action_chunk[key][0][i])
                     for key in self.modality_keys
                 ],
                 axis=0,

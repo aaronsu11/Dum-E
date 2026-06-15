@@ -124,6 +124,7 @@ def create_robot_tools(
         actions_to_execute: int = 10,
         pose: Literal["initial", "resume"] = "resume",
         language_instruction: Optional[str] = None,
+        action_horizon: int = 8,
     ) -> dict:
         if pose == "initial":
             robot_controller.move_to_initial_pose()
@@ -138,7 +139,7 @@ def create_robot_tools(
             )
 
             # Execute a short horizon for stability
-            for action_dict in action_list:
+            for action_dict in action_list[:action_horizon]:
                 robot_controller.set_target_state(action_dict)
                 time.sleep(0.05)
 

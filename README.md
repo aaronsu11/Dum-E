@@ -87,45 +87,46 @@ Choose the setup that best matches your needs and hardware availability. The fol
     sudo apt-get -y install cuda-toolkit-12-4
     ```
 
-3. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.10 for gr00t policy server:
+3. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (if not already installed):
 
     ```bash
-    conda create -y -n gr00t python=3.10
-    conda activate gr00t
+    curl -LsSf https://astral.sh/uv/install.sh | sh
     ```
 
-4. Clone Isaac-GR00T repository:
+    > **Requirement:** uv **v0.8.4+** is needed to build `flash-attn` automatically.
+
+4. Clone Isaac-GR00T repository (including submodules):
 
     ```bash
-    git clone https://github.com/NVIDIA/Isaac-GR00T
+    git clone --recurse-submodules https://github.com/NVIDIA/Isaac-GR00T
     ```
 
 5. Install Isaac-GR00T:
 
     ```bash
     cd Isaac-GR00T
-    # use the tested version on 12th Sep 2025
-    git checkout b211007ed6698e6642d2fd7679dabab1d97e9e6c
-
-    # conda activate gr00t
-    pip install --upgrade setuptools
-    pip install -e .[base]
-    pip install --no-build-isolation flash-attn==2.7.1.post4
+    git checkout n1.7-release
+    # Install FFmpeg (required by torchcodec, the default video backend)
+    sudo apt-get update && sudo apt-get install -y ffmpeg
+    # Create the environment and install GR00T
+    uv sync --python 3.10
+    # Verify the installation
+    uv run python -c "import gr00t; print('GR00T installed successfully')"
     ```
     Download a fine-tuned GR00T model from Hugging Face for the task you want to perform. For example, to pick up a fruit (apple, banana, orange, etc.) and put it on the plate, you can download our checkpoint by running:
     ```bash
-    hf download aaronsu11/GR00T-N1.5-3B-FT-FRUIT-0810 --local-dir ./GR00T-N1.5-3B-FT --exclude "optimizer.pt"
+    uv run hf download aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking --local-dir ./checkpoints/GR00T-N1.7-3B-SO101 --exclude "optimizer.pt"
     ```
 
 6. Start policy server
-    
+
     Run the following command to start the gr00t policy server:
     ```bash
-    python scripts/inference_service.py \
-    --server \
-    --model_path ./GR00T-N1.5-3B-FT \
-    --embodiment_tag new_embodiment \
-    --data_config so100_dualcam
+    uv run python gr00t/eval/run_gr00t_server.py \
+    --model-path ./checkpoints/GR00T-N1.7-3B-SO101 \
+    --embodiment-tag new_embodiment \
+    --host 0.0.0.0 \
+    --port 5555
     ```
     This needs to be running as long as you are using the gr00t policy for inference. Note down the IP address of the policy server (`<policy_host>`) and make sure port 5555 is accessible from the client.
 

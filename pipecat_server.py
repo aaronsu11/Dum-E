@@ -82,7 +82,13 @@ LANGUAGE_PRESETS = {
             "language": "zh-CN",
         },
         "elevenlabs": {
-            "voice_id": "hkfHEbBvdQFNX4uWHqRF",  # Mandarin voice
+            # Sarah — a PREMADE voice (free-tier usable). eleven_turbo_v2_5 is
+            # multilingual, so with language_code "zh" it speaks Mandarin. Library/
+            # professional voices (e.g. the dedicated Mandarin "Stacy"
+            # hkfHEbBvdQFNX4uWHqRF) require a PAID ElevenLabs plan — on free tier the
+            # API returns 402 payment_required and the websocket path fails silently
+            # (no audio). Use a premade voice unless the deployment has a paid plan.
+            "voice_id": "EXAVITQu4vr4xnSDxMaL",  # Sarah (premade, multilingual via turbo)
             # eleven_turbo_v2_5 is required for the streaming websocket path pipecat
             # uses (the multi-stream-input endpoint only serves the streaming models
             # eleven_flash_v2_5 / eleven_turbo_v2_5). eleven_multilingual_v2 is NOT a

@@ -641,6 +641,26 @@ class TestNovaSonic2Wiring:
             "explicitly (SPCH-04 / D-04 — Nova 2 Sonic)"
         )
 
+    def test_nova_sonic2_bootstrap_does_not_use_v1_trigger(self):
+        """UAT (test 3): Nova Sonic 2 is kicked off with a plain LLMRunFrame(), NOT
+        the Nova Sonic 1 'await-trigger' pattern. On amazon.nova-2-sonic-v1:0,
+        trigger_assistant_response() is a NO-OP (pipecat logs 'Assistant response
+        trigger not needed'), and injecting AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION
+        makes the model wait for a 'ready' cue that never arrives — so it never greets
+        or responds. Assert the v1 trigger pattern is gone and LLMRunFrame() remains."""
+        source = _server_source()
+        assert "trigger_assistant_response" not in source, (
+            "Nova Sonic 2 must NOT call trigger_assistant_response() — it is a no-op on "
+            "amazon.nova-2-sonic-v1:0 and leaves the assistant waiting silently"
+        )
+        assert "AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION" not in source, (
+            "Nova Sonic 2 must NOT inject AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION — "
+            "it tells the model to wait for a 'ready' trigger that NS2 never sends"
+        )
+        assert "LLMRunFrame" in source, (
+            "Nova Sonic 2 is prompted to respond with a plain LLMRunFrame()"
+        )
+
     def test_nova_sonic_timeout_guard_intact_post_swap(self):
         """PIPE-04 regression guard (Pitfall 4): after adding session_continuation
         + model, the Nova Sonic constructor STILL carries a non-None

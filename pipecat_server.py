@@ -531,8 +531,14 @@ async def run_jarvis(
         #     await tts.queue_frame(TTSSpeakFrame("Let me check on that."))
 
         if profile == "aws":
-            # For Nova Sonic speech-to-speech, append the special trigger instruction so the
-            # assistant will start speaking when it hears the synthetic "ready" trigger.
+            # Nova Sonic 2 (amazon.nova-2-sonic-v1:0) bootstrap. The OLD Nova Sonic 1
+            # pattern appended an "await-trigger" instruction ("start speaking when you
+            # hear 'ready'") and sent a synthetic "ready" audio cue. On NS2 that audio
+            # cue is a NO-OP (pipecat logs "Assistant response trigger not needed"), so
+            # the model would sit waiting for a 'ready' cue that never arrives and never
+            # greet. NS2 is kicked off with a plain LLMRunFrame() instead (see
+            # on_client_connected), so we must NOT inject the await-trigger instruction
+            # here — keep only the greeting instruction.
             if mode == "speech_to_speech":
                 context = LLMContext(
                     messages=[
@@ -543,7 +549,6 @@ async def run_jarvis(
                                     "text": "\n".join(
                                         [
                                             system_prompt,
-                                            AWSNovaSonicLLMService.AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION,
                                             "Greet the user by saying 'Hello there!'",
                                         ]
                                     )
@@ -622,10 +627,12 @@ async def run_jarvis(
             logger.info(f"Client connected")
             # Kick off the conversation.
             if mode == "speech_to_speech" and profile == "aws":
-                # For Nova Sonic (speech-to-speech), trigger the assistant to speak using the synthetic "ready" audio,
-                # so the model responds without having to wait for real user audio.
+                # Nova Sonic 2: a plain LLMRunFrame() prompts the assistant to greet
+                # (the context ends with the system greeting instruction). The old
+                # Nova Sonic 1 "ready"-audio response cue is a NO-OP on NS2
+                # (amazon.nova-2-sonic-v1:0) and is intentionally NOT called here —
+                # calling it just logged a warning and did nothing.
                 await worker.queue_frames([LLMRunFrame()])
-                await llm.trigger_assistant_response()
             else:
                 # Use language-specific greeting
                 greeting = language_preset["greeting"]

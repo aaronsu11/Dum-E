@@ -71,15 +71,21 @@ def _spawn_pipecat_server(
         }
     )
 
-    # Pass voice configuration via environment variables for pipecat runner
+    # Pass voice configuration via environment variables for pipecat runner.
+    # Precedence: inherited shell env var (DUME_VOICE_*) > config file > built-in
+    # default. An operator who exports DUME_VOICE_LANGUAGE=zh (e.g. the README D-06
+    # smoke-test gate) must win over the my-dum-e.yaml `language` default — do NOT
+    # unconditionally overwrite an already-set env var with the config value.
     if voice_config:
-        language = voice_config.get("language", "en")
-        mode = voice_config.get("mode", "cascaded")
-        profile = voice_config.get("profile", "default")
-
-        env["DUME_VOICE_LANGUAGE"] = language
-        env["DUME_VOICE_MODE"] = mode
-        env["DUME_VOICE_PROFILE"] = profile
+        voice_env_defaults = {
+            "DUME_VOICE_LANGUAGE": voice_config.get("language", "en"),
+            "DUME_VOICE_MODE": voice_config.get("mode", "cascaded"),
+            "DUME_VOICE_PROFILE": voice_config.get("profile", "default"),
+        }
+        for env_key, config_value in voice_env_defaults.items():
+            # setdefault: only apply the config/default value when the operator
+            # has not already exported the variable in the shell environment.
+            env.setdefault(env_key, config_value)
 
     if extra_env:
         env.update(extra_env)

@@ -111,9 +111,14 @@ class TestLoadConfigFile:
             temp_path = f.name
 
         try:
-            with mock.patch(
-                "builtins.__import__", side_effect=ImportError("No module named 'yaml'")
-            ):
+            _real_import = __import__
+
+            def _import_no_yaml(name, *args, **kwargs):
+                if name == "yaml":
+                    raise ImportError("No module named 'yaml'")
+                return _real_import(name, *args, **kwargs)
+
+            with mock.patch("builtins.__import__", side_effect=_import_no_yaml):
                 with pytest.raises(RuntimeError, match="PyYAML is required"):
                     load_config_file(temp_path)
         finally:

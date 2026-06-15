@@ -299,6 +299,85 @@ def resolve_aws_static_credentials():
         return None, None, None
 
 
+def _sanitize_schema_for_nova_sonic(node):
+    """Recursively coerce a JSON-Schema fragment into the restricted shape that
+    Nova Sonic's Bedrock tool validator accepts.
+
+    SPCH-04: Nova Sonic (amazon.nova-*-sonic) rejects tool inputSchemas that use
+    constructs its bidirectional-streaming tool validator does not support —
+    surfacing as "Invalid input request, please fix your input and try again."
+    the instant the tool-bearing prompt-start event is sent — even though the
+    boto3/Converse path (Claude) tolerates them. The MCP tool schemas emitted by
+    FastMCP/Pydantic use exactly those constructs for optional params:
+      - ``anyOf: [<T>, {"type": "null"}]`` (Optional[...] fields)
+      - ``default`` keys
+      - ``additionalProperties`` / ``title``
+    Collapse ``anyOf``/``oneOf`` to the first non-null branch and strip the
+    unsupported keys. The result remains a valid schema for every other model.
+    """
+    if isinstance(node, list):
+        return [_sanitize_schema_for_nova_sonic(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+
+    node = dict(node)
+
+    # Collapse anyOf/oneOf (commonly Optional[...] == [T, null]) to the first
+    # non-null branch, merging any sibling keys (e.g. description) into it.
+    for combinator in ("anyOf", "oneOf"):
+        if combinator in node:
+            branches = [
+                b
+                for b in node.pop(combinator)
+                if not (isinstance(b, dict) and b.get("type") == "null")
+            ]
+            chosen = branches[0] if branches else {"type": "string"}
+            merged = {**node, **chosen}
+            return _sanitize_schema_for_nova_sonic(merged)
+
+    # Strip keys the validator does not accept / does not need.
+    for key in ("default", "additionalProperties", "title"):
+        node.pop(key, None)
+
+    # Recurse into nested schema positions.
+    if isinstance(node.get("properties"), dict):
+        node["properties"] = {
+            k: _sanitize_schema_for_nova_sonic(v) for k, v in node["properties"].items()
+        }
+    if "items" in node:
+        node["items"] = _sanitize_schema_for_nova_sonic(node["items"])
+
+    return node
+
+
+def sanitize_tools_for_nova_sonic(tools):
+    """Return a ToolsSchema whose FunctionSchema properties are coerced to the
+    restricted JSON-Schema shape Nova Sonic accepts (see
+    _sanitize_schema_for_nova_sonic).
+
+    Tool NAMES and required lists are preserved so handler dispatch is unaffected.
+    Returns ``tools`` unchanged if it is falsy. Only the Nova Sonic speech-to-speech
+    path needs this — the cascaded Claude/Converse path tolerates the raw MCP schemas.
+    """
+    if not tools:
+        return tools
+    sanitized = []
+    for fn in tools.standard_tools:
+        clean_props = {
+            name: _sanitize_schema_for_nova_sonic(spec)
+            for name, spec in fn.properties.items()
+        }
+        sanitized.append(
+            FunctionSchema(
+                name=fn.name,
+                description=fn.description,
+                properties=clean_props,
+                required=fn.required,
+            )
+        )
+    return ToolsSchema(standard_tools=sanitized)
+
+
 def patch_trace_input_output():
     """Promote the first LLM input and latest LLM output to the Langfuse TRACE level.
 
@@ -576,6 +655,11 @@ async def run_jarvis(
             # on_client_connected), so we must NOT inject the await-trigger instruction
             # here — keep only the greeting instruction.
             if mode == "speech_to_speech":
+                # SPCH-04: Nova Sonic's tool validator rejects the raw MCP schemas
+                # (anyOf/null, default, additionalProperties) with "Invalid input
+                # request" at session setup. Coerce to its restricted shape — this
+                # path only; the cascaded Claude path below tolerates them as-is.
+                nova_sonic_tools = sanitize_tools_for_nova_sonic(tools)
                 context = LLMContext(
                     messages=[
                         {
@@ -592,7 +676,7 @@ async def run_jarvis(
                             ],
                         }
                     ],
-                    tools=tools,
+                    tools=nova_sonic_tools,
                 )
             else:
                 context = LLMContext(

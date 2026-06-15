@@ -767,6 +767,124 @@ class TestNovaSonic2Wiring:
             ), "function_call_timeout_secs must be a real bound, not None"
 
 
+class TestNovaSonicToolSchemaSanitization:
+    """SPCH-04: Nova Sonic's tool validator rejects the raw MCP/FastMCP tool schemas
+    (anyOf/null for Optional params, default, additionalProperties) with "Invalid
+    input request, please fix your input and try again." at session setup. The
+    speech_to_speech+aws path must coerce schemas to Nova Sonic's restricted shape
+    BEFORE building the LLMContext, without disturbing the cascaded Claude path
+    (which tolerates the raw schemas). Behavioural unit tests on the sanitizer +
+    AST guard that it is applied on the s2s path.
+    """
+
+    def _server_module(self):
+        import importlib
+
+        return importlib.import_module("pipecat_server")
+
+    def test_anyof_optional_collapses_to_non_null_branch(self):
+        ps = self._server_module()
+        result = ps._sanitize_schema_for_nova_sonic(
+            {"anyOf": [{"type": "string"}, {"type": "null"}], "default": None}
+        )
+        assert result == {"type": "string"}
+
+    def test_default_and_additional_properties_stripped(self):
+        ps = self._server_module()
+        result = ps._sanitize_schema_for_nova_sonic(
+            {"type": "integer", "default": 900}
+        )
+        assert result == {"type": "integer"}
+        result = ps._sanitize_schema_for_nova_sonic(
+            {"type": "object", "additionalProperties": True, "title": "Meta"}
+        )
+        assert result == {"type": "object"}
+
+    def test_nested_array_items_preserved(self):
+        ps = self._server_module()
+        result = ps._sanitize_schema_for_nova_sonic(
+            {
+                "anyOf": [
+                    {"items": {"type": "string"}, "type": "array"},
+                    {"type": "null"},
+                ],
+                "default": None,
+            }
+        )
+        assert result == {"items": {"type": "string"}, "type": "array"}
+
+    def test_sanitized_schema_has_no_forbidden_constructs_through_adapter(self):
+        """End-to-end: a sanitized ToolsSchema, run through the real Nova Sonic
+        adapter, yields an inputSchema.json with NONE of the forbidden constructs,
+        while preserving the tool name and required list (handler dispatch intact)."""
+        import json
+
+        from pipecat.adapters.schemas.function_schema import FunctionSchema
+        from pipecat.adapters.schemas.tools_schema import ToolsSchema
+        from pipecat.adapters.services.aws_nova_sonic_adapter import (
+            AWSNovaSonicLLMAdapter,
+        )
+
+        ps = self._server_module()
+        raw = ToolsSchema(
+            standard_tools=[
+                FunctionSchema(
+                    name="execute_robot_instruction",
+                    description="Assign a task to the physical robot agent.",
+                    properties={
+                        "instruction": {"type": "string"},
+                        "robot_id": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        "timeout_s": {"default": 900, "type": "integer"},
+                        "metadata": {
+                            "anyOf": [
+                                {"additionalProperties": True, "type": "object"},
+                                {"type": "null"},
+                            ],
+                            "default": None,
+                        },
+                    },
+                    required=["instruction", "robot_id"],
+                ),
+            ]
+        )
+        clean = ps.sanitize_tools_for_nova_sonic(raw)
+        out = AWSNovaSonicLLMAdapter().to_provider_tools_format(clean)
+        spec = out[0]["toolSpec"]
+        blob = spec["inputSchema"]["json"]
+
+        assert spec["name"] == "execute_robot_instruction"
+        for forbidden in ("anyOf", "oneOf", "default", "additionalProperties", "title"):
+            assert forbidden not in blob, (
+                f"sanitized Nova Sonic inputSchema must not contain '{forbidden}'"
+            )
+        parsed = json.loads(blob)
+        assert parsed["required"] == ["instruction", "robot_id"]
+        assert parsed["properties"]["robot_id"] == {"type": "string"}
+
+    def test_sanitize_passthrough_on_falsy_tools(self):
+        ps = self._server_module()
+        assert ps.sanitize_tools_for_nova_sonic(None) is None
+
+    def test_s2s_path_applies_nova_sonic_sanitizer(self):
+        """AST guard: the speech_to_speech branch feeds the LLMContext with
+        sanitize_tools_for_nova_sonic(...) output, not the raw tools, so the fix
+        cannot silently regress."""
+        source = _server_source()
+        assert "sanitize_tools_for_nova_sonic" in source, (
+            "speech_to_speech path must sanitize tool schemas for Nova Sonic"
+        )
+        tree = _server_ast()
+        # The sanitizer must be CALLED (not merely defined) somewhere.
+        called = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "sanitize_tools_for_nova_sonic"
+        ]
+        assert called, "sanitize_tools_for_nova_sonic must be invoked, not just defined"
+
+
 class TestSageMakerBackendSelector:
     """SPCH-05 / D-05: the DUME_DEEPGRAM_BACKEND=sagemaker path is WIRED but the
     endpoint is NOT deployed this milestone — it raises ValueError on a missing

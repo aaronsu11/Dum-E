@@ -196,5 +196,13 @@ cython_debug/
 #VSCode
 .vscode/
 
+# Claude Code
+.claude/
+.agents/
+skills-lock.json
+
 # Planning files
 .planning/
+
+# YAML files
+my-dum-e.yaml

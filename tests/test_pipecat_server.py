@@ -561,23 +561,22 @@ class TestPerLanguageTTSRouting:
             "Pitfall 3: a wrong route here produces silence on zh"
         )
 
-    def test_zh_elevenlabs_language_is_eleven_supported(self):
-        """UAT regression (test 2): the zh ElevenLabs language must resolve to a
-        code eleven_turbo_v2_5 accepts. Language.CMN resolves to 'cmn', which the
-        model rejects with a 1008 policy violation (connection fails 3x -> no audio).
-        Language.ZH resolves to 'zh', which is accepted. Assert the preset uses ZH
-        (not CMN) so the runtime fallback actually produces audio."""
+    def test_zh_elevenlabs_uses_multilingual_v2_model(self):
+        """UAT (test 2): the zh ElevenLabs fallback uses eleven_multilingual_v2 for
+        higher-quality Mandarin. That model auto-detects language from the text and
+        does NOT take an explicit language_code (it is excluded from pipecat's
+        ELEVENLABS_MULTILINGUAL_MODELS), which also sidesteps the earlier cmn/zh
+        language-code mismatch. The preset must carry the model key, and the
+        ElevenLabs constructor must pass it through (not hard-code a turbo model)."""
         from pipecat_server import LANGUAGE_PRESETS
-        from pipecat.transcriptions.language import Language
 
-        el_lang = LANGUAGE_PRESETS["zh"]["elevenlabs"]["language"]
-        assert el_lang == Language.ZH, (
-            "zh ElevenLabs language must be Language.ZH (-> 'zh'); Language.CMN "
-            "(-> 'cmn') is rejected by eleven_turbo_v2_5 with a 1008 policy violation"
+        assert LANGUAGE_PRESETS["zh"]["elevenlabs"]["model"] == "eleven_multilingual_v2", (
+            "zh ElevenLabs preset must select eleven_multilingual_v2 (higher Mandarin quality)"
         )
-        assert el_lang != Language.CMN, (
-            "Language.CMN regresses the zh fallback to a 1008 'does not support "
-            "language_code cmn' failure — no audible Mandarin audio"
+        source = _server_source()
+        assert 'elevenlabs_config.get("model"' in source, (
+            "the ElevenLabs branch must pass the preset's model to ElevenLabsTTSService "
+            "(model=elevenlabs_config.get('model', ...)), not hard-code a turbo model"
         )
 
     def test_elevenlabs_tts_service_is_live_code(self):

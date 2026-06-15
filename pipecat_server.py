@@ -83,10 +83,12 @@ LANGUAGE_PRESETS = {
         },
         "elevenlabs": {
             "voice_id": "hkfHEbBvdQFNX4uWHqRF",  # Mandarin voice
-            # ElevenLabs maps Language.ZH -> "zh" (the code eleven_turbo_v2_5 accepts);
-            # Language.CMN falls through to the raw "cmn" base code, which the model
-            # rejects with a 1008 policy-violation (no audio). Use ZH for ElevenLabs TTS.
-            # (STT/Polly keep their own cmn-CN/zh-CN codes above.)
+            # eleven_multilingual_v2 gives higher-quality Mandarin than the turbo models.
+            # It auto-detects language from the text (it is NOT in pipecat's
+            # ELEVENLABS_MULTILINGUAL_MODELS language-code set), so no explicit
+            # language_code is sent — which sidesteps the earlier cmn/zh code-mismatch
+            # entirely. `language` is kept for documentation/other-engine use.
+            "model": "eleven_multilingual_v2",
             "language": Language.ZH,
         },
         "aws_polly": {
@@ -455,6 +457,7 @@ async def run_jarvis(
                     tts = ElevenLabsTTSService(
                         api_key=os.getenv("ELEVENLABS_API_KEY"),
                         voice_id=elevenlabs_config["voice_id"],
+                        model=elevenlabs_config.get("model", "eleven_turbo_v2_5"),
                         sample_rate=24000,
                         params=ElevenLabsTTSService.InputParams(
                             language=elevenlabs_config["language"]
@@ -485,6 +488,7 @@ async def run_jarvis(
                     tts = ElevenLabsTTSService(
                         api_key=os.getenv("ELEVENLABS_API_KEY"),
                         voice_id=elevenlabs_config["voice_id"],
+                        model=elevenlabs_config.get("model", "eleven_turbo_v2_5"),
                         sample_rate=24000,
                         params=ElevenLabsTTSService.InputParams(
                             language=elevenlabs_config["language"]

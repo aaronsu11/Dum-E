@@ -222,6 +222,61 @@ Choose the setup that best matches your needs and hardware availability. The fol
     > python dum_e.py --node servers --config my-dum-e.yaml
     > ```
 
+### 🧪 GR00T N1.7 manual smoke test
+
+The end-to-end inference path (live N1.7 policy server + SO-ARM101 picking real
+fruit) cannot run in CI — it requires the GPU policy server and physical
+hardware. This is the manual acceptance gate for the N1.7 client upgrade.
+Mocked-wiring unit tests cover every CI-runnable surface
+(`uv run pytest tests/test_robot_agent.py`); the steps below verify the one
+surface that can only be checked on real hardware.
+
+1. **Start the upstream Isaac-GR00T `n1.7-release` policy server** (run as-is —
+   the server is NOT modified by Dum-E) with the locked SO101 fruit-picking
+   checkpoint. From your Isaac-GR00T checkout on the GPU host:
+
+    ```bash
+    python gr00t/eval/run_gr00t_server.py \
+        --model-path aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking \
+        --embodiment-tag NEW_EMBODIMENT \
+        --port 5555
+    ```
+
+2. **Confirm reachability and fail-loud behavior.** The client `ping()` should
+   succeed with the server up. Then stop the server and confirm the client
+   raises a descriptive "Policy server unreachable at `<host>:5555`"
+   `RuntimeError` within ~45s rather than hanging indefinitely. Restart the
+   server before continuing.
+
+3. **Run the robot agent** against the live server with the SO101 arm connected
+   (substitute your serial port and policy host):
+
+    ```bash
+    python -m embodiment.so_arm10x.agent \
+        --port <serial> \
+        --id so101_follower_arm \
+        --wrist_cam_idx 0 \
+        --front_cam_idx 1 \
+        --policy_host <host> \
+        --profile aws \
+        --instruction "I want one banana on the plate"
+    ```
+
+4. **Observe the expected behavior:**
+    - The agent assesses the scene, drives N1.7 inference end-to-end, and the
+      SO101 arm executes the action sequence and picks the fruit.
+    - The agent/voice loop stays responsive throughout the multi-minute pick —
+      the blocking inference runs in a worker thread (`asyncio.to_thread`), so
+      the event loop is never blocked.
+    - A wrong embodiment tag or schema mismatch fails loudly with a descriptive
+      `RuntimeError` (no deep `KeyError`/`IndexError`, no silent corruption).
+
+> [!NOTE]
+> If the robot is not moving, confirm the policy server is reachable from the
+> client: `nc -zv <policy_host> 5555` (macOS/Linux) or
+> `Test-NetConnection -ComputerName <policy_host> -Port 5555` (Windows
+> PowerShell).
+
 ## 🏗️ Architecture Overview
 
 ### Core Components

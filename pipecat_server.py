@@ -83,12 +83,13 @@ LANGUAGE_PRESETS = {
         },
         "elevenlabs": {
             "voice_id": "hkfHEbBvdQFNX4uWHqRF",  # Mandarin voice
-            # eleven_multilingual_v2 gives higher-quality Mandarin than the turbo models.
-            # It auto-detects language from the text (it is NOT in pipecat's
-            # ELEVENLABS_MULTILINGUAL_MODELS language-code set), so no explicit
-            # language_code is sent — which sidesteps the earlier cmn/zh code-mismatch
-            # entirely. `language` is kept for documentation/other-engine use.
-            "model": "eleven_multilingual_v2",
+            # eleven_turbo_v2_5 is required for the streaming websocket path pipecat
+            # uses (the multi-stream-input endpoint only serves the streaming models
+            # eleven_flash_v2_5 / eleven_turbo_v2_5). eleven_multilingual_v2 is NOT a
+            # streaming model — the endpoint returns a final message with no audio.
+            # turbo_v2_5 is also in ELEVENLABS_MULTILINGUAL_MODELS, so the zh language
+            # code below IS applied (Language.ZH -> "zh", which the model accepts).
+            "model": "eleven_turbo_v2_5",
             "language": Language.ZH,
         },
         "aws_polly": {

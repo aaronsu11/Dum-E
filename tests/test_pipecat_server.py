@@ -561,22 +561,41 @@ class TestPerLanguageTTSRouting:
             "Pitfall 3: a wrong route here produces silence on zh"
         )
 
-    def test_zh_elevenlabs_uses_multilingual_v2_model(self):
-        """UAT (test 2): the zh ElevenLabs fallback uses eleven_multilingual_v2 for
-        higher-quality Mandarin. That model auto-detects language from the text and
-        does NOT take an explicit language_code (it is excluded from pipecat's
-        ELEVENLABS_MULTILINGUAL_MODELS), which also sidesteps the earlier cmn/zh
-        language-code mismatch. The preset must carry the model key, and the
-        ElevenLabs constructor must pass it through (not hard-code a turbo model)."""
+    def test_zh_elevenlabs_uses_streaming_compatible_model(self):
+        """UAT (test 2): the zh ElevenLabs fallback must use a STREAMING-compatible
+        model. pipecat's websocket ElevenLabsTTSService uses the multi-stream-input
+        endpoint, which only serves ELEVENLABS_MULTILINGUAL_MODELS
+        (eleven_flash_v2_5 / eleven_turbo_v2_5). eleven_multilingual_v2 is NOT a
+        streaming model — that endpoint returns a final message with NO audio (silent
+        failure observed in UAT). The preset must select a streaming model, and the
+        constructor must thread the preset model through (not hard-code one)."""
         from pipecat_server import LANGUAGE_PRESETS
 
-        assert LANGUAGE_PRESETS["zh"]["elevenlabs"]["model"] == "eleven_multilingual_v2", (
-            "zh ElevenLabs preset must select eleven_multilingual_v2 (higher Mandarin quality)"
+        # The streaming models pipecat's websocket service supports (and which accept
+        # an explicit language_code). Keep in lockstep with ELEVENLABS_MULTILINGUAL_MODELS.
+        streaming_models = {"eleven_flash_v2_5", "eleven_turbo_v2_5"}
+        model = LANGUAGE_PRESETS["zh"]["elevenlabs"]["model"]
+        assert model in streaming_models, (
+            f"zh ElevenLabs model {model!r} is not a streaming model {streaming_models}; "
+            "eleven_multilingual_v2 returns no audio on the multi-stream-input endpoint"
         )
         source = _server_source()
         assert 'elevenlabs_config.get("model"' in source, (
             "the ElevenLabs branch must pass the preset's model to ElevenLabsTTSService "
-            "(model=elevenlabs_config.get('model', ...)), not hard-code a turbo model"
+            "(model=elevenlabs_config.get('model', ...)), not hard-code a model"
+        )
+
+    def test_zh_elevenlabs_language_is_eleven_supported(self):
+        """UAT regression (test 2): with a streaming model, the zh language code IS
+        applied — so it must resolve to a code the model accepts. Language.ZH -> 'zh'
+        (accepted); Language.CMN -> 'cmn' (rejected with a 1008 policy violation)."""
+        from pipecat_server import LANGUAGE_PRESETS
+        from pipecat.transcriptions.language import Language
+
+        el_lang = LANGUAGE_PRESETS["zh"]["elevenlabs"]["language"]
+        assert el_lang == Language.ZH, (
+            "zh ElevenLabs language must be Language.ZH (-> 'zh'); Language.CMN "
+            "(-> 'cmn') is rejected by the turbo model with a 1008 policy violation"
         )
 
     def test_elevenlabs_tts_service_is_live_code(self):

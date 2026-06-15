@@ -268,6 +268,37 @@ class AsyncMCPClient(MCPClient):
                 continue
 
 
+def resolve_aws_static_credentials():
+    """Resolve AWS credentials via the botocore default provider chain.
+
+    SPCH-04: AWSNovaSonicLLMService builds a smithy StaticCredentialsResolver from
+    the access_key_id/secret_access_key/session_token it is handed and does NOT walk
+    the AWS credential chain itself. Reading only os.getenv("AWS_ACCESS_KEY_ID")/
+    ("AWS_SECRET_ACCESS_KEY") therefore fails (SmithyIdentityError "credentials weren't
+    configured") whenever auth lives in ~/.aws/credentials, a named AWS_PROFILE, or SSO
+    rather than in those two env vars — even though the boto3-based cascaded services
+    (Transcribe/Polly/Bedrock) resolve fine. Resolve once here through botocore (which
+    honors env vars, shared credentials files, profiles, and SSO) and hand the frozen
+    static creds to Nova Sonic.
+
+    Returns:
+        Tuple of (access_key_id, secret_access_key, session_token). session_token is
+        None for long-lived IAM-user keys. Returns (None, None, None) if the chain
+        resolves nothing, so the caller can fall back to explicit env vars.
+    """
+    try:
+        import botocore.session
+
+        creds = botocore.session.get_session().get_credentials()
+        if creds is None:
+            return None, None, None
+        frozen = creds.get_frozen_credentials()
+        return frozen.access_key, frozen.secret_key, frozen.token
+    except Exception as e:
+        logger.warning(f"botocore credential resolution failed: {e}")
+        return None, None, None
+
+
 def patch_trace_input_output():
     """Promote the first LLM input and latest LLM output to the Langfuse TRACE level.
 
@@ -372,9 +403,14 @@ async def run_jarvis(
     # Speech to speech
     if mode == "speech_to_speech":
         if profile == "aws":
+            # SPCH-04: Nova Sonic uses a static smithy credentials resolver, so resolve
+            # the full AWS chain (env vars, ~/.aws profiles, SSO) up front and pass the
+            # frozen creds in. Fall back to explicit env vars if the chain resolves nothing.
+            ns_access_key, ns_secret_key, ns_session_token = resolve_aws_static_credentials()
             llm = AWSNovaSonicLLMService(
-                secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-                access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                secret_access_key=ns_secret_key or os.getenv("AWS_SECRET_ACCESS_KEY"),
+                access_key_id=ns_access_key or os.getenv("AWS_ACCESS_KEY_ID"),
+                session_token=ns_session_token or os.getenv("AWS_SESSION_TOKEN"),
                 region=os.getenv("AWS_REGION"),  # SPCH-04: must be us-east-1 / us-west-2 / ap-northeast-1 for Nova-2 Sonic
                 model="amazon.nova-2-sonic-v1:0",  # SPCH-04 / D-04: Nova 2 Sonic (the default; explicit for testability)
                 voice_id="matthew",  # Voices: matthew, tiffany, amy

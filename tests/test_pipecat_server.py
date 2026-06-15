@@ -661,6 +661,93 @@ class TestNovaSonic2Wiring:
             "Nova Sonic 2 is prompted to respond with a plain LLMRunFrame()"
         )
 
+    def test_nova_sonic_credentials_resolved_via_chain_not_only_env(self):
+        """UAT (test 3): Nova Sonic builds a static smithy credentials resolver and
+        does NOT walk the AWS credential chain itself. Reading only os.getenv for the
+        access key/secret fails (SmithyIdentityError 'credentials weren't configured')
+        whenever auth lives in ~/.aws/credentials / a profile / SSO. Assert the
+        constructor's credential kwargs are fed by resolve_aws_static_credentials()
+        (the botocore-chain resolver), not by a bare os.getenv() alone."""
+        source = _server_source()
+        assert "resolve_aws_static_credentials" in source, (
+            "pipecat_server must resolve AWS creds through the botocore default chain "
+            "(resolve_aws_static_credentials) so Nova Sonic works with profiles/SSO, "
+            "not only with AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY env vars"
+        )
+        tree = _server_ast()
+        calls = _calls_to(tree, "AWSNovaSonicLLMService")
+        assert calls, "expected an AWSNovaSonicLLMService(...) constructor call"
+        for call in calls:
+            for kw_name in ("access_key_id", "secret_access_key"):
+                node = _kwarg(call, kw_name)
+                assert node is not None, (
+                    f"AWSNovaSonicLLMService must pass {kw_name}="
+                )
+                # The value must reference the chain-resolved name (directly or as the
+                # primary operand of a `chain or os.getenv(...)` fallback), not be a
+                # bare os.getenv() call on its own.
+                names = {
+                    n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                }
+                assert any(name.startswith("ns_") for name in names), (
+                    f"AWSNovaSonicLLMService {kw_name}= must be fed by the "
+                    f"botocore-resolved credential (ns_*), not os.getenv alone"
+                )
+
+    def test_nova_sonic_passes_session_token(self):
+        """SPCH-04: temporary credentials (SSO / assumed roles) require a
+        session_token. Assert the Nova Sonic constructor forwards one so STS-based
+        auth works, not just long-lived IAM keys."""
+        tree = _server_ast()
+        calls = _calls_to(tree, "AWSNovaSonicLLMService")
+        assert calls, "expected an AWSNovaSonicLLMService(...) constructor call"
+        assert any(
+            _kwarg(call, "session_token") is not None for call in calls
+        ), "AWSNovaSonicLLMService must forward session_token= for temporary creds"
+
+    def test_resolve_aws_static_credentials_uses_botocore_chain(self):
+        """resolve_aws_static_credentials() delegates to botocore's default session
+        (which honors env vars, ~/.aws profiles, and SSO) and returns the frozen
+        (access_key, secret_key, token) triple — unlike the static smithy resolver
+        Nova Sonic builds internally."""
+        import importlib
+
+        import botocore.session
+
+        pipecat_server = importlib.import_module("pipecat_server")
+
+        frozen = mock.Mock(access_key="AKIA_X", secret_key="SECRET_X", token="TOKEN_X")
+        creds = mock.Mock()
+        creds.get_frozen_credentials.return_value = frozen
+        fake_session = mock.Mock()
+        fake_session.get_credentials.return_value = creds
+
+        with mock.patch.object(
+            botocore.session, "get_session", return_value=fake_session
+        ):
+            result = pipecat_server.resolve_aws_static_credentials()
+
+        assert result == ("AKIA_X", "SECRET_X", "TOKEN_X")
+
+    def test_resolve_aws_static_credentials_returns_none_when_unresolved(self):
+        """When botocore resolves nothing, the helper returns (None, None, None) so
+        the caller can fall back to explicit env vars rather than crash."""
+        import importlib
+
+        import botocore.session
+
+        pipecat_server = importlib.import_module("pipecat_server")
+
+        fake_session = mock.Mock()
+        fake_session.get_credentials.return_value = None
+
+        with mock.patch.object(
+            botocore.session, "get_session", return_value=fake_session
+        ):
+            result = pipecat_server.resolve_aws_static_credentials()
+
+        assert result == (None, None, None)
+
     def test_nova_sonic_timeout_guard_intact_post_swap(self):
         """PIPE-04 regression guard (Pitfall 4): after adding session_continuation
         + model, the Nova Sonic constructor STILL carries a non-None

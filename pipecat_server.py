@@ -26,14 +26,14 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMSettings
 from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.services.aws.stt import AWSTranscribeSTTService
 from pipecat.services.aws.tts import AWSPollyTTSService
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
 from pipecat.services.aws.nova_sonic.session_continuation import SessionContinuationParams
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
-from pipecat.services.deepgram.tts import DeepgramTTSService
+from pipecat.services.deepgram.tts import DeepgramTTSService, DeepgramTTSSettings
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import LLMService
 from pipecat.services.mcp_service import MCPClient
@@ -649,13 +649,18 @@ async def run_jarvis(
                 else:
                     tts = DeepgramTTSService(
                         api_key=os.getenv("DEEPGRAM_API_KEY"),
-                        voice=language_preset.get("aura2_voice", "aura-2-thalia-en"),
+                        settings=DeepgramTTSSettings(
+                            voice=language_preset.get("aura2_voice", "aura-2-thalia-en"),
+                        ),
                     )
 
             llm = AnthropicLLMService(
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
-                model="claude-haiku-4-5",
-                params=AnthropicLLMService.InputParams(temperature=0.1, max_tokens=500),
+                settings=AnthropicLLMSettings(
+                    model="claude-haiku-4-5",
+                    temperature=0.1,
+                    max_tokens=500,
+                ),
                 function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
             )
 

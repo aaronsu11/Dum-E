@@ -69,65 +69,73 @@ Choose the setup that best matches your needs and hardware availability. The fol
 ### 🔧 Installation
 
 #### 📦 On Single Workstation or Server
-> Requires 1) NVIDIA GPU 2) Linux or WSL2
+> Requires 1) NVIDIA GPU 2) Linux or WSL2 3) Docker with the NVIDIA Container Runtime
 
-1. Install required system dependencies
+The GR00T N1.7 policy server runs as a reproducible Docker container (x86 + NVIDIA
+GPU, or Jetson Orin). The container packages the server's CUDA / torch / flash-attn
+stack and serves inference on ZMQ port `5555`; the checkpoint and Hugging Face cache
+are mounted at runtime, never baked into the image.
 
-    ```bash
-    sudo apt-get update
-    sudo apt-get install ffmpeg libsm6 libxext6
-    ```
-
-2. Install CUDA toolkit 12.4
+1. Clone the Isaac-GR00T repository (the build wrapper checks it out at a pinned commit):
 
     ```bash
-    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-    sudo dpkg -i cuda-keyring_1.1-1_all.deb
-    sudo apt-get update
-    sudo apt-get -y install cuda-toolkit-12-4
+    git clone --recurse-submodules https://github.com/NVIDIA/Isaac-GR00T
     ```
 
-3. Create a [conda](https://www.anaconda.com/docs/getting-started/miniconda/install) or venv environment using Python 3.10 for gr00t policy server:
+2. Pre-fetch the checkpoint and the gated `nvidia/Cosmos-Reason2-2B` backbone into the
+   host Hugging Face cache. This is mandatory — the server loads the gated backbone at
+   startup and exits with `GatedRepoError` if it is not already cached. Request access
+   to `nvidia/Cosmos-Reason2-2B` on its Hugging Face page first, then:
 
     ```bash
-    conda create -y -n gr00t python=3.10
-    conda activate gr00t
+    export HF_TOKEN=<your-hf-token>
+    # SO101 fruit-picking checkpoint (mounted :ro at runtime)
+    uv run hf download aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking \
+        --local-dir ./checkpoints/GR00T-N1.7-3B-SO101 --exclude "optimizer.pt"
+    # Gated backbone (read from the mounted HF cache at runtime)
+    uv run hf download nvidia/Cosmos-Reason2-2B
     ```
 
-4. Clone Isaac-GR00T repository:
+3. Build the image at the pinned commit. The wrapper delegates to the upstream
+   `docker/build.sh`, failing closed if the checkout does not match the pin. Set
+   `GR00T_REPO` if your clone is not at `/home/<user>/Projects/Isaac-GR00T`.
 
     ```bash
-    git clone https://github.com/NVIDIA/Isaac-GR00T
+    # x86 + NVIDIA GPU -> image tag: gr00t
+    bash scripts/build_gr00t_image.sh
+
+    # Jetson Orin (aarch64), run natively on the Orin -> image tag: gr00t-orin
+    bash scripts/build_gr00t_image.sh orin
     ```
 
-5. Install Isaac-GR00T:
+4. Start the policy server. The checkpoint and HF cache are mounted `:ro`; `HF_TOKEN`
+   is passed at runtime via `-e` (never baked into the image).
 
     ```bash
-    cd Isaac-GR00T
-    # use the tested version on 12th Sep 2025
-    git checkout b211007ed6698e6642d2fd7679dabab1d97e9e6c
+    docker rm -f gr00t-server 2>/dev/null || true
+    docker run -d \
+        --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+        -p 5555:5555 \
+        -v "$(pwd)/checkpoints/GR00T-N1.7-3B-SO101:/checkpoints/model:ro" \
+        -v ~/.cache/huggingface:/root/.cache/huggingface:ro \
+        -e HF_TOKEN="$HF_TOKEN" \
+        --name gr00t-server \
+        gr00t \
+        uv run python gr00t/eval/run_gr00t_server.py \
+            --model-path /checkpoints/model \
+            --embodiment-tag new_embodiment --host 0.0.0.0 --port 5555
+    ```
 
-    # conda activate gr00t
-    pip install --upgrade setuptools
-    pip install -e .[base]
-    pip install --no-build-isolation flash-attn==2.7.1.post4
-    ```
-    Download a fine-tuned GR00T model from Hugging Face for the task you want to perform. For example, to pick up a fruit (apple, banana, orange, etc.) and put it on the plate, you can download our checkpoint by running:
-    ```bash
-    hf download aaronsu11/GR00T-N1.5-3B-FT-FRUIT-0810 --local-dir ./GR00T-N1.5-3B-FT --exclude "optimizer.pt"
-    ```
+    The server is ready once port `5555` is listening and the model has finished
+    loading (GPU memory settles). Keep the container running while you use the policy
+    for inference. Note the server's IP (`<policy_host>`) and make sure port 5555 is
+    reachable from the client.
 
-6. Start policy server
-    
-    Run the following command to start the gr00t policy server:
-    ```bash
-    python scripts/inference_service.py \
-    --server \
-    --model_path ./GR00T-N1.5-3B-FT \
-    --embodiment_tag new_embodiment \
-    --data_config so100_dualcam
-    ```
-    This needs to be running as long as you are using the gr00t policy for inference. Note down the IP address of the policy server (`<policy_host>`) and make sure port 5555 is accessible from the client.
+> [!NOTE]
+> **Security:** the server has no auth by default. Publish/bind `:5555` to `localhost`
+> or a trusted subnet only — do not expose it to untrusted networks. Always build via
+> `scripts/build_gr00t_image.sh` (SHA-pinned), never an ad-hoc `docker build`, so the
+> image provenance stays locked to the verified upstream commit.
 
 #### On Single Workstation or Client
 
@@ -283,7 +291,7 @@ graph TB
 ### Q4 2025
 
 - [ ] **Cross-Platform Support**
-  - [ ] Docker containers for platform-agnostic deployment
+  - [x] Docker containers for platform-agnostic deployment (x86 + Jetson Orin)
 
 - [ ] **ROS2 Integration**
   - [ ] Native ROS2 node implementation

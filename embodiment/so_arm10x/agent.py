@@ -37,12 +37,16 @@ from strands.agent import AgentResult
 from strands.models import BedrockModel
 from strands.models.anthropic import AnthropicModel
 from strands.telemetry import StrandsTelemetry
-from tqdm import tqdm
 
 
 from embodiment.so_arm10x.controller import (
     Gr00tRobotInferenceClient,
     SO10xArmController,
+)
+from embodiment.so_arm10x.skills import (
+    PickSkill,
+    PlaceSkill,
+    ResetPoseSkill,
 )
 from shared import (
     ITaskManager,
@@ -89,12 +93,29 @@ def create_robot_tools(
     robot_controller: SO10xArmController,
     gr00t_client_instance: Gr00tRobotInferenceClient,
 ):
-    """Create robot tools that use the specific robot instance."""
+    """Create robot tools that use the specific robot instance.
+
+    Each blocking robot operation lives in a synchronous ``Skill`` (skills.py).
+    The robot ``@tool`` functions below are thin ASYNC adapters that offload the
+    Skill's ``run()`` onto a worker thread via ``asyncio.to_thread``, so
+    the event loop stays responsive during multi-minute N1.7 inference. The
+    adapters preserve the exact ``{"status", "content": [...]}`` response shape
+    and the ``image_to_jpeg_bytes`` post-processing; the Skill returns raw images.
+
+    Strands 1.12.0 accepts ``async def`` functions decorated with ``@tool``
+    (confirmed via ``Agent(tools=[async_tool]).tool_names``), so the adapters are
+    registered directly without a sync bridge.
+    """
+
+    # Construct the synchronous Skills bound to this controller + policy client.
+    pick_skill = PickSkill(robot_controller, gr00t_client_instance)
+    place_skill = PlaceSkill(robot_controller, gr00t_client_instance)
+    reset_pose_skill = ResetPoseSkill(robot_controller, gr00t_client_instance)
 
     @tool
-    def reset_pose():
+    async def reset_pose():
         """Reset the robot to the initial pose to make the workspace clear and visible."""
-        robot_controller.move_to_initial_pose()
+        await asyncio.to_thread(reset_pose_skill.run)
         return {
             "status": "success",
             "content": [
@@ -103,11 +124,17 @@ def create_robot_tools(
         }
 
     @tool
-    def assess_situation() -> dict:
+    async def assess_situation() -> dict:
         """Assess the situation of the current state"""
-        images = robot_controller.get_current_images()
-        front_image_bytes = image_to_jpeg_bytes(images["front"], verbose=False)
-        wrist_image_bytes = image_to_jpeg_bytes(images["wrist"], verbose=False)
+        # Offload blocking camera read + JPEG encodes so the event loop stays
+        # responsive, matching the other robot @tool adapters.
+        images = await asyncio.to_thread(robot_controller.get_current_images)
+        front_image_bytes = await asyncio.to_thread(
+            image_to_jpeg_bytes, images["front"], verbose=False
+        )
+        wrist_image_bytes = await asyncio.to_thread(
+            image_to_jpeg_bytes, images["wrist"], verbose=False
+        )
 
         return {
             "status": "success",
@@ -120,33 +147,8 @@ def create_robot_tools(
             ],
         }
 
-    def pick(
-        actions_to_execute: int = 10,
-        pose: Literal["initial", "resume"] = "resume",
-        language_instruction: Optional[str] = None,
-    ) -> dict:
-        if pose == "initial":
-            robot_controller.move_to_initial_pose()
-            robot_controller.move_to_ready_pose()
-
-        for _ in tqdm(range(actions_to_execute), desc="Executing actions"):
-            # New observation -> policy -> action flow using updated interfaces
-            observation_dict = robot_controller.get_observation()
-            action_list = gr00t_client_instance.get_action(
-                observation_dict,
-                language_instruction or gr00t_client_instance.language_instruction,
-            )
-
-            # Execute a short horizon for stability
-            for action_dict in action_list:
-                robot_controller.set_target_state(action_dict)
-                time.sleep(0.05)
-
-        time.sleep(0.5)
-        return robot_controller.get_current_images()
-
     @tool
-    def start_pick(item: str) -> dict:
+    async def start_pick(item: str) -> dict:
         """Start picking up an item and put it on the plate
 
         Args:
@@ -157,7 +159,12 @@ def create_robot_tools(
         """
         language_instruction = f"Grab {item} and put it on the plate"
         gr00t_client_instance.set_lang_instruction(language_instruction)
-        latest_images = pick(pose="initial", language_instruction=language_instruction)
+        latest_images = await asyncio.to_thread(
+            pick_skill.run,
+            item=item,
+            pose="initial",
+            language_instruction=language_instruction,
+        )
         image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
 
         return {
@@ -171,9 +178,11 @@ def create_robot_tools(
         }
 
     @tool
-    def resume_pick():
+    async def resume_pick():
         """Resume picking up an item from a given location"""
-        latest_images = pick(actions_to_execute=15, pose="resume")
+        latest_images = await asyncio.to_thread(
+            pick_skill.run, actions_to_execute=15, pose="resume"
+        )
         image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
 
         return {
@@ -187,10 +196,9 @@ def create_robot_tools(
         }
 
     @tool
-    def place(location: Literal["left", "right"]):
+    async def place(location: Literal["left", "right"]):
         """Place an item at a given location"""
-        robot_controller.release_at_remote_pose(location)
-        latest_images = robot_controller.get_current_images()
+        latest_images = await asyncio.to_thread(place_skill.run, location=location)
         image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
 
         return {
@@ -367,8 +375,9 @@ Note: Colors in images may appear different due to reflections.""",
 
                 result = agent(instruction)
 
-                # Reset to initial pose after completion
-                self.robot_controller.move_to_initial_pose()
+                # Reset to initial pose after completion — offload the blocking
+                # move (it sleeps internally) so the event loop stays free.
+                await asyncio.to_thread(self.robot_controller.move_to_initial_pose)
 
             if self.task_manager is not None and task_id is not None:
                 await self.task_manager.update_task(task_id, TaskStatus.COMPLETED)
@@ -510,10 +519,11 @@ Note: Colors in images may appear different due to reflections.""",
                             )
                         # don't yield the result, same data is already yielded in the assistant_message event
 
-                # Reset to initial pose after completion
+                # Reset to initial pose after completion — offload the blocking
+                # move and use async sleep so the event loop stays responsive.
                 try:
-                    self.robot_controller.move_to_initial_pose()
-                    time.sleep(1.0)
+                    await asyncio.to_thread(self.robot_controller.move_to_initial_pose)
+                    await asyncio.sleep(1.0)
                 except Exception as pose_error:
                     # Log the error but don't fail the task - it already completed successfully
                     logger.warning(
@@ -559,14 +569,45 @@ Note: Colors in images may appear different due to reflections.""",
             }
 
     async def get_available_tools(self) -> List[ToolDefinition]:
-        """Get list of tools available to this agent."""
-        # TODO: convert this to ToolDefinition list
-        return await self._robot_tools
+        """Get list of tools available to this agent.
+
+        Builds a real ``List[ToolDefinition]`` from the Strands ``@tool`` specs.
+        Each decorated tool exposes its spec via ``.tool_spec`` (a dict with
+        ``name``/``description``/``inputSchema``); the JSON parameter schema lives
+        at ``tool_spec["inputSchema"]["json"]``.
+        """
+        tool_definitions: List[ToolDefinition] = []
+        for fn in self._robot_tools:
+            spec = getattr(fn, "tool_spec", None)
+            if spec is not None:
+                name = spec.get("name", getattr(fn, "tool_name", str(fn)))
+                description = spec.get("description", "")
+                parameters_schema = spec.get("inputSchema", {}).get("json", {})
+            else:
+                # Fallback if a future Strands version drops the spec attribute.
+                name = getattr(fn, "tool_name", getattr(fn, "__name__", str(fn)))
+                description = getattr(fn, "__doc__", "") or ""
+                parameters_schema = {}
+            tool_definitions.append(
+                ToolDefinition(
+                    name=name,
+                    description=description,
+                    function=fn,
+                    parameters_schema=parameters_schema,
+                    requires_hardware=True,
+                    category="robot",
+                )
+            )
+        return tool_definitions
 
     async def get_status(self) -> Dict[str, Any]:
         """Get current agent status and health information."""
         try:
-            is_controller_connected = await self.robot_controller.is_connected()
+            # is_connected() is SYNCHRONOUS (controller.py) — do NOT await it
+            # (awaiting a bool raised a TypeError that masked real health state).
+            # The task_manager / message_broker calls below are genuinely async
+            # and keep their await.
+            is_controller_connected = self.robot_controller.is_connected()
             running_tasks = await self.task_manager.list_tasks(
                 status=TaskStatus.RUNNING
             )

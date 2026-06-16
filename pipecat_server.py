@@ -26,14 +26,14 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair, LLMUserAggregatorParams
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.anthropic.llm import AnthropicLLMService
+from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMSettings
 from pipecat.services.aws.llm import AWSBedrockLLMService
 from pipecat.services.aws.stt import AWSTranscribeSTTService
 from pipecat.services.aws.tts import AWSPollyTTSService
 from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
 from pipecat.services.aws.nova_sonic.session_continuation import SessionContinuationParams
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
-from pipecat.services.deepgram.tts import DeepgramTTSService
+from pipecat.services.deepgram.tts import DeepgramTTSService, DeepgramTTSSettings
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, Language
 from pipecat.services.llm_service import LLMService
 from pipecat.services.mcp_service import MCPClient
@@ -53,9 +53,9 @@ LANGUAGE_PRESETS = {
     "en": {
         "deepgram": {
             "model": "nova-3",
-            "language": "multi",  # D-01: Nova-3 multi auto-detect (covers en/es/fr/de/hi/ru/pt/ja/it/nl)
+            "language": "multi",  # Nova-3 multi auto-detect (covers en/es/fr/de/hi/ru/pt/ja/it/nl)
         },
-        # D-02 static TTS routing: en is Aura-2-supported -> Deepgram TTS.
+        # Static TTS routing: en is Aura-2-supported -> Deepgram TTS.
         "tts_engine": "deepgram",
         "aura2_voice": "aura-2-thalia-en",
         "aws_transcribe": {
@@ -75,9 +75,9 @@ LANGUAGE_PRESETS = {
     "zh": {
         "deepgram": {
             "model": "nova-3",
-            "language": "zh",  # D-01 override: Mandarin is NOT in Nova-3 `multi`; use explicit zh
+            "language": "zh",  # Override: Mandarin is NOT in Nova-3 `multi`; use explicit zh
         },
-        # D-02/D-03 static TTS routing: Aura-2 does NOT support Mandarin -> ElevenLabs fallback.
+        # Static TTS routing: Aura-2 does NOT support Mandarin -> ElevenLabs fallback.
         "tts_engine": "elevenlabs",
         "aws_transcribe": {
             "language": "zh-CN",
@@ -109,11 +109,11 @@ LANGUAGE_PRESETS = {
     "ja": {
         "deepgram": {
             "model": "nova-3",
-            "language": "multi",  # D-01: moved off nova-2 — Nova-3 multi now covers Japanese
+            "language": "multi",  # Moved off nova-2 — Nova-3 multi now covers Japanese
         },
-        # D-02 static TTS routing: Japanese is Aura-2-supported -> Deepgram TTS.
+        # Static TTS routing: Japanese is Aura-2-supported -> Deepgram TTS.
         "tts_engine": "deepgram",
-        "aura2_voice": "aura-2-fujin-ja",  # [ASSUMED A1] confirm exact ja Aura-2 token at smoke test
+        "aura2_voice": "aura-2-fujin-ja",  # [ASSUMED] confirm exact ja Aura-2 token at smoke test
         "aws_transcribe": {
             "language": "ja-JP",
         },
@@ -131,11 +131,11 @@ LANGUAGE_PRESETS = {
     "es": {
         "deepgram": {
             "model": "nova-3",
-            "language": "multi",  # D-01: Nova-3 multi covers Spanish
+            "language": "multi",  # Nova-3 multi covers Spanish
         },
-        # D-02 static TTS routing: Spanish is Aura-2-supported -> Deepgram TTS.
+        # Static TTS routing: Spanish is Aura-2-supported -> Deepgram TTS.
         "tts_engine": "deepgram",
-        "aura2_voice": "aura-2-celeste-es",  # [ASSUMED A1] confirm exact es Aura-2 token at smoke test
+        "aura2_voice": "aura-2-celeste-es",  # [ASSUMED] confirm exact es Aura-2 token at smoke test
         "aws_transcribe": {
             "language": "es-ES",
         },
@@ -170,7 +170,7 @@ transport_params = {
 def _as_tool_result_object(response: str):
     """Coerce a tool's concatenated text response into a JSON-object result.
 
-    SPCH-04: function-call results flow through two serialization layers — the
+    Function-call results flow through two serialization layers — the
     universal aggregator does ``json.dumps(frame.result)`` and stores the string,
     then Nova Sonic forwards it verbatim. Nova Sonic's Bedrock side REJECTS a
     tool result whose top-level JSON is not an object:
@@ -247,7 +247,7 @@ class AsyncMCPClient(MCPClient):
 
     # Normal (non-long-running) tool timeout. The Pipecat 1.x default for
     # function_call_timeout_secs flipped to None, so without an explicit bound a
-    # stalled normal tool would hang the voice loop forever (PIPE-04 / D-02).
+    # stalled normal tool would hang the voice loop forever.
     NORMAL_TOOL_TIMEOUT_SECS: float = 30.0
 
     async def register_tools_schema(self, tools_schema, llm):
@@ -260,9 +260,9 @@ class AsyncMCPClient(MCPClient):
         flag, then register each tool with the parent's `self._tool_wrapper`.
 
         - long_running tools: cancel_on_interruption=False, timeout_secs=None (exempt —
-          legitimate multi-minute robot tasks must not be killed; D-02).
+          legitimate multi-minute robot tasks must not be killed).
         - normal tools: cancel_on_interruption=True, timeout_secs=NORMAL_TOOL_TIMEOUT_SECS
-          (true hangs are bounded; PIPE-04).
+          (true hangs are bounded).
         """
         # Recover the long_running flag per tool name from the live MCP session.
         long_running_by_name: dict[str, bool] = {}
@@ -301,7 +301,7 @@ class AsyncMCPClient(MCPClient):
 def resolve_aws_static_credentials():
     """Resolve AWS credentials via the botocore default provider chain.
 
-    SPCH-04: AWSNovaSonicLLMService builds a smithy StaticCredentialsResolver from
+    AWSNovaSonicLLMService builds a smithy StaticCredentialsResolver from
     the access_key_id/secret_access_key/session_token it is handed and does NOT walk
     the AWS credential chain itself. Reading only os.getenv("AWS_ACCESS_KEY_ID")/
     ("AWS_SECRET_ACCESS_KEY") therefore fails (SmithyIdentityError "credentials weren't
@@ -333,7 +333,7 @@ def _sanitize_schema_for_nova_sonic(node):
     """Recursively coerce a JSON-Schema fragment into the restricted shape that
     Nova Sonic's Bedrock tool validator accepts.
 
-    SPCH-04: Nova Sonic (amazon.nova-*-sonic) rejects tool inputSchemas that use
+    Nova Sonic (amazon.nova-*-sonic) rejects tool inputSchemas that use
     constructs its bidirectional-streaming tool validator does not support —
     surfacing as "Invalid input request, please fix your input and try again."
     the instant the tool-bearing prompt-start event is sent — even though the
@@ -491,9 +491,9 @@ async def run_jarvis(
         mode: The mode to use for the bot. Voice status update is only supported in cascaded mode.
         profile: The profile to use for the bot
         language: Language code for voice interface (en, zh, ja, es)
-        backend: Deepgram backend for the default profile (D-05). "hosted" (default) uses the
+        backend: Deepgram backend for the default profile. "hosted" (default) uses the
             hosted Deepgram STT/TTS; "sagemaker" uses the Deepgram-on-SageMaker services
-            (wired but NOT deployed this milestone — raises ValueError if no endpoint is set).
+            (wired but NOT yet deployed — raises ValueError if no endpoint is set).
     """
 
     logger.info(f"Starting bot")
@@ -512,7 +512,7 @@ async def run_jarvis(
     # Speech to speech
     if mode == "speech_to_speech":
         if profile == "aws":
-            # SPCH-04: Nova Sonic uses a static smithy credentials resolver, so resolve
+            # Nova Sonic uses a static smithy credentials resolver, so resolve
             # the full AWS chain (env vars, ~/.aws profiles, SSO) up front and pass the
             # frozen creds in. Fall back to explicit env vars if the chain resolves nothing.
             ns_access_key, ns_secret_key, ns_session_token = resolve_aws_static_credentials()
@@ -520,11 +520,11 @@ async def run_jarvis(
                 secret_access_key=ns_secret_key or os.getenv("AWS_SECRET_ACCESS_KEY"),
                 access_key_id=ns_access_key or os.getenv("AWS_ACCESS_KEY_ID"),
                 session_token=ns_session_token or os.getenv("AWS_SESSION_TOKEN"),
-                region=os.getenv("AWS_REGION"),  # SPCH-04: must be us-east-1 / us-west-2 / ap-northeast-1 for Nova-2 Sonic
-                model="amazon.nova-2-sonic-v1:0",  # SPCH-04 / D-04: Nova 2 Sonic (the default; explicit for testability)
+                region=os.getenv("AWS_REGION"),  # Must be us-east-1 / us-west-2 / ap-northeast-1 for Nova-2 Sonic
+                model="amazon.nova-2-sonic-v1:0",  # Nova 2 Sonic (the default; explicit for testability)
                 voice_id="matthew",  # Voices: matthew, tiffany, amy
-                function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
-                # D-04: native ~8-min context-carrying session rotation (no hand-rolled reconnect).
+                function_call_timeout_secs=30.0,  # Bound normal tool calls (long_running exempt per-tool)
+                # Native ~8-min context-carrying session rotation (no hand-rolled reconnect).
                 session_continuation=SessionContinuationParams(),
             )
         else:
@@ -552,7 +552,7 @@ async def run_jarvis(
                     temperature=0.1,
                     max_tokens=500,
                 ),
-                function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
+                function_call_timeout_secs=30.0,  # Bound normal tool calls (long_running exempt per-tool)
             )
 
             polly_config = language_preset["aws_polly"]
@@ -572,21 +572,21 @@ async def run_jarvis(
             deepgram_config = language_preset["deepgram"]
 
             if backend == "sagemaker":
-                # D-05 / SPCH-05: Deepgram-on-SageMaker is WIRED but NOT deployed this milestone.
+                # Deepgram-on-SageMaker is WIRED but NOT yet deployed.
                 # Require explicit endpoint env vars and raise (never silently fall back to hosted).
                 stt_endpoint = os.getenv("SAGEMAKER_STT_ENDPOINT_NAME")
                 if not stt_endpoint:
                     raise ValueError(
                         "DUME_DEEPGRAM_BACKEND=sagemaker requires SAGEMAKER_STT_ENDPOINT_NAME; "
-                        "the SageMaker endpoint is wired but NOT deployed this milestone"
+                        "the SageMaker endpoint is wired but NOT currently deployed"
                     )
                 tts_endpoint = os.getenv("SAGEMAKER_TTS_ENDPOINT_NAME")
                 if not tts_endpoint:
                     raise ValueError(
                         "DUME_DEEPGRAM_BACKEND=sagemaker requires SAGEMAKER_TTS_ENDPOINT_NAME; "
-                        "the SageMaker endpoint is wired but NOT deployed this milestone"
+                        "the SageMaker endpoint is wired but NOT currently deployed"
                     )
-                # Pitfall 1: lazy-import inside the branch so the default hosted path never
+                # Lazy-import inside the branch so the default hosted path never
                 # triggers the aws_sdk_sagemaker_runtime_http2 import.
                 from pipecat.services.deepgram.sagemaker.stt import DeepgramSageMakerSTTService
                 from pipecat.services.deepgram.sagemaker.tts import DeepgramSageMakerTTSService
@@ -599,7 +599,7 @@ async def run_jarvis(
                         language=deepgram_config["language"],
                     ),
                 )
-                # CR-01: honor the same per-language tts_engine routing as the hosted path.
+                # Honor the same per-language tts_engine routing as the hosted path.
                 # Aura-2 (Deepgram TTS, hosted or SageMaker) has no Mandarin voice, so zh must
                 # still route to ElevenLabs — otherwise the aura2_voice fallback would synthesize
                 # Mandarin with an English voice. ElevenLabs is a hosted service independent of
@@ -624,7 +624,7 @@ async def run_jarvis(
                         ),
                     )
             else:
-                # backend == "hosted" (default): hosted Deepgram STT (Nova-3 multi, D-01).
+                # backend == "hosted" (default): hosted Deepgram STT (Nova-3 multi).
                 stt = DeepgramSTTService(
                     api_key=os.getenv("DEEPGRAM_API_KEY"),
                     settings=DeepgramSTTSettings(
@@ -633,7 +633,7 @@ async def run_jarvis(
                     ),
                 )
 
-                # D-02/D-03 static per-language TTS routing: Aura-2 for supported languages,
+                # Static per-language TTS routing: Aura-2 for supported languages,
                 # ElevenLabs fallback for the rest (Mandarin — Aura-2 has no zh voice).
                 if language_preset.get("tts_engine") == "elevenlabs":
                     elevenlabs_config = language_preset["elevenlabs"]
@@ -649,14 +649,19 @@ async def run_jarvis(
                 else:
                     tts = DeepgramTTSService(
                         api_key=os.getenv("DEEPGRAM_API_KEY"),
-                        voice=language_preset.get("aura2_voice", "aura-2-thalia-en"),
+                        settings=DeepgramTTSSettings(
+                            voice=language_preset.get("aura2_voice", "aura-2-thalia-en"),
+                        ),
                     )
 
             llm = AnthropicLLMService(
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
-                model="claude-haiku-4-5",
-                params=AnthropicLLMService.InputParams(temperature=0.1, max_tokens=500),
-                function_call_timeout_secs=30.0,  # PIPE-04: bound normal tool calls (long_running exempt per-tool)
+                settings=AnthropicLLMSettings(
+                    model="claude-haiku-4-5",
+                    temperature=0.1,
+                    max_tokens=500,
+                ),
+                function_call_timeout_secs=30.0,  # Bound normal tool calls (long_running exempt per-tool)
             )
 
     # Use enhanced MCPClient to avoid interrupting long-running tools and enable voice updates on progress.
@@ -685,7 +690,7 @@ async def run_jarvis(
             # on_client_connected), so we must NOT inject the await-trigger instruction
             # here — keep only the greeting instruction.
             if mode == "speech_to_speech":
-                # SPCH-04: Nova Sonic's tool validator rejects the raw MCP schemas
+                # Nova Sonic's tool validator rejects the raw MCP schemas
                 # (anyOf/null, default, additionalProperties) with "Invalid input
                 # request" at session setup. Coerce to its restricted shape — this
                 # path only; the cascaded Claude path below tolerates them as-is.
@@ -831,7 +836,7 @@ async def bot(runner_args: RunnerArguments):
         logger.warning(f"Invalid profile '{profile}', falling back to 'default'")
         profile = "default"
 
-    # Validate Deepgram backend selector (D-05). An UNKNOWN value warns + falls back to
+    # Validate Deepgram backend selector. An UNKNOWN value warns + falls back to
     # hosted; the explicit "sagemaker" value (with no endpoint) is guarded downstream by a
     # ValueError in run_jarvis — never a silent fallback.
     if backend not in ["hosted", "sagemaker"]:

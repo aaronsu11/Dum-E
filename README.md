@@ -69,66 +69,73 @@ Choose the setup that best matches your needs and hardware availability. The fol
 ### 🔧 Installation
 
 #### 📦 On Single Workstation or Server
-> Requires 1) NVIDIA GPU 2) Linux or WSL2
+> Requires 1) NVIDIA GPU 2) Linux or WSL2 3) Docker with the NVIDIA Container Runtime
 
-1. Install required system dependencies
+The GR00T N1.7 policy server runs as a reproducible Docker container (x86 + NVIDIA
+GPU, or Jetson Orin). The container packages the server's CUDA / torch / flash-attn
+stack and serves inference on ZMQ port `5555`; the checkpoint and Hugging Face cache
+are mounted at runtime, never baked into the image.
 
-    ```bash
-    sudo apt-get update
-    sudo apt-get install ffmpeg libsm6 libxext6
-    ```
-
-2. Install CUDA toolkit 12.4
-
-    ```bash
-    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-    sudo dpkg -i cuda-keyring_1.1-1_all.deb
-    sudo apt-get update
-    sudo apt-get -y install cuda-toolkit-12-4
-    ```
-
-3. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (if not already installed):
-
-    ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    ```
-
-    > **Requirement:** uv **v0.8.4+** is needed to build `flash-attn` automatically.
-
-4. Clone Isaac-GR00T repository (including submodules):
+1. Clone the Isaac-GR00T repository (the build wrapper checks it out at a pinned commit):
 
     ```bash
     git clone --recurse-submodules https://github.com/NVIDIA/Isaac-GR00T
     ```
 
-5. Install Isaac-GR00T:
+2. Pre-fetch the checkpoint and the gated `nvidia/Cosmos-Reason2-2B` backbone into the
+   host Hugging Face cache. This is mandatory — the server loads the gated backbone at
+   startup and exits with `GatedRepoError` if it is not already cached. Request access
+   to `nvidia/Cosmos-Reason2-2B` on its Hugging Face page first, then:
 
     ```bash
-    cd Isaac-GR00T
-    git checkout n1.7-release
-    # Install FFmpeg (required by torchcodec, the default video backend)
-    sudo apt-get update && sudo apt-get install -y ffmpeg
-    # Create the environment and install GR00T
-    uv sync --python 3.10
-    # Verify the installation
-    uv run python -c "import gr00t; print('GR00T installed successfully')"
-    ```
-    Download a fine-tuned GR00T model from Hugging Face for the task you want to perform. For example, to pick up a fruit (apple, banana, orange, etc.) and put it on the plate, you can download our checkpoint by running:
-    ```bash
-    uv run hf download aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking --local-dir ./checkpoints/GR00T-N1.7-3B-SO101 --exclude "optimizer.pt"
+    export HF_TOKEN=<your-hf-token>
+    # SO101 fruit-picking checkpoint (mounted :ro at runtime)
+    uv run hf download aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking \
+        --local-dir ./checkpoints/GR00T-N1.7-3B-SO101 --exclude "optimizer.pt"
+    # Gated backbone (read from the mounted HF cache at runtime)
+    uv run hf download nvidia/Cosmos-Reason2-2B
     ```
 
-6. Start policy server
+3. Build the image at the pinned commit. The wrapper delegates to the upstream
+   `docker/build.sh`, failing closed if the checkout does not match the pin. Set
+   `GR00T_REPO` if your clone is not at `/home/<user>/Projects/Isaac-GR00T`.
 
-    Run the following command to start the gr00t policy server:
     ```bash
-    uv run python gr00t/eval/run_gr00t_server.py \
-    --model-path ./checkpoints/GR00T-N1.7-3B-SO101 \
-    --embodiment-tag new_embodiment \
-    --host 0.0.0.0 \
-    --port 5555
+    # x86 + NVIDIA GPU -> image tag: gr00t
+    bash scripts/build_gr00t_image.sh
+
+    # Jetson Orin (aarch64), run natively on the Orin -> image tag: gr00t-orin
+    bash scripts/build_gr00t_image.sh orin
     ```
-    This needs to be running as long as you are using the gr00t policy for inference. Note down the IP address of the policy server (`<policy_host>`) and make sure port 5555 is accessible from the client.
+
+4. Start the policy server. The checkpoint and HF cache are mounted `:ro`; `HF_TOKEN`
+   is passed at runtime via `-e` (never baked into the image).
+
+    ```bash
+    docker rm -f gr00t-server 2>/dev/null || true
+    docker run -d \
+        --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+        -p 5555:5555 \
+        -v "$(pwd)/checkpoints/GR00T-N1.7-3B-SO101:/checkpoints/model:ro" \
+        -v ~/.cache/huggingface:/root/.cache/huggingface:ro \
+        -e HF_TOKEN="$HF_TOKEN" \
+        --name gr00t-server \
+        gr00t \
+        uv run python gr00t/eval/run_gr00t_server.py \
+            --model-path /checkpoints/model \
+            --embodiment-tag new_embodiment --host 0.0.0.0 --port 5555
+    ```
+
+    The server is ready once port `5555` is listening and the model has finished
+    loading (GPU memory settles). Keep the container running while you use the policy
+    for inference. Note the server's IP (`<policy_host>`) and make sure port 5555 is
+    reachable from the client.
+
+> [!NOTE]
+> **Security:** the server has no auth by default. Publish/bind `:5555` to `localhost`
+> or a trusted subnet only — do not expose it to untrusted networks. Always build via
+> `scripts/build_gr00t_image.sh` (SHA-pinned), never an ad-hoc `docker build`, so the
+> image provenance stays locked to the verified upstream commit.
 
 #### On Single Workstation or Client
 
@@ -222,61 +229,6 @@ Choose the setup that best matches your needs and hardware availability. The fol
     > python dum_e.py --node servers --config my-dum-e.yaml
     > ```
 
-### 🧪 GR00T N1.7 manual smoke test
-
-The end-to-end inference path (live N1.7 policy server + SO-ARM101 picking real
-fruit) cannot run in CI — it requires the GPU policy server and physical
-hardware. This is the manual acceptance gate for the N1.7 client upgrade.
-Mocked-wiring unit tests cover every CI-runnable surface
-(`uv run pytest tests/test_robot_agent.py`); the steps below verify the one
-surface that can only be checked on real hardware.
-
-1. **Start the upstream Isaac-GR00T `n1.7-release` policy server** (run as-is —
-   the server is NOT modified by Dum-E) with the locked SO101 fruit-picking
-   checkpoint. From your Isaac-GR00T checkout on the GPU host:
-
-    ```bash
-    python gr00t/eval/run_gr00t_server.py \
-        --model-path aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking \
-        --embodiment-tag NEW_EMBODIMENT \
-        --port 5555
-    ```
-
-2. **Confirm reachability and fail-loud behavior.** The client `ping()` should
-   succeed with the server up. Then stop the server and confirm the client
-   raises a descriptive "Policy server unreachable at `<host>:5555`"
-   `RuntimeError` within ~45s rather than hanging indefinitely. Restart the
-   server before continuing.
-
-3. **Run the robot agent** against the live server with the SO101 arm connected
-   (substitute your serial port and policy host):
-
-    ```bash
-    python -m embodiment.so_arm10x.agent \
-        --port <serial> \
-        --id so101_follower_arm \
-        --wrist_cam_idx 0 \
-        --front_cam_idx 1 \
-        --policy_host <host> \
-        --profile aws \
-        --instruction "I want one banana on the plate"
-    ```
-
-4. **Observe the expected behavior:**
-    - The agent assesses the scene, drives N1.7 inference end-to-end, and the
-      SO101 arm executes the action sequence and picks the fruit.
-    - The agent/voice loop stays responsive throughout the multi-minute pick —
-      the blocking inference runs in a worker thread (`asyncio.to_thread`), so
-      the event loop is never blocked.
-    - A wrong embodiment tag or schema mismatch fails loudly with a descriptive
-      `RuntimeError` (no deep `KeyError`/`IndexError`, no silent corruption).
-
-> [!NOTE]
-> If the robot is not moving, confirm the policy server is reachable from the
-> client: `nc -zv <policy_host> 5555` (macOS/Linux) or
-> `Test-NetConnection -ComputerName <policy_host> -Port 5555` (Windows
-> PowerShell).
-
 ## 🏗️ Architecture Overview
 
 ### Core Components
@@ -339,7 +291,7 @@ graph TB
 ### Q4 2025
 
 - [ ] **Cross-Platform Support**
-  - [ ] Docker containers for platform-agnostic deployment
+  - [x] Docker containers for platform-agnostic deployment (x86 + Jetson Orin)
 
 - [ ] **ROS2 Integration**
   - [ ] Native ROS2 node implementation

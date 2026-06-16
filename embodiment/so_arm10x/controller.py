@@ -114,15 +114,13 @@ class Gr00tRobotInferenceClient:
                 "gripper": state[5:6].astype(np.float32),
             },
             "language": {
-                # PINNED N1.7 INFERENCE KEY (GR-02 / D-02 — do NOT "fix" this).
-                # `annotation.human.action.task_description` is the GR00T N1.6/N1.7
-                # *inference* observation key the policy server expects at request
-                # time. It is explicitly NOT the LeRobot *dataset* annotation field
-                # (`human.task_description` in modality.json), and NOT the older
-                # N1.5 form. The verified obs-build/decode below depends on this
-                # exact key; a silent edit here would surface as a wrong-embodiment
-                # decode (RESEARCH §Pitfall 1 / threat T-03-05).
-                "annotation.human.action.task_description": lang or self.language_instruction
+                # PINNED N1.7 INFERENCE KEY (GR-02 / D-02).
+                # Confirmed against: checkpoint experiment_cfg/conf.yaml language
+                # modality_keys AND the upstream SO100 real-robot eval script
+                # (gr00t/eval/real_robot/SO100/eval_so100.py:128) AND validated by
+                # live server strict-mode rejection of the .action. variant.
+                # The correct key is `annotation.human.task_description` (NO `.action.`).
+                "annotation.human.task_description": lang or self.language_instruction
             },
         }
 

@@ -290,12 +290,8 @@ graph TB
 
 ### Q4 2025
 
-- [ ] **Cross-Platform Support**
+- [x] **Cross-Platform Support**
   - [x] Docker containers for platform-agnostic deployment (x86 + Jetson Orin)
-
-- [ ] **ROS2 Integration**
-  - [ ] Native ROS2 node implementation
-  - [ ] Integration with existing ROS toolkits
 
 ### 🔬 Ongoing: Research Initiatives
 - [ ] **Embodied AI Research**

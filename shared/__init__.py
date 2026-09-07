@@ -155,6 +155,88 @@ class IRobotController(ABC):
         pass
 
 
+class IPolicyBackend(ABC):
+    """
+    Interface for policy (inference) backend abstraction.
+
+    Covers every policy call site in the codebase so a robot skill can drive an
+    action policy without knowing which inference stack serves it. Concrete
+    backends are selected by ``policy.factory.make_policy_backend()`` via the
+    ``DUME_POLICY_BACKEND`` environment variable.
+
+    Every member is deliberately SYNCHRONOUS. Concurrency is handled at the
+    ``@tool`` boundary in ``embodiment/so_arm10x/agent.py`` via
+    ``await asyncio.to_thread(sync_method, *args)``; an ``async def`` here would
+    break that offload pattern and every existing call site.
+    """
+
+    @abstractmethod
+    def get_action(
+        self, observation_dict: dict[str, Any], lang: str | None = None
+    ) -> list[dict[str, float]]:
+        """Run one inference step and return a list of per-timestep action dicts.
+
+        Args:
+            observation_dict: Raw observation keyed by camera name and
+                ``"<joint>.pos"`` — the shape produced by
+                ``IRobotController.get_observation()``.
+            lang: Instruction to condition on. When omitted, the backend falls
+                back to its stored ``language_instruction``.
+
+        Returns:
+            A list (length = action horizon) of ``{"<joint>.pos": float}`` dicts.
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def language_instruction(self) -> str | None:
+        """The instruction the backend conditions on when ``lang`` is omitted.
+
+        Read-only: mutate it through ``set_lang_instruction`` so a backend can
+        validate/normalize the value. Declared as a property (not a method) to
+        stay source-compatible with the parenthesis-free read at
+        ``embodiment/so_arm10x/skills.py``.
+        """
+        pass
+
+    @abstractmethod
+    def set_lang_instruction(self, lang_instruction: str) -> None:
+        """Set the stored language instruction."""
+        pass
+
+    @abstractmethod
+    def ping(self) -> bool:
+        """Check backend reachability. Returns False rather than raising."""
+        pass
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Reset per-episode backend state (e.g. recreate the transport socket).
+
+        Must be safe to call when nothing is in flight.
+        """
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        """Release backend resources. MUST be idempotent."""
+        pass
+
+    @contextmanager
+    def session(self):
+        """Scope a backend to one episode: ``reset()`` on entry, ``close()`` on exit.
+
+        ``close()`` runs in a ``finally`` so the lifecycle cannot be forgotten at
+        a call site, and a raising body still releases the transport.
+        """
+        self.reset()
+        try:
+            yield self
+        finally:
+            self.close()
+
+
 class IRobotAgent(ABC):
     """
     Interface for robot agent implementations.

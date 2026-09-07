@@ -155,6 +155,19 @@ class Gr00tRobotInferenceClient(IPolicyBackend):
     def get_action(
         self, observation_dict: Dict[str, Any], lang: Optional[str] = None
     ) -> List[Dict[str, float]]:
+        # Fail closed on a missing instruction rather than sending a null under
+        # the pinned annotation key: the server accepts it and returns motion
+        # conditioned on nothing, which reads downstream as checkpoint drift
+        # instead of as the configuration error it is.
+        instruction = lang or self._language_instruction
+        if not instruction:
+            raise ValueError(
+                "No language instruction: get_action() was called without a `lang` "
+                "argument and no instruction is stored on the backend. Pass `lang` "
+                "or call set_lang_instruction() first — a null "
+                "`annotation.human.task_description` must never reach the policy."
+            )
+
         # Build nested obs dict for new Isaac-GR00T API
         state = np.array([observation_dict[k] for k in self.robot_state_keys])
         obs_dict: Dict[str, Any] = {
@@ -170,7 +183,7 @@ class Gr00tRobotInferenceClient(IPolicyBackend):
                 # (gr00t/eval/real_robot/SO100/eval_so100.py:128) AND validated by
                 # live server strict-mode rejection of the .action. variant.
                 # The correct key is `annotation.human.task_description` (NO `.action.`).
-                "annotation.human.task_description": lang or self.language_instruction
+                "annotation.human.task_description": instruction
             },
         }
 

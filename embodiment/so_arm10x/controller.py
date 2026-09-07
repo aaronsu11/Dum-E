@@ -436,6 +436,82 @@ _MOTOR_NAMES: Tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# The joint-value convention (LR-03 / D-03)
+# ---------------------------------------------------------------------------
+#
+# `use_degrees` decides whether the motor bus reports and accepts joint values as
+# degrees (`MotorNormMode.DEGREES`) or as percent of the calibrated range
+# (`MotorNormMode.RANGE_M100_100`). It is part of the checkpoint's input
+# contract: the same physical pose yields different numbers into the policy under
+# the two conventions.
+#
+# THE RECORDED VERDICT IS PERCENT MODE — `RANGE_M100_100`, i.e.
+# `use_degrees=False`. See `docs/UNITS-VERDICT.md` for the evidence (a plus/minus
+# 100.0 clip fingerprint on seven checkpoint statistics, an `elbow_flex`
+# falsification, and a `wrist_roll` cross-check against the training dataset).
+# That document is the single source; this comment deliberately does not restate
+# its argument.
+#
+# AND THE VALUE BELOW IS NONETHELESS `True`, THE CURRENT EFFECTIVE SETTING.
+# The flip is deferred, not forgotten. Four hardcoded pose vectors in this module
+# encode today's convention implicitly, so flipping without converting them in
+# the same change would clip the initial pose's `shoulder_lift` of -102 to the
+# percent-mode boundary and move `wrist_roll` roughly 60 degrees from where the
+# policy was trained — and it would invalidate the live re-baseline. This key
+# exists precisely so that the verdict can be acted on later WITHOUT a code edit.
+DEFAULT_USE_DEGREES: bool = True
+
+# Recognised boolean spellings. The set is closed on purpose: YAML yields the
+# bare string "false" for some unquoted shapes, and every non-empty string is
+# truthy in Python, so an unrecognised value must RAISE rather than be silently
+# read as True — which would silently select the degrees convention.
+_TRUE_SPELLINGS = frozenset({"1", "true", "t", "yes", "y", "on"})
+_FALSE_SPELLINGS = frozenset({"0", "false", "f", "no", "n", "off"})
+
+
+def coerce_bool(value: Any, name: str) -> bool:
+    """Coerce ``value`` to ``bool`` explicitly, raising on anything unrecognised.
+
+    Raises:
+        ValueError: ``value`` is a string outside the recognised spellings, or a
+            type that has no unambiguous boolean reading.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_SPELLINGS:
+            return True
+        if token in _FALSE_SPELLINGS:
+            return False
+        raise ValueError(
+            f"{name} must be one of {sorted(_TRUE_SPELLINGS)} or "
+            f"{sorted(_FALSE_SPELLINGS)}; got {value!r}. Refusing to guess: every "
+            f"non-empty string is truthy in Python, so guessing would silently "
+            f"select the degrees convention."
+        )
+    raise ValueError(
+        f"{name} must be a bool or a recognised boolean string; got {value!r} of "
+        f"type {type(value).__name__}"
+    )
+
+
+def resolve_use_degrees(value: "bool | str | None" = None) -> bool:
+    """Resolve the joint-value convention: argument, then env, then the default.
+
+    Mirrors the serial-port fallback in :class:`SO10xArmController`. The
+    environment value is coerced through :func:`coerce_bool`, never trusted for
+    its truthiness.
+    """
+    if value is None:
+        raw = os.getenv("DUME_USE_DEGREES")
+        if raw is None or not raw.strip():
+            return DEFAULT_USE_DEGREES
+        return coerce_bool(raw, "DUME_USE_DEGREES")
+    return coerce_bool(value, "use_degrees")
+
+
+# ---------------------------------------------------------------------------
 # The per-step motion clamp (SAFE-02)
 # ---------------------------------------------------------------------------
 #
@@ -624,7 +700,7 @@ class SO10xArmController(IRobotController):
         *,
         wrist_cam_idx: int = 0,
         front_cam_idx: int = 1,
-        use_degrees: bool = True,
+        use_degrees: "bool | str | None" = None,
         max_relative_target: "float | Dict[str, float] | None" = None,
     ) -> None:
         if robot_port is None:
@@ -641,6 +717,21 @@ class SO10xArmController(IRobotController):
         # reaches the config, since upstream only rejects a bad clamp at the
         # moment the clamp engages.
         max_relative_target = resolve_max_relative_target(max_relative_target)
+
+        # LR-03 / D-03: same fallback shape. The environment string is coerced
+        # explicitly rather than trusted for truthiness.
+        use_degrees = resolve_use_degrees(use_degrees)
+
+        # D-03 requires the EFFECTIVE value to be visible in the log, so the
+        # running convention and the active clamp can be read off a session
+        # without reconstructing the config precedence chain.
+        logger.info(
+            "Controller units/safety config: use_degrees={} max_relative_target={} "
+            "(recorded units verdict is percent mode — see docs/UNITS-VERDICT.md; "
+            "the flip is deferred, so this ships at its current effective value)",
+            use_degrees,
+            max_relative_target,
+        )
 
         # Store robot_id for the id property
         self._robot_id = robot_id

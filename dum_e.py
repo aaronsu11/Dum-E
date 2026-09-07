@@ -122,11 +122,29 @@ def _spawn_agent_worker(
     # to pin which network commands the arm must win over a stale my-dum-e.yaml
     # value — do NOT unconditionally overwrite an already-set env var with the
     # config value, which is exactly what `env.update` would do.
+    controller_cfg = controller_config or {}
     policy_env_defaults = {
-        "DUME_POLICY_BACKEND": (controller_config or {}).get(
-            "policy_backend", "groot-native"
-        ),
+        "DUME_POLICY_BACKEND": controller_cfg.get("policy_backend", "groot-native"),
     }
+
+    # LR-03 / D-03 and SAFE-02: the joint-value convention and the per-step motion
+    # clamp are forwarded only when the config actually names them, so their
+    # defaults live in exactly one place (embodiment/so_arm10x/controller.py) and
+    # cannot drift between the launcher and the process that owns the arm.
+    #
+    # `use_degrees` is stringified lowercase so the controller's explicit boolean
+    # coercion recognises it. Do NOT rely on truthiness here: a YAML `false`
+    # arriving as the string "false" is truthy in Python, which is exactly the
+    # trap the controller's coerce_bool() closes.
+    if "use_degrees" in controller_cfg:
+        policy_env_defaults["DUME_USE_DEGREES"] = str(
+            controller_cfg["use_degrees"]
+        ).lower()
+    if "max_relative_target" in controller_cfg:
+        policy_env_defaults["DUME_MAX_RELATIVE_TARGET"] = str(
+            controller_cfg["max_relative_target"]
+        )
+
     for env_key, config_value in policy_env_defaults.items():
         # setdefault: only apply the config/default value when the operator has
         # not already exported the variable in the shell environment.
@@ -178,10 +196,18 @@ def _spawn_agent_worker(
             )
 
     policy_backend_display = env.get("DUME_POLICY_BACKEND", "groot-native")
+    # "controller default" rather than a restated literal: the authoritative
+    # effective value is logged by the controller itself at construction, and
+    # duplicating the default here is how the two drift apart.
+    use_degrees_display = env.get("DUME_USE_DEGREES", "controller default")
+    clamp_display = env.get("DUME_MAX_RELATIVE_TARGET", "controller default")
     logger.info(
-        "Starting agent worker with namespace={} policy_backend={} and args={}",
+        "Starting agent worker with namespace={} policy_backend={} "
+        "use_degrees={} max_relative_target={} and args={}",
         config.namespace,
         policy_backend_display,
+        use_degrees_display,
+        clamp_display,
         agent_args,
     )
     return subprocess.Popen(cmd, env=env)

@@ -52,10 +52,37 @@ controller:
   front_cam_idx: 1 # the OpenCV index of the front camera
   show_images: false # show camera images for debugging (may slow down the robot)
 
+  # Joint-value convention fed to the policy and used for this module's
+  # hardcoded poses. Forwarded to the agent worker as DUME_USE_DEGREES; an
+  # exported shell value wins over this file.
+  #   true  -> MotorNormMode.DEGREES
+  #   false -> MotorNormMode.RANGE_M100_100 (percent of the calibrated range)
+  # The RECORDED VERDICT for the GR00T-N1.7-3B-SO101 checkpoint is percent mode,
+  # i.e. false -- see docs/UNITS-VERDICT.md for the evidence. The value shipped
+  # here is nonetheless `true`, the CURRENT EFFECTIVE setting, because the flip is
+  # deferred: four hardcoded pose vectors in the controller encode today's
+  # convention implicitly and must be converted in the same change as the flip.
+  # This key exists so that flip needs no code edit when it is taken.
+  use_degrees: true
+
+  # Per-step motion clamp, in the same units as the joint values above (SAFE-02).
+  # Any commanded per-joint delta larger than this is clipped toward the present
+  # position and the clamp is logged. Must be a positive FLOAT -- an int raises a
+  # TypeError inside the clamp at the exact moment it would have engaged. Set to
+  # "none" via DUME_MAX_RELATIVE_TARGET to disable it (not recommended).
+  # 160.0 is derived from the checkpoint's own per-timestep relative-action
+  # extreme (137.47) plus a 15% margin; see the provenance comment on
+  # DEFAULT_MAX_RELATIVE_TARGET in embodiment/so_arm10x/controller.py.
+  max_relative_target: 160.0
+
   # Policy server settings
   policy_host: "localhost" # the host IP of the policy server
   policy_port: 5555 # the port of the policy server
-  action_horizon: 8 # the number of action steps to generate each time
+  # Number of action steps to execute from each predicted chunk. Pinned to 16,
+  # the checkpoint's real action horizon (the legacy value of 8 truncated the
+  # learned chunk, and the checkpoint's own config.json advertises 40, which is
+  # a trap). Read by this module's offline eval entrypoint.
+  action_horizon: 16
 
   # Which inference backend serves the policy. Forwarded to the agent worker as
   # DUME_POLICY_BACKEND; an exported shell value wins over this file.

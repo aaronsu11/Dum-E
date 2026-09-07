@@ -601,6 +601,111 @@ class TestSpawnAgentWorker:
         assert env["DUME_POLICY_BACKEND"] == "groot-native"
 
     @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_forwards_use_degrees_from_config(self, mock_popen):
+        """LR-03/D-03: controller.use_degrees is forwarded as DUME_USE_DEGREES.
+
+        The joint-value convention was a constructor default before this, so it
+        could only be changed by editing code — and lerobot 0.6.x independently
+        flipped its OWN default, meaning today's behaviour survived by
+        coincidence. Making it configuration is what lets docs/UNITS-VERDICT.md's
+        verdict be acted on later without a code edit.
+        """
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+
+        # clear=True guarantees no inherited DUME_USE_DEGREES leaks in.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"use_degrees": True}
+            )
+        assert mock_popen.call_args[1]["env"]["DUME_USE_DEGREES"] == "true"
+
+        # Absent from the config, the key is not forwarded at all: the default
+        # lives in the controller, so restating it here could only drift.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(config, agent_args, controller_config={})
+        assert "DUME_USE_DEGREES" not in mock_popen.call_args[1]["env"]
+
+        # And an exported shell value wins over the config file (env.setdefault).
+        with mock.patch.dict(os.environ, {"DUME_USE_DEGREES": "false"}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"use_degrees": True}
+            )
+        assert mock_popen.call_args[1]["env"]["DUME_USE_DEGREES"] == "false"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_use_degrees_string_false_coerces_to_false(
+        self, mock_popen
+    ):
+        """A YAML `false` spelling must become a real False, not a truthy string.
+
+        This is the operative edge for LR-03. Env vars are always strings, and
+        every non-empty string is truthy in Python — so `if os.getenv(...)` would
+        read "false" as True and silently select the degrees convention. The
+        launcher forwards a recognised spelling and the controller coerces it
+        explicitly; both halves are asserted here because either alone would let
+        the trap through.
+        """
+        from embodiment.so_arm10x.controller import resolve_use_degrees
+
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+
+        for config_value in (False, "false", "False"):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                dum_e._spawn_agent_worker(
+                    config, agent_args, controller_config={"use_degrees": config_value}
+                )
+            forwarded = mock_popen.call_args[1]["env"]["DUME_USE_DEGREES"]
+            assert forwarded == "false", (config_value, forwarded)
+
+            # The truthiness trap, stated plainly: the forwarded value IS truthy.
+            assert bool(forwarded) is True
+            # ...and the controller nonetheless resolves it to a real False.
+            with mock.patch.dict(
+                os.environ, {"DUME_USE_DEGREES": forwarded}, clear=True
+            ):
+                assert resolve_use_degrees(None) is False
+
+        # An unrecognised spelling raises rather than defaulting to True.
+        with mock.patch.dict(os.environ, {"DUME_USE_DEGREES": "maybe"}, clear=True):
+            with pytest.raises(ValueError):
+                resolve_use_degrees(None)
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_forwards_max_relative_target_from_config(
+        self, mock_popen
+    ):
+        """SAFE-02: controller.max_relative_target is forwarded as a float string.
+
+        The clamp must reach the config as a float — an int raises TypeError
+        inside the clamp helper at the exact moment the clamp would have engaged —
+        so the forwarded string has to parse back as one.
+        """
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"max_relative_target": 160.0}
+            )
+        forwarded = mock_popen.call_args[1]["env"]["DUME_MAX_RELATIVE_TARGET"]
+        assert float(forwarded) == 160.0
+        assert isinstance(float(forwarded), float)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(config, agent_args, controller_config={})
+        assert "DUME_MAX_RELATIVE_TARGET" not in mock_popen.call_args[1]["env"]
+
+        with mock.patch.dict(
+            os.environ, {"DUME_MAX_RELATIVE_TARGET": "12.5"}, clear=True
+        ):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"max_relative_target": 160.0}
+            )
+        assert mock_popen.call_args[1]["env"]["DUME_MAX_RELATIVE_TARGET"] == "12.5"
+
+    @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_env_inheritance(self, mock_popen):
         """Test that agent worker inherits current environment."""
         config = BackendConfig(namespace="test")

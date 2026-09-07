@@ -253,7 +253,9 @@ def test_capture_observation_assembly_matches_controller(mocker):
     client.camera_keys = list(capture.CAMERA_KEYS)
     client.robot_state_keys = list(capture.ROBOT_STATE_KEYS)
     client.show_images = False
-    client.language_instruction = None
+    # `language_instruction` is a read-only property; seed the backing field the
+    # same way `__init__` does, since this client is built via `__new__`.
+    client._language_instruction = None
     client.modality_keys = ["single_arm", "gripper"]
 
     seen: dict = {}

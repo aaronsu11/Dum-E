@@ -239,9 +239,22 @@ NVIDIA_CUDA_PREFIX = "nvidia-cuda"
 # for a permanently red assertion is to gut the whole guard. Do not add them
 # here to make the guard look stricter.
 #
-# diffusers is likewise absent for now: it is in the CURRENT resolved closure via
-# the incumbent lerobot pin and only leaves when the version bump lands, so it is
-# added in the same change that makes it satisfiable.
+# diffusers was ADDED HERE, in plan 05-04, by the same commit that bumps lerobot
+# from 0.3.3 to 0.6.1 — because that bump is what makes the assertion satisfiable.
+# diffusers 0.38.0 was a member of the resolved closure under the incumbent 0.3.3
+# pin and is not a base dependency of 0.6.1 (it lives only in the groot extra), so
+# this entry would have FAILED before that commit and passes after it. That
+# fail-first property is the non-vacuity proof for the whole resolved-closure
+# assertion: an entry that has never been red is an entry that has never been
+# tested.
+#
+# `av` is DELIBERATELY NOT here, and it is the one name in the bump's
+# dataset-reader group that survives. av 16.1.0 is required by aiortc
+# (av<17.0.0,>=14.0.0), which pipecat-ai pulls through its webrtc extra for the
+# voice transport — verified with `uv tree --invert --package av`. Its presence is
+# nothing to do with lerobot's dataset extra, so asserting its absence would be
+# unsatisfiable-by-construction in the same way a resolved-`torch` assertion would
+# be, and its only available remedy would be dropping WebRTC voice support.
 FORBIDDEN_RESOLVED_PACKAGES = frozenset(
     {
         "flash-attn",
@@ -251,6 +264,7 @@ FORBIDDEN_RESOLVED_PACKAGES = frozenset(
         "dm-tree",
         "peft",
         "timm",
+        "diffusers",
     }
 )
 
@@ -419,6 +433,50 @@ def test_client_lock_has_no_server_only_packages():
     assert leaked == [], f"server-only packages in the resolved closure: {leaked}"
 
 
+def test_client_lock_no_longer_resolves_diffusers():
+    """diffusers has left the resolved closure, and the denylist says so.
+
+    This is the guard's own non-vacuity proof, asserted against the REAL lockfile
+    rather than a synthetic one. diffusers 0.38.0 was in the closure under the
+    incumbent ``lerobot[feetech]==0.3.3`` pin; it is not a base dependency of
+    0.6.1 (only the groot extra pulls it). So this test would have failed before
+    the bump commit and passes after it — an entry with a demonstrated fail-first
+    property, not a name added because it was already absent.
+
+    A future regression here means something re-introduced the model stack, most
+    likely the groot extra. The correct response is to find what pulled it in, not
+    to remove diffusers from ``FORBIDDEN_RESOLVED_PACKAGES``.
+    """
+    resolved = resolved_package_names(read_lock_text(REPO_ROOT / "uv.lock"))
+    assert "diffusers" not in resolved, (
+        "diffusers is back in the resolved closure — investigate which dependency "
+        "reintroduced it (the lerobot groot extra is the likely cause); do not "
+        "remove it from the denylist"
+    )
+    # And the denylist carries it, so the closure check above is what enforces it.
+    assert "diffusers" in FORBIDDEN_RESOLVED_PACKAGES
+
+
+def test_client_lock_no_longer_resolves_the_dataset_reader_stack():
+    """The dataset readers 0.6.0 moved behind the ``dataset`` extra are gone.
+
+    lerobot 0.6.0 stopped bundling dataset dependencies; five of the six readers
+    that were present only as a side effect of the 0.3.3 pin leave with the bump.
+    Asserted against the real lockfile so a later ``lerobot[dataset]`` addition is
+    caught as the closure enlargement it is.
+
+    ``av`` is deliberately excluded from this list: it is required by aiortc for
+    the WebRTC voice transport (``uv tree --invert --package av``), so it never
+    depended on the lerobot pin and its presence is not a dataset-extra leak.
+    """
+    resolved = set(resolved_package_names(read_lock_text(REPO_ROOT / "uv.lock")))
+    readers = {"torchcodec", "pandas", "pyarrow", "datasets", "jsonlines"}
+    assert readers & resolved == set(), (
+        f"dataset-reading packages back in the resolved closure: "
+        f"{sorted(readers & resolved)} — check whether the dataset extra was added"
+    )
+
+
 # --- Negative tests: the guard has teeth (roadmap criterion 5) ---------------
 #
 # Each drives a helper with SYNTHETIC input. No test mutates the real
@@ -492,9 +550,16 @@ def test_guard_detects_forbidden_package_in_resolved_lock():
     assert "torchvision" not in FORBIDDEN_RESOLVED_PACKAGES
     assert not any(p.startswith("nvidia-") for p in FORBIDDEN_RESOLVED_PACKAGES)
 
-    # diffusers is NOT in the set yet: it is in the current closure via the
-    # incumbent lerobot pin and only leaves when the bump lands (plan 05-04).
-    assert "diffusers" not in FORBIDDEN_RESOLVED_PACKAGES
+    # diffusers IS in the set as of plan 05-04, added by the same commit that
+    # bumped lerobot to 0.6.1 and thereby made the assertion satisfiable. Before
+    # that commit this entry was red; that is the point of it.
+    assert "diffusers" in FORBIDDEN_RESOLVED_PACKAGES
+    injected_diffusers = '[[package]]\nname = "diffusers"\nversion = "0.38.0"\n'
+    assert forbidden_resolved_packages(injected_diffusers) == ["diffusers"]
+
+    # av is NOT in the set: it resolves legitimately via aiortc <- pipecat-ai's
+    # webrtc extra, so asserting its absence would be unsatisfiable.
+    assert "av" not in FORBIDDEN_RESOLVED_PACKAGES
 
 
 def test_guard_normalizes_distribution_names_per_pep503():

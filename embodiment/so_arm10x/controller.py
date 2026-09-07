@@ -36,13 +36,8 @@ import draccus
 import matplotlib.pyplot as plt
 import numpy as np
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
-from lerobot.robots import (
-    Robot,
-    RobotConfig,
-    make_robot_from_config,
-    so100_follower,
-    so101_follower,
-)  # noqa: F401
+from lerobot.robots import Robot, RobotConfig, make_robot_from_config  # noqa: F401
+from lerobot.robots.so_follower import SOFollower
 from lerobot.utils.utils import init_logging, log_say
 
 from shared import IPolicyBackend, IRobotController
@@ -306,9 +301,23 @@ class SO10xArmController(IRobotController):
             ),
         }
 
-        # Build the appropriate config subclass for the chosen robot type
+        # Build the appropriate config subclass for the chosen robot type.
+        #
+        # `robot_type` stays "so101_follower"/"so100_follower": lerobot 0.6.1
+        # consolidated the two modules into `lerobot.robots.so_follower` but kept
+        # BOTH names registered as draccus config choices, and the consolidated
+        # name "so_follower" is NOT a registered choice — renaming it here would
+        # raise. The branch therefore selects on Dum-E's own string, not on the
+        # class: `SO100FollowerConfig is SO101FollowerConfig` (both alias
+        # `SOFollowerRobotConfig`) and `SO100Follower is SO101Follower is
+        # SOFollower`, so the classes cannot discriminate.
+        #
+        # Do NOT read `self.config.type` as the model identity: draccus's
+        # `get_choice_name` returns the first registry key matching the class,
+        # which is "so100_follower" even for an SO-101 arm. Model identity comes
+        # from the `robot_type` argument above, which Dum-E controls.
         if robot_type == "so101_follower":
-            from lerobot.robots.so101_follower import SO101FollowerConfig
+            from lerobot.robots.so_follower import SO101FollowerConfig
 
             self.config = SO101FollowerConfig(
                 id=robot_id,
@@ -319,7 +328,7 @@ class SO10xArmController(IRobotController):
             )
         elif robot_type == "so100_follower":
             # Fall back to SO-100 if desired
-            from lerobot.robots.so100_follower import SO100FollowerConfig  # type: ignore
+            from lerobot.robots.so_follower import SO100FollowerConfig  # type: ignore
 
             self.config = SO100FollowerConfig(
                 id=robot_id,
@@ -331,9 +340,9 @@ class SO10xArmController(IRobotController):
         else:
             raise ValueError(f"Unsupported robot_type: {robot_type}")
 
-        self.robot: so100_follower.SO100Follower | so101_follower.SO101Follower = (
-            make_robot_from_config(self.config)
-        )
+        # `SO100Follower is SO101Follower is SOFollower` at 0.6.1, so the single
+        # consolidated class is the exact annotation for both branches.
+        self.robot: SOFollower = make_robot_from_config(self.config)
 
         # Cache ordering used for vector<->dict conversions
         self._state_keys: List[str] = [

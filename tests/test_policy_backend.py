@@ -16,6 +16,7 @@ an ephemeral port.
 
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -27,7 +28,11 @@ import pytest
 import zmq
 
 from embodiment.so_arm10x.controller import Gr00tRobotInferenceClient
-from policy.factory import make_policy_backend
+from policy.factory import (
+    DEFAULT_POLICY_BACKEND,
+    POLICY_BACKENDS,
+    make_policy_backend,
+)
 from policy.gr00t.service import MsgSerializer
 from shared import IPolicyBackend
 
@@ -168,3 +173,187 @@ def test_groot_native_end_to_end_over_real_socket(mock_server):
                 assert all(isinstance(v, float) for v in step.values())
         finally:
             backend.close()
+
+
+# --- BACK-02/03/04: the selector is FAIL-CLOSED ------------------------------
+
+
+def test_unknown_backend_raises_with_value_and_allowlist():
+    """BACK-03: an unknown value RAISES; it never warns and falls back.
+
+    Deliberate divergence from the DUME_DEEPGRAM_BACKEND analog, which warns and
+    defaults to 'hosted'. Silently swapping which neural network commands a
+    physical arm is worse than a crash. The message must name the offending value
+    AND the full allowlist so the operator can fix it without reading the source.
+    """
+    with mock.patch.dict(
+        os.environ, {"DUME_POLICY_BACKEND": "nonsense"}, clear=True
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            make_policy_backend(host="127.0.0.1")
+
+    message = str(excinfo.value)
+    assert "nonsense" in message
+    for allowed in POLICY_BACKENDS:
+        assert allowed in message
+
+
+def test_default_backend_is_lerobot():
+    """BACK-02: with DUME_POLICY_BACKEND unset, the selected backend is 'lerobot'.
+
+    Observable through the lerobot branch's own raise — proving the CODE-level
+    default rather than a config-file default. clear=True guarantees no inherited
+    DUME_POLICY_BACKEND leaks in from the runner environment.
+    """
+    assert DEFAULT_POLICY_BACKEND == "lerobot"
+
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert os.getenv("DUME_POLICY_BACKEND") is None
+        with pytest.raises(ValueError) as excinfo:
+            make_policy_backend(host="127.0.0.1")
+
+    assert "lerobot" in str(excinfo.value)
+
+
+def test_lerobot_backend_raises_actionable_not_implemented():
+    """BACK-04: 'lerobot' is KNOWN but not wired until Phase 6 — raise actionably.
+
+    The message must name the variable, the selected value, the phase that lands
+    the backend, and the alternative that works today.
+    """
+    with mock.patch.dict(
+        os.environ, {"DUME_POLICY_BACKEND": "lerobot"}, clear=True
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            make_policy_backend(host="127.0.0.1")
+
+    message = str(excinfo.value)
+    assert "DUME_POLICY_BACKEND" in message
+    assert "lerobot" in message
+    assert "Phase 6" in message
+    assert "groot-native" in message
+
+
+def test_factory_module_import_pulls_no_torch_or_lerobot():
+    """Lazy-import discipline (BACK-06): importing the factory stays torch-free.
+
+    Run in a SUBPROCESS so the assertion is unaffected by whatever the rest of
+    the suite already imported. The groot-native path must not pay for the
+    LeRobot/GPU stack that the Phase 6 lerobot branch will pull in.
+    """
+    probe = (
+        "import sys; import policy.factory; "
+        "forbidden = sorted(m for m in sys.modules "
+        "if m == 'torch' or m.startswith('torch.') "
+        "or m == 'grpc' or m.startswith('grpc.') "
+        "or m == 'lerobot' or m.startswith('lerobot.')); "
+        "print(','.join(forbidden))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    leaked = result.stdout.strip()
+    assert leaked == "", f"policy.factory import leaked heavy modules: {leaked}"
+
+
+def test_factory_never_builds_an_import_from_the_env_value():
+    """ASVS V5 / T-05-01: the allowlist plus explicit branches is the WHOLE
+    validation surface. No eval, no importlib path built from the raw env string,
+    no getattr keyed by it — those would turn a config string into code
+    selection."""
+    source = (REPO_ROOT / "policy" / "factory.py").read_text(encoding="utf-8")
+    assert "eval(" not in source
+    assert "importlib" not in source
+    assert "__import__" not in source
+    # The allowlist is a literal tuple, not something derived at runtime.
+    assert POLICY_BACKENDS == ("lerobot", "groot-native")
+
+
+# --- BACK-01 edge cases: adjacency / empty / ordering ------------------------
+
+
+def test_language_instruction_is_readonly_property():
+    """BACK-01 adjacency edge: two names that are exactly equal on the ABC do not
+    collide. `language_instruction` is a read-only @property backed by a field,
+    so skills.py's parenthesis-free READ works while assignment is rejected —
+    mutation goes through set_lang_instruction, which a backend can validate."""
+    client = Gr00tRobotInferenceClient(host="127.0.0.1", port=_free_port())
+    try:
+        assert isinstance(
+            type(client).language_instruction, property
+        ), "language_instruction must be a property, not a plain attribute"
+        assert client.language_instruction is None
+
+        client.set_lang_instruction("pick up the banana")
+        assert client.language_instruction == "pick up the banana"
+
+        with pytest.raises(AttributeError):
+            client.language_instruction = "assigned directly"
+    finally:
+        client.close()
+
+
+def test_get_action_without_any_instruction_raises(mock_server):
+    """BACK-01 empty edge: no argument instruction AND no stored one -> raise.
+
+    A null `annotation.human.task_description` on the wire is silent garbage-in
+    that would surface downstream as apparent checkpoint drift, so it must never
+    be sent. The error names the missing instruction, not a generic failure. The
+    guard fires before any socket send; the positive half then proves the stored
+    instruction really lands under the PINNED key.
+    """
+    client = Gr00tRobotInferenceClient(host="127.0.0.1", port=mock_server)
+    try:
+        with pytest.raises(ValueError) as excinfo:
+            client.get_action(_synthetic_observation())
+        assert "instruction" in str(excinfo.value).lower()
+
+        # An explicit empty-string argument is just as unusable as no instruction.
+        with pytest.raises(ValueError):
+            client.get_action(_synthetic_observation(), lang="")
+
+        # With a stored instruction the guard does NOT fire, and the value rides
+        # the pinned key (double-wrapped by the T=1 then B=1 dim expansion).
+        client.set_lang_instruction("pick up the banana")
+        captured: dict = {}
+        real_get_action = client.policy.get_action
+
+        def _spy(observation, options=None):
+            captured["observation"] = observation
+            return real_get_action(observation, options)
+
+        with mock.patch.object(client.policy, "get_action", _spy):
+            actions = client.get_action(_synthetic_observation())
+
+        assert actions
+        assert captured["observation"]["language"][
+            "annotation.human.task_description"
+        ] == [["pick up the banana"]]
+    finally:
+        client.close()
+
+
+def test_close_is_idempotent_and_session_closes_on_exception():
+    """BACK-01 ordering edge: close() twice must not raise, and session() must
+    close even when its body raises — otherwise a double close in a `finally`
+    would mask the original exception, and an aborted episode would leak the
+    socket into the next one."""
+    client = Gr00tRobotInferenceClient(host="127.0.0.1", port=_free_port())
+    client.close()
+    client.close()  # second call is a no-op, never a raise
+
+    other = Gr00tRobotInferenceClient(host="127.0.0.1", port=_free_port())
+    boom = RuntimeError("episode aborted")
+    with pytest.raises(RuntimeError, match="episode aborted"):
+        with other.session() as backend:
+            assert backend is other
+            raise boom
+
+    # close() ran in session()'s finally, so a further close is still a no-op.
+    assert other._closed is True
+    other.close()

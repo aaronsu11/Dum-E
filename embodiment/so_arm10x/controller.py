@@ -25,11 +25,13 @@ python -m embodiment.so_arm10x.controller \
 ```
 """
 
+import hashlib
 import logging
 import os
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Literal, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from pprint import pformat
 
 import draccus
@@ -260,6 +262,30 @@ def view_img(img, overlay_img=None):
 
 
 # ============================================================================
+# Calibration-file resolution and the connect-time assertion (D-05)
+# ============================================================================
+
+
+def resolve_lerobot_calibration_root() -> Path:
+    """RED stub — see plan 05-04 Task 2."""
+    raise NotImplementedError("resolve_lerobot_calibration_root")
+
+
+def resolve_calibration_file(robot_name: str, robot_id: str) -> Path:
+    """RED stub — see plan 05-04 Task 2."""
+    raise NotImplementedError("resolve_calibration_file")
+
+
+def assert_calibration_loaded(
+    robot_name: Optional[str] = None,
+    robot_id: Optional[str] = None,
+    expected_path: Optional[Path] = None,
+) -> Tuple[Path, str]:
+    """RED stub — see plan 05-04 Task 2."""
+    raise NotImplementedError("assert_calibration_loaded")
+
+
+# ============================================================================
 # Hardware wrapper built on LeRobot API
 # ============================================================================
 
@@ -371,6 +397,10 @@ class SO10xArmController(IRobotController):
         self.robot.connect(calibrate=calibrate)
         # Apply our preferred preset on connect
         self.set_so10x_robot_preset()
+
+    def _assert_calibration_loaded(self) -> Tuple[Path, str]:
+        """RED stub — see plan 05-04 Task 2."""
+        raise NotImplementedError("_assert_calibration_loaded")
 
     def disconnect(self) -> None:
         self.robot.disconnect()

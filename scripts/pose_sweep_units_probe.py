@@ -806,19 +806,25 @@ def check_pinned_constants(index: str, args: argparse.Namespace) -> bool:
 
 
 def check_hardware_raw_tick(index: str, args: argparse.Namespace) -> bool:
-    """The arm-required half. Never reached under --skip-hardware."""
+    """The arm-required half. Never reached under --skip-hardware.
+
+    Reports whichever normalization mode the constructed controller is ACTUALLY
+    running — it does not presuppose one, which is the whole point of the probe.
+    """
     print(f"\n[{index}] raw-tick round-trip probe — REQUIRES THE ARM ...")
     if not args.port:
         print(_red("  FAIL: --port is required for the hardware probe"))
         return False
     try:
-        # Imported here so --skip-hardware opens no serial port and needs no
-        # lerobot robot stack at all.
-        from embodiment.so_arm10x.controller import SOArm10xController
+        # Imported here so --skip-hardware opens no serial port and pulls in no
+        # part of the lerobot robot stack at all.
+        from embodiment.so_arm10x.controller import SO10xArmController
     except Exception as exc:  # noqa: BLE001
         print(_red(f"  FAIL: cannot import the controller: {type(exc).__name__}: {exc}"))
         return False
-    controller = SOArm10xController(port=args.port, robot_type=args.robot_type)
+    controller = SO10xArmController(
+        robot_type=args.robot_type, robot_port=args.port, robot_id=args.robot_id
+    )
     try:
         controller.connect()
         result = units_verdict(controller.robot.bus, controller.robot.bus.calibration)

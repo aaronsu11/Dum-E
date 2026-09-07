@@ -943,6 +943,7 @@ def main() -> int:
         "dataset_revision": handle.revision,
         "dataset_codebase_version": handle.codebase_version,
         "dataset_fps": handle.fps,
+        "frame_shape": list(handle.frame_shape),
         "instruction": args.instruction or first_record.instruction,
         "instruction_source": "cli" if args.instruction else "dataset-task",
         "samples_per_observation": int(args.samples_per_obs),

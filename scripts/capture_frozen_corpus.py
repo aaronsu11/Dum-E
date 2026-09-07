@@ -914,7 +914,28 @@ def main() -> int:
             f"keys tried={seed_evidence.get('option_key_tried')})",
         )
 
-    seed_option_key = (seed_evidence or {}).get("option_key_selected") or SEED_OPTION_KEYS[0]
+    # If NO candidate key ever produced a successful reply, the server rejects an
+    # options payload outright (e.g. it splats options as kwargs). Sending one
+    # during capture would then fail every request, so degrade to options=None and
+    # record that the seeds are nominal only — a corpus must not claim a seed the
+    # server never saw (T-05-09).
+    seed_options_sent = bool((seed_evidence or {}).get("any_server_reply", True))
+    seed_option_key = (
+        ((seed_evidence or {}).get("option_key_selected") or SEED_OPTION_KEYS[0])
+        if seed_options_sent
+        else None
+    )
+    if not seed_options_sent:
+        print(
+            _red(
+                "  NOTE: the server rejected every options payload — capturing with "
+                "options=None; recorded seeds are nominal sample ordinals, not a "
+                "channel the server observed."
+            )
+        )
+
+    def seed_options(seed: int) -> dict[str, Any] | None:
+        return {seed_option_key: int(seed)} if seed_option_key else None
 
     manifest: dict[str, Any] = {
         "corpus_schema_version": CORPUS_SCHEMA_VERSION,
@@ -928,6 +949,7 @@ def main() -> int:
         "seed_verdict": seed_verdict,
         "seed_verdict_evidence": seed_evidence,
         "seed_option_key": seed_option_key,
+        "seed_options_sent": seed_options_sent,
         "action_modality_layout": ACTION_MODALITY_LAYOUT,
         "stratification": recipe,
         "server_image": args.server_label,
@@ -991,7 +1013,7 @@ def main() -> int:
                 info_seen: dict[str, Any] = {}
                 for seed in seeds:
                     chunk, info = capture_record(
-                        client, observation, {seed_option_key: seed}
+                        client, observation, seed_options(seed)
                     )
                     samples.append(chunk)
                     if info:

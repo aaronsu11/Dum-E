@@ -893,8 +893,9 @@ def main() -> int:
         results["hardware_raw_tick"] = check_hardware_raw_tick(f"6/{total}", args)
     else:
         print(
-            "\n[6/6 SKIPPED] raw-tick round-trip probe — deferred to plan 05-06 "
-            "behind the hardware-attach gate (--skip-hardware)"
+            "\n[not run] raw-tick round-trip probe — deferred to plan 05-06 behind "
+            "the hardware-attach gate (--skip-hardware). The per-joint scale above "
+            "stays a HYPOTHESIS until that probe measures it."
         )
 
     print("\n" + "=" * 72)

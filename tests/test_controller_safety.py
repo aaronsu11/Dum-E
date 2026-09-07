@@ -169,16 +169,23 @@ def clamp_controller(robot: StubRobot) -> SO10xArmController:
 
 @contextlib.contextmanager
 def capture_loguru(level: str = "WARNING") -> Iterator[List[str]]:
-    """Collect loguru output through a real sink, not by inspecting source text.
+    """Collect loguru MESSAGES through a real sink, not by inspecting source text.
 
     Capturing the sink is the whole point: SAFE-02's claim is that the clamp is
     *surfaced on Dum-E's own stream*, and only a sink proves that. Grepping the
     source would pass even if the message never reached loguru.
+
+    ``record["message"]`` rather than the rendered line, deliberately: the
+    rendered line carries a millisecond timestamp, so no two runs could ever be
+    byte-identical and the determinism assertion below would be untestable. The
+    claim under test is that the *message* is deterministic, not the clock.
     """
-    lines: List[str] = []
-    sink_id = logger.add(lambda message: lines.append(str(message)), level=level)
+    messages: List[str] = []
+    sink_id = logger.add(
+        lambda message: messages.append(message.record["message"]), level=level
+    )
     try:
-        yield lines
+        yield messages
     finally:
         logger.remove(sink_id)
 
@@ -455,6 +462,31 @@ def test_stdlib_root_warning_is_bridged_to_loguru():
     assert text.count("stdlib root bridge probe marker") == 1, lines
 
 
+def test_bridged_record_is_attributed_to_the_originating_frame():
+    """A bridged record names its real origin, not ``utils.py`` or ``logging``.
+
+    Frame depth is not cosmetic here. The clamp warning is emitted from inside
+    ``lerobot/robots/utils.py``, and an operator who greps the log to find where
+    a clamp came from must be pointed there — not at Dum-E's logging setup, and
+    not at ``logging/__init__.py:callHandlers``, both of which are where a naive
+    depth calculation lands.
+    """
+    seen: List[Dict[str, Any]] = []
+    sink_id = logger.add(lambda message: seen.append(message.record), level="WARNING")
+    try:
+        with stdlib_bridge_installed():
+            logging.getLogger("probe").warning("attribution probe marker")
+    finally:
+        logger.remove(sink_id)
+
+    records = [r for r in seen if "attribution probe marker" in r["message"]]
+    assert records, seen
+    origin = records[0]["file"].path
+    assert origin.endswith("test_controller_safety.py"), origin
+    assert not origin.endswith("utils.py"), origin
+    assert "logging/__init__.py" not in origin, origin
+
+
 def test_upstream_clamp_warning_itself_reaches_loguru_through_the_bridge():
     """The belt-and-braces half: upstream's OWN warning lands on Dum-E's stream.
 
@@ -485,6 +517,12 @@ def test_skill_loop_consumes_set_target_state_return_value(monkeypatch):
     from embodiment.so_arm10x import skills as skills_mod
 
     monkeypatch.setattr(skills_mod.time, "sleep", lambda *_: None)
+    # Bypass tqdm rather than let it run: instantiating it starts tqdm's
+    # background monitor thread, which persists for the rest of the session and
+    # makes every later `os.fork()` in the multiprocessing tests emit a
+    # multi-threaded-fork DeprecationWarning. The subject here is the clamp
+    # signal, not the progress bar.
+    monkeypatch.setattr(skills_mod, "tqdm", lambda iterable, **_: iterable)
 
     requested = {f"{motor}.pos": 10.0 for motor in MOTOR_NAMES}
     clipped = {**requested, "elbow_flex.pos": 1.0}

@@ -27,6 +27,7 @@ python -m embodiment.so_arm10x.controller \
 
 import hashlib
 import logging
+import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -422,6 +423,187 @@ DUME_PID: Dict[str, int] = {
 _PID_READ_MIN_RETRIES = 2
 
 
+# The six motor names on an SO-10x follower. `send_action` strips the `.pos`
+# suffix before clamping, so a per-motor clamp mapping is keyed on these.
+_MOTOR_NAMES: Tuple[str, ...] = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+)
+
+
+# ---------------------------------------------------------------------------
+# The per-step motion clamp (SAFE-02)
+# ---------------------------------------------------------------------------
+#
+# PROVENANCE OF THIS VALUE — derived arithmetic on recorded statistics, NOT a
+# measurement of this arm.
+#
+#   Source        checkpoints/GR00T-N1.7-3B-SO101/statistics.json
+#                 -> new_embodiment.relative_action.single_arm
+#                 min / max, shape (16, 5): per-timestep relative action bounds
+#                 across all 16 chunk timesteps and all five arm joints.
+#   Extreme       137.47269  (max[15][1] — shoulder_lift at timestep 16; the
+#                 negative extreme is -121.70099 on elbow_flex at the same step)
+#   Margin        x 1.15  ->  158.094
+#   Rounded up    160.0
+#
+# Why the CUMULATIVE per-timestep bound and not the increment between
+# consecutive timesteps (whose extreme is only 12.692): the clamp compares each
+# commanded goal against the arm's PRESENT position, and the pick loop streams a
+# whole chunk at 0.05 s intervals. A perfectly tracking arm would see only the
+# increment, but a lagging arm — which is the real case, PID-limited at these
+# intervals — sees a delta approaching the full cumulative offset. Sizing on the
+# increment would therefore clamp nominal, correctly-tracked motion.
+#
+# Why not smaller: Phase 7 requires ZERO clamp warnings during nominal
+# operation, so a clamp below the policy's own trained per-step motion would
+# fire constantly and be read as a parity bug rather than as a mis-set clamp.
+# Why not larger: one far above the arm's own travel would never catch a
+# runaway. 160.0 sits above the checkpoint's motion and below twice any joint's
+# calibrated span.
+#
+# THIS IS AN ASSUMPTION, not a measurement. Plan 05-06's live clamp
+# demonstration and Phase 7's zero-warning requirement are what validate it. If
+# nominal operation trips the clamp, the value must be RE-DERIVED — the clamp
+# must not be removed and the warning must not be suppressed.
+DEFAULT_MAX_RELATIVE_TARGET: float = 160.0
+
+# Divergence threshold for deciding the clamp fired, identical to the
+# `abs(safe_goal_pos - goal_pos) > 1e-4` test inside
+# `lerobot.robots.utils.ensure_safe_goal_position`. Held equal on purpose: a
+# different threshold would let Dum-E and upstream disagree about whether a given
+# action was clamped.
+CLAMP_DIVERGENCE_THRESHOLD: float = 1e-4
+
+# Upstream's exact clamp wording, re-emitted verbatim inside Dum-E's own warning
+# so a single grep finds both signals (research Pitfall 9).
+CLAMP_WARNING_TEXT = "Relative goal position magnitude had to be clamped to be safe."
+
+# Environment spellings that explicitly DISABLE the clamp. Disabling has to be
+# spelled out, because `None` on the constructor parameter means "resolve from
+# the environment then the default" — the clamp is on by default, which is the
+# point of SAFE-02 given that the production call site passes neither this
+# parameter nor the units one.
+_CLAMP_DISABLED_SPELLINGS = frozenset({"none", "null", "off", "disabled", "false"})
+
+
+def resolve_max_relative_target(
+    value: "float | Dict[str, float] | None" = None,
+) -> "float | Dict[str, float] | None":
+    """Resolve and validate the per-step motion clamp before it reaches the config.
+
+    Resolution order mirrors the serial-port fallback in ``SO10xArmController``:
+    an explicit argument wins, then ``DUME_MAX_RELATIVE_TARGET``, then
+    :data:`DEFAULT_MAX_RELATIVE_TARGET`.
+
+    Args:
+        value: a positive float, a mapping covering every motor name, or ``None``
+            to resolve from the environment and then the derived default.
+
+    Returns:
+        A ``float``, a complete ``dict[str, float]``, or ``None`` when the clamp
+        was explicitly disabled.
+
+    Raises:
+        ValueError: the value is non-positive, non-finite, a ``bool``, an
+            unparseable environment string, or a mapping whose key set does not
+            match the motor names exactly.
+
+    Validating here rather than letting the value flow through is deliberate.
+    ``ensure_safe_goal_position`` only rejects a bad clamp when it is *used*: an
+    ``int`` raises ``TypeError`` and an incomplete mapping raises ``ValueError``,
+    both at the exact moment the clamp would have engaged. Neither fails on
+    ordinary actions, so without a boundary check the mistake stays invisible
+    until the safety mechanism is needed.
+    """
+    if value is None:
+        raw = os.getenv("DUME_MAX_RELATIVE_TARGET")
+        if raw is None or not raw.strip():
+            value = DEFAULT_MAX_RELATIVE_TARGET
+        elif raw.strip().lower() in _CLAMP_DISABLED_SPELLINGS:
+            return None
+        else:
+            try:
+                value = float(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"DUME_MAX_RELATIVE_TARGET must be a positive float, or one of "
+                    f"{sorted(_CLAMP_DISABLED_SPELLINGS)} to disable the clamp; "
+                    f"got {raw!r}"
+                ) from exc
+
+    if isinstance(value, dict):
+        missing = sorted(set(_MOTOR_NAMES) - set(value))
+        extra = sorted(set(value) - set(_MOTOR_NAMES))
+        if missing or extra:
+            raise ValueError(
+                "A per-motor max_relative_target mapping must cover exactly the "
+                f"motor names {list(_MOTOR_NAMES)} — upstream raises when the key "
+                f"sets differ, and only when the clamp actually engages. "
+                f"Missing: {missing}. Unexpected: {extra}."
+            )
+        resolved = {str(motor): float(bound) for motor, bound in value.items()}
+        bad = {m: b for m, b in resolved.items() if not (b > 0.0) or not math.isfinite(b)}
+        if bad:
+            raise ValueError(
+                f"Every per-motor max_relative_target bound must be a positive "
+                f"finite float; got {bad}"
+            )
+        return resolved
+
+    # `bool` is a subclass of `int`, and `float(True) == 1.0` would silently
+    # become a 1-unit clamp that fires on every action.
+    if isinstance(value, bool):
+        raise ValueError(
+            f"max_relative_target must be a positive float or a per-motor "
+            f"mapping, not a bool; got {value!r}"
+        )
+    if not isinstance(value, (int, float)):
+        raise ValueError(
+            f"max_relative_target must be a positive float, a per-motor mapping, "
+            f"or None; got {value!r} of type {type(value).__name__}"
+        )
+
+    resolved_float = float(value)
+    if not math.isfinite(resolved_float) or resolved_float <= 0.0:
+        raise ValueError(
+            f"max_relative_target must be a positive finite float — a value of "
+            f"zero or below would clamp every action to the present position, and "
+            f"a non-finite one disables the comparison; got {value!r}"
+        )
+    return resolved_float
+
+
+def diff_clamped_joints(
+    requested: Dict[str, float],
+    sent: Dict[str, float],
+    threshold: float = CLAMP_DIVERGENCE_THRESHOLD,
+) -> Tuple[Tuple[str, float, float], ...]:
+    """Return ``(joint, requested, clipped)`` for every joint the clamp moved.
+
+    ``send_action``'s docstring guarantees its return is "the action actually
+    sent", so comparing request against return is a detector that does not depend
+    on any logging configuration and needs no hardware to test. That is why it is
+    the PRIMARY clamp mechanism and the stdlib->loguru bridge is the backstop.
+
+    Iteration follows ``requested``'s key order so two runs over the same
+    requested action produce byte-identical report lines.
+    """
+    clamped: List[Tuple[str, float, float]] = []
+    for key, requested_value in requested.items():
+        if key not in sent:
+            continue
+        requested_float = float(requested_value)
+        sent_float = float(sent[key])
+        if abs(sent_float - requested_float) > threshold:
+            clamped.append((key, requested_float, sent_float))
+    return tuple(clamped)
+
+
 # ============================================================================
 # Hardware wrapper built on LeRobot API
 # ============================================================================
@@ -443,7 +625,7 @@ class SO10xArmController(IRobotController):
         wrist_cam_idx: int = 0,
         front_cam_idx: int = 1,
         use_degrees: bool = True,
-        max_relative_target: Optional[int] = None,
+        max_relative_target: "float | Dict[str, float] | None" = None,
     ) -> None:
         if robot_port is None:
             robot_port = os.getenv("SO_ARM_PORT")
@@ -451,6 +633,14 @@ class SO10xArmController(IRobotController):
                 raise ValueError(
                     "Robot serial port is required. Set `port` or env `SO_ARM_PORT`."
                 )
+
+        # SAFE-02: `None` here means "resolve", not "disable" — mirroring the
+        # serial-port fallback just above. The clamp is therefore ON by default,
+        # which matters because the production call site passes neither this
+        # parameter nor the units one. Validation happens before the value
+        # reaches the config, since upstream only rejects a bad clamp at the
+        # moment the clamp engages.
+        max_relative_target = resolve_max_relative_target(max_relative_target)
 
         # Store robot_id for the id property
         self._robot_id = robot_id
@@ -694,7 +884,41 @@ class SO10xArmController(IRobotController):
             }
 
         sent = self.robot.send_action(action_dict)
-        return {k: float(v) for k, v in sent.items()}
+        sent_dict = {str(k): float(v) for k, v in sent.items()}
+        self._report_clamped_joints(action_dict, sent_dict)
+        return sent_dict
+
+    def _report_clamped_joints(
+        self, requested: Dict[str, float], sent: Dict[str, float]
+    ) -> Tuple[Tuple[str, float, float], ...]:
+        """Re-emit any clamp divergence on Dum-E's own loguru stream (SAFE-02).
+
+        Upstream already warns when it clamps — but through the module-level
+        ``logging.warning``, i.e. the stdlib ROOT logger, which auto-installs a
+        stderr handler, while Dum-E's loguru sink writes to stdout. Two disjoint
+        streams. The bridge in ``utils.install_stdlib_to_loguru_bridge`` closes
+        that for upstream's message; this method is the independent primary
+        detector, working from ``send_action``'s returned action rather than from
+        any log.
+
+        The message embeds upstream's exact sentence so one grep finds both.
+        """
+        clamped = diff_clamped_joints(requested, sent)
+        if not clamped:
+            return ()
+
+        detail = ", ".join(
+            f"{joint} requested={requested_value:.4f} clipped={clipped_value:.4f}"
+            for joint, requested_value, clipped_value in clamped
+        )
+        logger.warning(
+            "{} max_relative_target={} clamped {} joint(s): {}",
+            CLAMP_WARNING_TEXT,
+            getattr(self.config, "max_relative_target", None),
+            len(clamped),
+            detail,
+        )
+        return clamped
 
     def move_to_initial_pose(self) -> None:
         # These target degrees mirror legacy behavior

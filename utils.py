@@ -9,6 +9,7 @@ This module provides:
 - Config file loading utilities
 """
 
+import inspect
 import json
 import logging
 import sys
@@ -157,6 +158,77 @@ class RobotCallbackHandler:
         return False
 
 
+class InterceptHandler(logging.Handler):
+    """Forward stdlib ``logging`` records into loguru.
+
+    Why this exists (SAFE-02, research Pitfall 9): LeRobot's motion clamp warns
+    via ``lerobot.robots.utils.ensure_safe_goal_position`` -> the *module-level*
+    ``logging.warning``, i.e. the stdlib **root** logger. With no handler on root,
+    that call auto-invokes ``basicConfig()`` and installs a ``StreamHandler`` on
+    **stderr** — while Dum-E's loguru sink writes to **stdout**. Two disjoint
+    streams, and before this handler the repo had no bridge at all, so a
+    safety-relevant warning was emitted and architecturally invisible: wrong
+    stream, unformatted, outside loguru, and never reaching the message broker or
+    the voice narration.
+
+    Installing this on root also has a second effect worth naming: once root has
+    a handler, ``logging.warning`` stops auto-installing the stderr one, so the
+    record travels to loguru instead of being duplicated onto another stream.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Map the stdlib level onto loguru's, falling back to the numeric level
+        # for custom levels loguru does not know by name.
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        # Walk out of the logging machinery so loguru reports the ORIGINATING
+        # frame rather than this handler or a `logging/__init__.py` internal.
+        # Without this the clamp warning would be attributed to Dum-E's logging
+        # setup instead of to lerobot, which is actively misleading when someone
+        # greps the log to find where a clamp came from.
+        #
+        # Starts at THIS frame (`emit`, which lives in utils.py) and always steps
+        # at least once — hence the `depth == 0` clause — then skips every frame
+        # belonging to the stdlib logging module.
+        frame, depth = inspect.currentframe(), 0
+        while frame is not None and (
+            depth == 0 or frame.f_code.co_filename == logging.__file__
+        ):
+            frame = frame.f_back
+            depth += 1
+
+        logger.opt(depth=depth, exception=record.exc_info).log(
+            level, record.getMessage()
+        )
+
+
+def install_stdlib_to_loguru_bridge() -> bool:
+    """Install :class:`InterceptHandler` on the stdlib ROOT logger, idempotently.
+
+    Returns:
+        ``True`` when a handler was added, ``False`` when one was already
+        present.
+
+    Idempotence is load-bearing: a duplicated handler duplicates every bridged
+    record, and a clamp warning appearing twice reads as the clamp having fired
+    twice.
+    """
+    root = logging.getLogger()
+    if any(isinstance(handler, InterceptHandler) for handler in root.handlers):
+        return False
+
+    root.addHandler(InterceptHandler())
+    # Root defaults to WARNING, which is already low enough for the clamp
+    # warning. Only raise the floor when root was left at NOTSET or higher than
+    # WARNING, which would drop the very record this bridge exists to carry.
+    if root.level == logging.NOTSET or root.level > logging.WARNING:
+        root.setLevel(logging.WARNING)
+    return True
+
+
 _logging_configured = False
 
 
@@ -195,6 +267,12 @@ def setup_robot_logging(
         logger.add(
             sys.stdout, format=format_string, level=log_level.upper(), colorize=True
         )
+
+    # Bridge stdlib logging into loguru BEFORE the per-library level tuning
+    # below. The named loggers below are noise suppression; this is the opposite
+    # concern — the ROOT logger, which nothing here touches and which is where
+    # LeRobot's motion-clamp warning lands (SAFE-02).
+    install_stdlib_to_loguru_bridge()
 
     # Suppress verbose logs from external libraries (always do this)
     logging.getLogger("urllib3").setLevel(logging.WARNING)

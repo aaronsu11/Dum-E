@@ -29,9 +29,12 @@ Skill.
 
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, Set
 
+from loguru import logger
 from tqdm import tqdm
+
+from embodiment.so_arm10x.controller import diff_clamped_joints
 
 
 class Skill(ABC):
@@ -103,6 +106,10 @@ class PickSkill(Skill):
             self.controller.move_to_initial_pose()
             self.controller.move_to_ready_pose()
 
+        # SAFE-02: the clamp signal, accumulated across the whole pick.
+        clamped_steps = 0
+        clamped_joints: Set[str] = set()
+
         for _ in tqdm(range(actions_to_execute), desc="Executing actions"):
             # New observation -> policy -> action flow using updated interfaces
             observation_dict = self.controller.get_observation()
@@ -113,8 +120,32 @@ class PickSkill(Skill):
 
             # Execute a short horizon for stability
             for action_dict in action_list[:action_horizon]:
-                self.controller.set_target_state(action_dict)
+                # BIND the return value — do not call for effect only. It is the
+                # action the robot reports it ACTUALLY sent, so divergence from
+                # the request is the per-step motion clamp having engaged. A
+                # caller that discards it reduces SAFE-02 to a log line nobody
+                # correlates with a task.
+                sent = self.controller.set_target_state(action_dict)
+                for joint, _requested, _clipped in diff_clamped_joints(
+                    action_dict, sent
+                ):
+                    clamped_joints.add(joint)
+                    clamped_steps += 1
                 time.sleep(0.05)
+
+        if clamped_steps:
+            # Upstream's exact wording is embedded so one grep finds the
+            # upstream warning, the controller's per-step warning, and this
+            # per-pick roll-up.
+            logger.warning(
+                "Relative goal position magnitude had to be clamped to be safe. "
+                "{} commanded joint target(s) were clamped during this pick, on "
+                "joints: {}. The policy is asking for motion past the configured "
+                "per-step limit — investigate before trusting the resulting "
+                "trajectory.",
+                clamped_steps,
+                sorted(clamped_joints),
+            )
 
         time.sleep(0.5)
         return self.controller.get_current_images()

@@ -11,18 +11,40 @@ Surfaces covered:
 - Wire contract: the :5555 ``MsgSerializer`` contract is preserved across a real
   socket (get_action 2-tuple with single_arm (1,16,5) / gripper (1,16,1) float32;
   ping non-error; {"error": ...} reply -> RuntimeError).
-- Stack isolation: the server GPU stack (torch/flash-attn/CUDA/tensorrt/onnxruntime-gpu)
-  never leaks into the client ``pyproject.toml``, and ``requires-python`` stays
+- Dependency isolation (SAFE-04): the client's declared ``lerobot`` extras stay
+  within an allowlist with ``feetech`` required, the pin stays exact, no
+  server-only GPU or model package is a DIRECT dependency, the resolved closure
+  from ``uv.lock`` carries no server-only package, and ``requires-python`` stays
   ``>=3.12`` (the client is Py3.12; the server is Py3.10 inside the container).
+  Six negative tests drive the helpers with synthetic input to prove the guard
+  actually fails when a violation is injected.
+
+Scope — this guard is a LOCAL pytest gate, and no CI workflow is created.
+Recorded as a decision so a later reader does not read the absent workflow as an
+oversight. The reasoning: this is one developer on one machine with the arm
+attached to it, so CI's value (which scales with contributors and machines) is
+small here; the guard runs in the suite before every commit; the word "CI" in
+SAFE-04's text names this contract-test file rather than a hosted service; and
+the realistic GPU-dependency leak arrives with the ``lerobot[groot]`` extra,
+where a local ``pytest`` run catches it. SAFE-04 is therefore satisfied at the
+pytest level.
+
+What this guard deliberately does NOT assert: that ``torch`` or the nvidia CUDA
+wheels are absent from the RESOLVED environment. ``torch`` is an unconditional
+base dependency of ``lerobot`` and the CUDA wheels resolve with it, so such an
+assertion is unsatisfiable by construction and its inevitable remedy is to weaken
+the guard. See ``FORBIDDEN_RESOLVED_PACKAGES``.
 
 No live policy server, no GPU, no hardware is required; the suite completes fast.
 """
 
 import os
+import re
 import socket
 import sys
 import threading
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -182,41 +204,171 @@ def test_real_socket_error_reply_raises_runtimeerror():
 
 
 # --- Dependency isolation guard (SAFE-04) -----------------------------------
-#
-# RED phase (plan 05-03 Task 3): the helpers below are stubs. The positive and
-# negative tests that follow MUST fail until the GREEN phase implements them.
 
-_NOT_YET = "RED phase (plan 05-03 Task 3): not implemented yet"
+# An ALLOWLIST, not a denylist: an extra that is not named here fails by
+# default, so a new heavyweight extra cannot slip in unnoticed. Phase 8 widens
+# this set to include lerobot's async extra — that widening must be a deliberate
+# edit here, not a surprise failure.
+LEROBOT_EXTRAS_ALLOWLIST = frozenset({"feetech"})
+
+# Server-only GPU and model packages that must never be DIRECT client
+# declarations. This is the ONLY place torch and the nvidia-cuda prefix belong:
+# both are legitimately present in the RESOLVED closure (torch is an
+# unconditional base dependency of lerobot, and the nvidia CUDA wheels come with
+# it), so they are meaningful only as a statement about what this project itself
+# declares.
+FORBIDDEN_DIRECT_DEPENDENCIES = frozenset(
+    {
+        "torch",
+        "torchvision",
+        "transformers",
+        "flash-attn",
+        "tensorrt",
+        "onnxruntime-gpu",
+    }
+)
+NVIDIA_CUDA_PREFIX = "nvidia-cuda"
+
+# Genuinely server-only packages that must not appear anywhere in the resolved
+# closure.
+#
+# torch, torchvision and every nvidia-* wheel are DELIBERATELY EXCLUDED. torch is
+# an unconditional base dependency of lerobot and roughly a dozen nvidia CUDA
+# wheels resolve transitively with it, so asserting their absence from the
+# resolved closure is unsatisfiable BY CONSTRUCTION — and the inevitable "fix"
+# for a permanently red assertion is to gut the whole guard. Do not add them
+# here to make the guard look stricter.
+#
+# diffusers is likewise absent for now: it is in the CURRENT resolved closure via
+# the incumbent lerobot pin and only leaves when the version bump lands, so it is
+# added in the same change that makes it satisfiable.
+FORBIDDEN_RESOLVED_PACKAGES = frozenset(
+    {
+        "flash-attn",
+        "tensorrt",
+        "onnxruntime-gpu",
+        "decord",
+        "dm-tree",
+        "peft",
+        "timm",
+    }
+)
+
+# name, optional [extras], then the version specifier. Environment markers are
+# stripped before matching.
+_REQUIREMENT_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*"
+    r"(?:\[(?P<extras>[^\]]*)\])?\s*"
+    r"(?P<spec>.*)$"
+)
 
 
 def normalize_dist_name(name: str) -> str:
-    raise NotImplementedError(_NOT_YET)
+    """PEP 503 normalization: lowercase, runs of -, _ and . collapse to one -.
+
+    Without this, ``Flash_Attn``, ``flash.attn`` and ``flash-attn`` read as three
+    different distributions and only one spelling gets caught.
+    """
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
 
 
-def parse_lerobot_requirement(dependencies):
-    raise NotImplementedError(_NOT_YET)
+def _split_requirement(requirement: str) -> tuple[str, frozenset[str], str]:
+    """Parse one requirement string into (normalized name, extras, specifier)."""
+    text = requirement.split(";", 1)[0].strip()
+    match = _REQUIREMENT_RE.match(text)
+    if not match:
+        raise ValueError(f"Unparseable requirement: {requirement!r}")
+    raw_extras = match.group("extras") or ""
+    extras = frozenset(
+        normalize_dist_name(part) for part in raw_extras.split(",") if part.strip()
+    )
+    return normalize_dist_name(match.group("name")), extras, match.group("spec").strip()
 
 
-def forbidden_direct_dependencies(dependencies):
-    raise NotImplementedError(_NOT_YET)
+def client_dependencies() -> list[str]:
+    """The client's DIRECT dependency list, parsed from pyproject.toml.
+
+    Structural parsing via tomllib — never a substring search over the file text,
+    which is what let ``lerobot[groot]`` pass the previous guard.
+    """
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        manifest = tomllib.load(handle)
+    return list(manifest["project"]["dependencies"])
 
 
-def forbidden_resolved_packages(lock_text: str):
-    raise NotImplementedError(_NOT_YET)
+def parse_lerobot_requirement(dependencies) -> tuple[frozenset[str], str]:
+    """Return the lerobot requirement's (extras, version specifier).
+
+    Fails loudly when no lerobot requirement is present: silently returning an
+    empty extras set would make the extras allowlist vacuously satisfiable.
+    """
+    for requirement in dependencies:
+        name, extras, spec = _split_requirement(requirement)
+        if name == "lerobot":
+            return extras, spec
+    raise ValueError(
+        f"no lerobot requirement found in {list(dependencies)!r} — the extras "
+        f"allowlist cannot be checked"
+    )
 
 
-def read_lock_text(path):
-    raise NotImplementedError(_NOT_YET)
+def forbidden_direct_dependencies(dependencies) -> list[str]:
+    """Normalized names in the DIRECT dependency list that are server-only."""
+    leaked = set()
+    for requirement in dependencies:
+        name, _extras, _spec = _split_requirement(requirement)
+        if name in FORBIDDEN_DIRECT_DEPENDENCIES or name.startswith(NVIDIA_CUDA_PREFIX):
+            leaked.add(name)
+    return sorted(leaked)
 
 
-def client_dependencies():
-    raise NotImplementedError(_NOT_YET)
+def read_lock_text(path) -> str:
+    """Read uv.lock, raising FileNotFoundError rather than reporting clean.
+
+    An absent lockfile means the resolved closure is unknown, which is not the
+    same as known-clean; treating it as clean would be a vacuous pass.
+    """
+    lock_path = Path(path)
+    if not lock_path.is_file():
+        raise FileNotFoundError(
+            f"lockfile not found at {lock_path} — the resolved closure cannot be "
+            f"checked, so the dependency-isolation guard cannot pass"
+        )
+    return lock_path.read_text(encoding="utf-8")
 
 
-LEROBOT_EXTRAS_ALLOWLIST = frozenset()
-FORBIDDEN_DIRECT_DEPENDENCIES = frozenset()
-FORBIDDEN_RESOLVED_PACKAGES = frozenset()
-NVIDIA_CUDA_PREFIX = "nvidia-cuda"
+def resolved_package_names(lock_text: str) -> list[str]:
+    """Normalized package names declared by the lockfile's [[package]] blocks."""
+    names = []
+    in_package = False
+    for line in lock_text.splitlines():
+        stripped = line.strip()
+        if stripped == "[[package]]":
+            in_package = True
+            continue
+        if in_package and stripped.startswith("name = "):
+            raw = stripped.split("=", 1)[1].strip().strip('"')
+            names.append(normalize_dist_name(raw))
+            in_package = False
+        elif stripped.startswith("["):
+            in_package = False
+    return names
+
+
+def forbidden_resolved_packages(lock_text: str) -> list[str]:
+    """Normalized server-only packages found in the resolved closure.
+
+    Raises when the text declares no packages at all: an empty closure is not a
+    clean closure, and reporting it clean would be exactly the vacuous pass this
+    guard exists to prevent.
+    """
+    names = resolved_package_names(lock_text)
+    if not names:
+        raise ValueError(
+            "the lockfile text declares no [[package]] entries — this is not a "
+            "resolved closure, and reporting it clean would be a vacuous pass"
+        )
+    return sorted(set(names) & FORBIDDEN_RESOLVED_PACKAGES)
 
 
 # --- Positive assertions against the real manifest and lockfile -------------

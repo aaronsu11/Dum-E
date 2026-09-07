@@ -213,4 +213,4 @@ my-dum-e.yaml
 # Frozen observation-to-action corpus (LR-05): large binary camera frames plus
 # recorded action chunks. The tracked deliverables are the capture/verify scripts
 # and their tests, never the bytes.
-corpus/
+corpus/.gsd/

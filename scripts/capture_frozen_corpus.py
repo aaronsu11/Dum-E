@@ -632,9 +632,13 @@ def plan_stratified_frames(
         chosen_episodes = [int(e) for e in episodes]
     else:
         if episode_count is None:
-            # One episode per ~10 records, at least 1 and at most 20 — for the
-            # 120-record default this yields 12 episodes (>= the 5-episode floor).
+            # One episode per ~10 records, and never fewer than 5 once there are
+            # 5 records to spread — a corpus that collapses onto one or two
+            # episodes would inherit their particular wrist pose. For the
+            # 120-record default this yields 12 episodes.
             episode_count = max(1, min(20, (records + 9) // 10))
+            if records >= 5:
+                episode_count = max(5, episode_count)
         episode_count = min(episode_count, len(available), records)
         step = len(available) / episode_count
         chosen_episodes = [

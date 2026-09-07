@@ -529,6 +529,78 @@ class TestSpawnAgentWorker:
             dum_e._spawn_agent_worker(config, agent_args)
 
     @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_forwards_policy_backend_from_config(self, mock_popen):
+        """BACK-02: controller.policy_backend is forwarded as DUME_POLICY_BACKEND.
+
+        The agent worker is the process that reaches
+        policy.factory.make_policy_backend(), so the YAML selection has to arrive
+        in its environment or the factory falls back to its own default.
+        """
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        controller_config = {"policy_backend": "groot-native"}
+
+        # clear=True guarantees no inherited DUME_POLICY_BACKEND leaks in from
+        # the runner env and masks a missing forward.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config=controller_config
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_POLICY_BACKEND"] == "groot-native"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_policy_backend_default_when_unset(self, mock_popen):
+        """With no controller config key, the shipped default is applied.
+
+        The example config selects the backend that works today, so the launcher
+        default matches it rather than leaving the worker to hit the code-level
+        'lerobot' default (which raises until Phase 6).
+        """
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(config, agent_args)  # no controller_config
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_POLICY_BACKEND"] == "groot-native"
+
+        # Same when the controller block exists but omits the key.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"robot_id": "arm"}
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_POLICY_BACKEND"] == "groot-native"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_shell_env_policy_backend_overrides_config(
+        self, mock_popen
+    ):
+        """An exported DUME_POLICY_BACKEND must WIN over the config file value.
+
+        Precedence is shell env > config > default (env.setdefault, never
+        env.update). An operator pinning which neural network commands the arm
+        must not be silently overridden by a stale my-dum-e.yaml.
+        """
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        controller_config = {"policy_backend": "lerobot"}
+
+        with mock.patch.dict(
+            os.environ, {"DUME_POLICY_BACKEND": "groot-native"}, clear=True
+        ):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config=controller_config
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_POLICY_BACKEND"] == "groot-native"
+
+    @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_env_inheritance(self, mock_popen):
         """Test that agent worker inherits current environment."""
         config = BackendConfig(namespace="test")

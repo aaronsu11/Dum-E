@@ -181,22 +181,219 @@ def test_real_socket_error_reply_raises_runtimeerror():
         thread.join(timeout=2.0)
 
 
-# --- Stack isolation (client pyproject.toml stays clean) --------------------
+# --- Dependency isolation guard (SAFE-04) -----------------------------------
+#
+# RED phase (plan 05-03 Task 3): the helpers below are stubs. The positive and
+# negative tests that follow MUST fail until the GREEN phase implements them.
+
+_NOT_YET = "RED phase (plan 05-03 Task 3): not implemented yet"
 
 
-def test_client_pyproject_has_no_server_gpu_stack():
-    """The server GPU stack must never leak into the client pyproject.toml."""
-    forbidden = {
-        "torch",
-        "flash-attn",
-        "flash_attn",
-        "nvidia-cuda",
-        "tensorrt",
-        "onnxruntime-gpu",
-    }
-    text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    leaked = sorted(f for f in forbidden if f in text)
-    assert not leaked, f"server GPU stack leaked into client pyproject.toml: {leaked}"
+def normalize_dist_name(name: str) -> str:
+    raise NotImplementedError(_NOT_YET)
+
+
+def parse_lerobot_requirement(dependencies):
+    raise NotImplementedError(_NOT_YET)
+
+
+def forbidden_direct_dependencies(dependencies):
+    raise NotImplementedError(_NOT_YET)
+
+
+def forbidden_resolved_packages(lock_text: str):
+    raise NotImplementedError(_NOT_YET)
+
+
+def read_lock_text(path):
+    raise NotImplementedError(_NOT_YET)
+
+
+def client_dependencies():
+    raise NotImplementedError(_NOT_YET)
+
+
+LEROBOT_EXTRAS_ALLOWLIST = frozenset()
+FORBIDDEN_DIRECT_DEPENDENCIES = frozenset()
+FORBIDDEN_RESOLVED_PACKAGES = frozenset()
+NVIDIA_CUDA_PREFIX = "nvidia-cuda"
+
+
+# --- Positive assertions against the real manifest and lockfile -------------
+
+
+def test_client_lerobot_extras_within_allowlist():
+    """The lerobot extras set is an ALLOWLIST subset, and feetech is required.
+
+    An allowlist, not a denylist: a new heavyweight extra fails by default. This
+    is the assertion that catches ``lerobot[groot]``, which pulls transformers,
+    peft, diffusers, timm, dm-tree and an x86-only decoder on top of the torch
+    that is already present transitively.
+    """
+    extras, _spec = parse_lerobot_requirement(client_dependencies())
+    assert extras <= LEROBOT_EXTRAS_ALLOWLIST, (
+        f"lerobot extras {sorted(extras)} exceed the allowlist "
+        f"{sorted(LEROBOT_EXTRAS_ALLOWLIST)}"
+    )
+    assert "feetech" in extras, "the feetech extra is required for the motor bus"
+
+
+def test_client_lerobot_pin_is_exact():
+    """The lerobot requirement uses an exact == pin with a concrete version.
+
+    Wire payloads are version-coupled from Phase 6 onward, so an exact pin is the
+    precondition for the Phase 6 lockstep test.
+    """
+    _extras, spec = parse_lerobot_requirement(client_dependencies())
+    assert spec.startswith("=="), f"lerobot pin must be exact, got {spec!r}"
+    assert spec[2:].strip(), f"lerobot pin declares no concrete version: {spec!r}"
+
+
+def test_client_has_no_direct_gpu_or_model_dependencies():
+    """No DIRECT dependency is a server-only GPU or model package.
+
+    Parsed, not substring-matched: parsing kills both the false pass on
+    ``lerobot[groot]`` and the false fail on a package whose name merely contains
+    a forbidden name as a substring. This is the only place torch and the
+    nvidia-cuda prefix belong.
+    """
+    leaked = forbidden_direct_dependencies(client_dependencies())
+    assert leaked == [], f"server GPU stack declared as a direct dependency: {leaked}"
+
+
+def test_client_lock_has_no_server_only_packages():
+    """The resolved closure from uv.lock contains no genuinely server-only package."""
+    leaked = forbidden_resolved_packages(read_lock_text(REPO_ROOT / "uv.lock"))
+    assert leaked == [], f"server-only packages in the resolved closure: {leaked}"
+
+
+# --- Negative tests: the guard has teeth (roadmap criterion 5) ---------------
+#
+# Each drives a helper with SYNTHETIC input. No test mutates the real
+# pyproject.toml or uv.lock.
+
+
+def test_guard_detects_torch_injected_as_direct_dependency():
+    """A deliberately injected DIRECT torch declaration is reported.
+
+    "Deliberately injected" means a direct declaration or a selected extra —
+    never transitive base-dependency presence, which is unavoidable and would
+    make the assertion unsatisfiable.
+    """
+    injected = ["fastapi>=0.129.0", "torch>=2.7", "lerobot[feetech]==0.6.1"]
+    assert forbidden_direct_dependencies(injected) == ["torch"]
+
+    for package in ("torchvision==0.26.0", "transformers>=4.57", "tensorrt", "onnxruntime-gpu"):
+        name = normalize_dist_name(package.split("=")[0].split(">")[0].split("<")[0])
+        assert forbidden_direct_dependencies([package]) == [name]
+
+    # The nvidia-cuda family is caught by prefix, as a DIRECT declaration only.
+    assert forbidden_direct_dependencies(["nvidia-cuda-runtime==13.0.96"]) == [
+        "nvidia-cuda-runtime"
+    ]
+
+    # A package whose name merely CONTAINS a forbidden name is not a false fail.
+    assert forbidden_direct_dependencies(["torchmetrics>=1.0", "pytorch-nowhere"]) == []
+
+
+def test_guard_detects_lerobot_groot_extra():
+    """A lerobot requirement carrying the groot extra is reported as a violation.
+
+    This is the exact false pass the previous substring guard exhibited: the
+    string ``lerobot[feetech,groot]==0.6.1`` contains none of that guard's six
+    forbidden substrings.
+    """
+    extras, spec = parse_lerobot_requirement(["lerobot[feetech,groot]==0.6.1"])
+    assert "groot" in extras
+    assert not extras <= LEROBOT_EXTRAS_ALLOWLIST, (
+        "the groot extra must fall outside the allowlist"
+    )
+    assert spec == "==0.6.1"
+
+    # And the substring guard's blind spot is real: no forbidden name appears.
+    assert forbidden_direct_dependencies(["lerobot[feetech,groot]==0.6.1"]) == []
+
+    # A non-exact pin is rejected too.
+    _extras, loose = parse_lerobot_requirement(["lerobot[feetech]>=0.6.1"])
+    assert not loose.startswith("==")
+
+
+def test_guard_detects_forbidden_package_in_resolved_lock():
+    """A server-only package in a synthetic resolved closure is reported."""
+    lock_text = (
+        '[[package]]\nname = "fastapi"\nversion = "0.129.0"\n\n'
+        '[[package]]\nname = "flash-attn"\nversion = "2.7.0"\n\n'
+        '[[package]]\nname = "peft"\nversion = "0.17.0"\n'
+    )
+    assert forbidden_resolved_packages(lock_text) == ["flash-attn", "peft"]
+
+    # torch, torchvision and the nvidia wheels are DELIBERATELY absent from the
+    # resolved-closure denylist — they resolve legitimately, so asserting their
+    # absence would be unsatisfiable by construction.
+    legitimate = (
+        '[[package]]\nname = "torch"\nversion = "2.11.0"\n\n'
+        '[[package]]\nname = "torchvision"\nversion = "0.26.0"\n\n'
+        '[[package]]\nname = "nvidia-cuda-runtime"\nversion = "13.0.96"\n'
+    )
+    assert forbidden_resolved_packages(legitimate) == []
+    assert "torch" not in FORBIDDEN_RESOLVED_PACKAGES
+    assert "torchvision" not in FORBIDDEN_RESOLVED_PACKAGES
+    assert not any(p.startswith("nvidia-") for p in FORBIDDEN_RESOLVED_PACKAGES)
+
+    # diffusers is NOT in the set yet: it is in the current closure via the
+    # incumbent lerobot pin and only leaves when the bump lands (plan 05-04).
+    assert "diffusers" not in FORBIDDEN_RESOLVED_PACKAGES
+
+
+def test_guard_normalizes_distribution_names_per_pep503():
+    """Flash_Attn, flash.attn and flash-attn are all the same distribution."""
+    assert (
+        normalize_dist_name("Flash_Attn")
+        == normalize_dist_name("flash.attn")
+        == normalize_dist_name("flash-attn")
+        == "flash-attn"
+    )
+    # Runs of separators collapse to a single hyphen.
+    assert normalize_dist_name("dm___tree") == "dm-tree"
+    assert normalize_dist_name("ONNXRuntime-.GPU") == "onnxruntime-gpu"
+
+    # All three spellings are DETECTED, in both surfaces.
+    for spelling in ("Flash_Attn", "flash.attn", "flash-attn"):
+        assert forbidden_direct_dependencies([f"{spelling}>=2.7"]) == ["flash-attn"]
+        lock_text = f'[[package]]\nname = "{spelling}"\nversion = "2.7.0"\n'
+        assert forbidden_resolved_packages(lock_text) == ["flash-attn"]
+
+
+def test_guard_fails_loudly_when_lockfile_absent():
+    """An absent lockfile raises rather than reporting an empty clean list."""
+    missing = REPO_ROOT / "uv.lock.does-not-exist"
+    assert not missing.exists()
+    with pytest.raises(FileNotFoundError):
+        read_lock_text(missing)
+
+    # A lockfile that declares no packages at all cannot be a resolved closure;
+    # reporting it clean would be a vacuous pass.
+    for empty in ("", "\n\n", "[manifest]\nmembers = []\n"):
+        with pytest.raises(ValueError):
+            forbidden_resolved_packages(empty)
+
+
+def test_guard_rejects_requirement_declaring_no_extras():
+    """A lerobot requirement declaring no extras fails the feetech assertion."""
+    extras, spec = parse_lerobot_requirement(["lerobot==0.6.1"])
+    assert extras == frozenset()
+    assert "feetech" not in extras, "no-extras must fail the feetech-required check"
+    assert extras <= LEROBOT_EXTRAS_ALLOWLIST, "the empty set is trivially a subset"
+    assert spec == "==0.6.1"
+
+    # An empty bracket group is also no extras, not a parse error.
+    empty_brackets, _spec = parse_lerobot_requirement(["lerobot[]==0.6.1"])
+    assert empty_brackets == frozenset()
+
+    # A dependency list with no lerobot requirement at all fails loudly rather
+    # than silently reporting a clean, empty extras set.
+    with pytest.raises(ValueError):
+        parse_lerobot_requirement(["fastapi>=0.129.0", "loguru>=0.7.3"])
 
 
 def test_client_requires_python_stays_312():

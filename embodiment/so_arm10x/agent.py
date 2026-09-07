@@ -48,6 +48,7 @@ from embodiment.so_arm10x.skills import (
     PlaceSkill,
     ResetPoseSkill,
 )
+from policy.factory import make_policy_backend
 from shared import (
     ITaskManager,
     IMessageBroker,
@@ -667,7 +668,11 @@ def create_robot_agent(
         wrist_cam_idx=wrist_cam_idx,
         front_cam_idx=front_cam_idx,
     )
-    gr00t_instance = Gr00tRobotInferenceClient(host=policy_host)
+    # Policy backend is SELECTED, never hardcoded (BACK-01/02/03): the factory
+    # validates DUME_POLICY_BACKEND and raises here — before
+    # `SO10xArmController.connect()` (driven by `IRobotController.activate()`)
+    # ever touches the serial bus.
+    gr00t_instance = make_policy_backend(host=policy_host)
 
     return SO10xRobotAgent(
         robot_controller=robot_controller,

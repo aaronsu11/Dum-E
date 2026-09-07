@@ -106,6 +106,7 @@ def _spawn_agent_worker(
     agent_args: Dict[str, Any],
     config_path: Optional[str] = None,
     extra_env: Optional[Dict[str, str]] = None,
+    controller_config: Optional[Dict[str, Any]] = None,
 ):
     env = os.environ.copy()
     env.update(
@@ -113,6 +114,24 @@ def _spawn_agent_worker(
             "DUME_NAMESPACE": config.namespace,
         }
     )
+
+    # Pass policy configuration via environment variables for the agent worker,
+    # which is the process that reaches policy.factory.make_policy_backend().
+    # Precedence: inherited shell env var (DUME_POLICY_BACKEND) > config file >
+    # built-in default. An operator who exports DUME_POLICY_BACKEND=groot-native
+    # to pin which network commands the arm must win over a stale my-dum-e.yaml
+    # value — do NOT unconditionally overwrite an already-set env var with the
+    # config value, which is exactly what `env.update` would do.
+    policy_env_defaults = {
+        "DUME_POLICY_BACKEND": (controller_config or {}).get(
+            "policy_backend", "groot-native"
+        ),
+    }
+    for env_key, config_value in policy_env_defaults.items():
+        # setdefault: only apply the config/default value when the operator has
+        # not already exported the variable in the shell environment.
+        env.setdefault(env_key, config_value)
+
     if extra_env:
         env.update(extra_env)
 
@@ -158,9 +177,11 @@ def _spawn_agent_worker(
                 ]
             )
 
+    policy_backend_display = env.get("DUME_POLICY_BACKEND", "groot-native")
     logger.info(
-        "Starting agent worker with namespace={} and args={}",
+        "Starting agent worker with namespace={} policy_backend={} and args={}",
         config.namespace,
+        policy_backend_display,
         agent_args,
     )
     return subprocess.Popen(cmd, env=env)
@@ -297,6 +318,7 @@ def main():
                     agent_args,
                     config_path=args.config,
                     extra_env=env_common,
+                    controller_config=ctrl_cfg,
                 )
                 procs.append(agent_proc)
 

@@ -45,7 +45,7 @@ from lerobot.robots import (
 )  # noqa: F401
 from lerobot.utils.utils import init_logging, log_say
 
-from shared import IRobotController
+from shared import IPolicyBackend, IRobotController
 from policy.gr00t.service import ExternalRobotInferenceClient
 from utils import load_config_file
 
@@ -63,14 +63,18 @@ def _recursive_add_extra_dim(obs: Dict) -> Dict:
     return obs
 
 
-class Gr00tRobotInferenceClient:
-    """Wrapper for the Isaac-GR00T inference service compatible with the new
+class Gr00tRobotInferenceClient(IPolicyBackend):
+    """The ``groot-native`` :class:`~shared.IPolicyBackend`: Isaac-GR00T native ZMQ.
+
+    Wrapper for the Isaac-GR00T inference service compatible with the new
     observation schema and Dum-E's expectations.
 
     - Accepts `camera_keys` and `robot_state_keys` to build observations.
-    - Provides `set_lang_instruction` and stores `language_instruction`.
+    - Provides `set_lang_instruction` and exposes a read-only
+      `language_instruction` property over the `_language_instruction` field.
     - `get_action` accepts a raw observation dict and returns a list of action dicts.
-    - `get_action_from_images_state` is a convenience for legacy flows.
+    - `reset()` recreates the strict-FSM REQ socket between episodes; `close()`
+      releases socket + context and is idempotent.
     """
 
     def __init__(
@@ -93,18 +97,77 @@ class Gr00tRobotInferenceClient:
             "gripper.pos",
         ]
         self.show_images = show_images
-        self.language_instruction = language_instruction
+        self._language_instruction = language_instruction
+        self._closed = False
         assert (
             len(self.robot_state_keys) == 6
         ), f"robot_state_keys should be size 6, but got {len(self.robot_state_keys)}"
         self.modality_keys = ["single_arm", "gripper"]
 
+    @property
+    def language_instruction(self) -> Optional[str]:
+        """The stored instruction (read-only; set via `set_lang_instruction`)."""
+        return self._language_instruction
+
     def set_lang_instruction(self, lang_instruction: str) -> None:
-        self.language_instruction = lang_instruction
+        self._language_instruction = lang_instruction
+
+    def ping(self) -> bool:
+        """Backend reachability. Delegates to the transport; never raises."""
+        return self.policy.ping()
+
+    def reset(self) -> None:
+        """Recreate the REQ socket so no mid-FSM socket leaks between episodes.
+
+        `_init_socket()` is the documented close-with-LINGER=0-and-recreate path
+        (see `policy/gr00t/service.py`); it is safe to call when nothing is in
+        flight, and a fresh socket is exactly what a strict-REQ peer needs after
+        an aborted episode.
+        """
+        self.policy._init_socket()
+        self._closed = False
+
+    def close(self) -> None:
+        """Release the transport socket + zmq context. Idempotent.
+
+        Mirrors `BaseInferenceClient.__del__`'s best-effort cleanup
+        (`socket.close(linger=0)` then `context.term()`, each guarded), so a
+        double close — e.g. an explicit `close()` inside a `session()` body plus
+        the `finally` — is a no-op rather than a raise over the original error.
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        policy = getattr(self, "policy", None)
+        socket = getattr(policy, "socket", None)
+        if socket is not None:
+            try:
+                socket.close(linger=0)
+            except Exception:
+                pass
+        context = getattr(policy, "context", None)
+        if context is not None:
+            try:
+                context.term()
+            except Exception:
+                pass
 
     def get_action(
         self, observation_dict: Dict[str, Any], lang: Optional[str] = None
     ) -> List[Dict[str, float]]:
+        # Fail closed on a missing instruction rather than sending a null under
+        # the pinned annotation key: the server accepts it and returns motion
+        # conditioned on nothing, which reads downstream as checkpoint drift
+        # instead of as the configuration error it is.
+        instruction = lang or self._language_instruction
+        if not instruction:
+            raise ValueError(
+                "No language instruction: get_action() was called without a `lang` "
+                "argument and no instruction is stored on the backend. Pass `lang` "
+                "or call set_lang_instruction() first — a null "
+                "`annotation.human.task_description` must never reach the policy."
+            )
+
         # Build nested obs dict for new Isaac-GR00T API
         state = np.array([observation_dict[k] for k in self.robot_state_keys])
         obs_dict: Dict[str, Any] = {
@@ -120,7 +183,7 @@ class Gr00tRobotInferenceClient:
                 # (gr00t/eval/real_robot/SO100/eval_so100.py:128) AND validated by
                 # live server strict-mode rejection of the .action. variant.
                 # The correct key is `annotation.human.task_description` (NO `.action.`).
-                "annotation.human.task_description": lang or self.language_instruction
+                "annotation.human.task_description": instruction
             },
         }
 

@@ -231,11 +231,14 @@ def test_connect_asserts_calibration_before_reading_any_observation(
             get_observation=_fail_on_observation,
         ),
         _assert_calibration_loaded=lambda: calls.append("assert_calibration"),
-        set_so10x_robot_preset=lambda: calls.append("preset"),
+        # Plan 05-05 replaced `set_so10x_robot_preset()` (a torque-disabled write
+        # loop wrapped in a bare except) with a read-back assertion at the same
+        # point in `connect()`. The ordering this test pins is unchanged.
+        _assert_pid_landed=lambda: calls.append("pid_readback"),
     )
 
     SO10xArmController.connect(stub, calibrate=False)
 
     assert "get_observation" not in calls
     assert calls.index("robot.connect") < calls.index("assert_calibration")
-    assert calls.index("assert_calibration") < calls.index("preset")
+    assert calls.index("assert_calibration") < calls.index("pid_readback")

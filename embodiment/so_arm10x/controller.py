@@ -390,6 +390,39 @@ def assert_calibration_loaded(
 
 
 # ============================================================================
+# Safety and stiffness presets (LR-04 / D-01 / D-02)
+# ============================================================================
+
+
+# Dum-E's PID preset, keyed by the Feetech register names the motor bus uses.
+#
+# These values are *not* new — Dum-E has written 10/0/5 since v1.0 to reduce
+# shakiness, against upstream's 16/0/32. What is new at lerobot 0.6.1 is that
+# they became CONFIGURABLE: `SOFollowerConfig` grew `position_p_coefficient`,
+# `position_i_coefficient` and `position_d_coefficient`, and
+# `SOFollower.configure()` — which `connect()` already calls — writes them from
+# the config while still inside `torque_disabled()`.
+#
+# So the preset is declared on the config (see both branches in `__init__`) and
+# upstream lands it on the first pass. Dum-E's remaining job is EVIDENCE, not
+# writing: `_assert_pid_landed()` reads the coefficients back from every motor
+# and refuses to connect on a mismatch. A clean write is not evidence the value
+# landed (CONTEXT.md D-02), and a Feetech bus can drop or corrupt a packet.
+DUME_PID: Dict[str, int] = {
+    "P_Coefficient": 10,
+    "I_Coefficient": 0,
+    "D_Coefficient": 5,
+}
+
+# Minimum retry count for a coefficient read-back. Upstream's `read` defaults to
+# `num_retry=0`, which turns one dropped packet on the Feetech bus into a value
+# mismatch — and under D-01 a mismatch refuses to connect a perfectly healthy
+# arm. The floor is applied over `config.num_read_retries` so a config that
+# lowers retries cannot silently disable this one.
+_PID_READ_MIN_RETRIES = 2
+
+
+# ============================================================================
 # Hardware wrapper built on LeRobot API
 # ============================================================================
 
@@ -455,6 +488,13 @@ class SO10xArmController(IRobotController):
                 cameras=cameras,
                 use_degrees=use_degrees,
                 max_relative_target=max_relative_target,
+                # LR-04: declarative. Upstream `configure()` writes these during
+                # `connect()`, so the preset lands on the first pass — no
+                # post-connect register overwrite, no second torque-disabled
+                # cycle. Verified by `_assert_pid_landed()`.
+                position_p_coefficient=DUME_PID["P_Coefficient"],
+                position_i_coefficient=DUME_PID["I_Coefficient"],
+                position_d_coefficient=DUME_PID["D_Coefficient"],
             )
         elif robot_type == "so100_follower":
             # Fall back to SO-100 if desired
@@ -466,6 +506,11 @@ class SO10xArmController(IRobotController):
                 cameras=cameras,
                 use_degrees=use_degrees,
                 max_relative_target=max_relative_target,
+                # LR-04, same as the SO-101 branch: an SO-100 arm is not
+                # entitled to the library defaults either.
+                position_p_coefficient=DUME_PID["P_Coefficient"],
+                position_i_coefficient=DUME_PID["I_Coefficient"],
+                position_d_coefficient=DUME_PID["D_Coefficient"],
             )
         else:
             raise ValueError(f"Unsupported robot_type: {robot_type}")
@@ -505,8 +550,10 @@ class SO10xArmController(IRobotController):
         # while the in-Python mapping stays empty, and the failure then surfaces
         # at the first bus read instead of here.
         self._assert_calibration_loaded()
-        # Apply our preferred preset on connect
-        self.set_so10x_robot_preset()
+        # The Dum-E PID preset is declared on the config and written by upstream
+        # `configure()` during the connect above. What remains is proving it
+        # landed (D-02) — and refusing to operate the arm if it did not (D-01).
+        self._assert_pid_landed()
 
     def _assert_calibration_loaded(self) -> Tuple[Path, str]:
         """Confirm the calibration file loaded, logging its path and checksum.
@@ -543,19 +590,83 @@ class SO10xArmController(IRobotController):
     def get_observation(self) -> Dict[str, Any]:
         return self.robot.get_observation()
 
-    # ------------------------ Convenience methods ------------------------
-    def set_so10x_robot_preset(self) -> None:
-        """Adjust controller gains to reduce shakiness. Best-effort with new API."""
-        try:
-            with self.robot.bus.torque_disabled():
-                for motor in self.robot.bus.motors:
-                    self.robot.bus.write("P_Coefficient", motor, 10)
-                    self.robot.bus.write("I_Coefficient", motor, 0)
-                    self.robot.bus.write("D_Coefficient", motor, 5)
-        except Exception:
-            # Keep silent if firmware/register names differ
-            pass
+    def _assert_pid_landed(self) -> Dict[str, Dict[str, int]]:
+        """Read the PID preset back from every motor and assert it landed.
 
+        Returns:
+            ``{motor: {register: observed value}}`` for all six motors — logged
+            at INFO so a later phase can cite the stiffness the arm *actually*
+            ran at rather than the value that was requested (D-02).
+
+        Raises:
+            RuntimeError: a coefficient read failed. The underlying exception is
+                chained.
+            ValueError: one or more read-back values do not match the preset.
+                Every mismatch is aggregated into a single message.
+
+        This method REPLACES the former ``set_so10x_robot_preset()``, whose
+        torque-disabled write loop wrapped in ``except Exception: pass`` is the
+        debt recorded in ``.planning/codebase/CONCERNS.md``. Two changes, both
+        deliberate:
+
+        * **It only reads.** At 0.6.1 the write is upstream's responsibility (the
+          three coefficients are config fields that ``configure()`` writes), so
+          re-writing them here would be a redundant second torque-disabled cycle.
+          That also dissolves D-01's recorded risk that a renamed *write* API
+          would hard-stop the phase.
+        * **It raises.** CONTEXT.md D-01 forbids softening this to a warning or a
+          best-effort skip to get past a bus problem: operating the arm at
+          unknown stiffness is the failure this exists to prevent, and a silent
+          stiffness change would present in Phase 7 as apparent checkpoint drift.
+
+        Two register-access specifics are load-bearing. ``normalize=False``,
+        because normalization is defined for *position* registers through the
+        calibration mapping and is meaningless for coefficient registers. And a
+        non-zero ``num_retry``, so one dropped packet on the Feetech bus surfaces
+        as a retry rather than as a false mismatch.
+        """
+        num_retry = max(
+            _PID_READ_MIN_RETRIES,
+            int(getattr(self.config, "num_read_retries", 0) or 0),
+        )
+
+        observed: Dict[str, Dict[str, int]] = {}
+        mismatches: List[str] = []
+        for motor in self.robot.bus.motors:
+            observed[motor] = {}
+            for register, expected in DUME_PID.items():
+                try:
+                    actual = self.robot.bus.read(
+                        register, motor, normalize=False, num_retry=num_retry
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not read {register} from motor {motor!r} to verify "
+                        f"the Dum-E PID preset {DUME_PID}: the arm will NOT be "
+                        f"operated at unknown stiffness. Fix the motor bus rather "
+                        f"than softening this check (CONTEXT.md D-01)."
+                    ) from exc
+                observed[motor][register] = actual
+                if actual != expected:
+                    mismatches.append(
+                        f"{motor}.{register}: expected {expected}, observed {actual}"
+                    )
+
+        if mismatches:
+            # Aggregated on purpose: a read-back that is neither the Dum-E preset
+            # nor the library default means the write PARTIALLY landed, which is
+            # more dangerous than either endpoint. One message per connect shows
+            # which motors took the write and which did not.
+            raise ValueError(
+                "Dum-E PID preset did not land on the motor bus; refusing to "
+                f"operate the arm at unknown stiffness. Expected {DUME_PID}. "
+                f"Mismatches: {'; '.join(mismatches)}"
+            )
+
+        logger.info("PID read-back verified on every motor: {}", observed)
+        return observed
+
+    # ------------------------ Convenience methods ------------------------
     def get_current_state(self) -> np.ndarray:
         obs = self.get_observation()
         return np.array([float(obs[k]) for k in self._state_keys], dtype=np.float64)

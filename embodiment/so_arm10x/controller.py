@@ -37,6 +37,7 @@ from pprint import pformat
 import draccus
 import matplotlib.pyplot as plt
 import numpy as np
+from loguru import logger
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.robots import Robot, RobotConfig, make_robot_from_config  # noqa: F401
 from lerobot.robots.so_follower import SOFollower
@@ -266,14 +267,64 @@ def view_img(img, overlay_img=None):
 # ============================================================================
 
 
+# Fixed intermediate path segment upstream inserts between the calibration root
+# and the robot class name (`lerobot.utils.constants.ROBOTS`).
+_CALIBRATION_ROBOTS_SEGMENT = "robots"
+
+# Upstream's default cache layout when neither HF_LEROBOT_CALIBRATION nor
+# HF_LEROBOT_HOME is set: `HF_HOME / "lerobot" / "calibration"`, with HF_HOME
+# itself defaulting to the standard huggingface cache directory.
+_HF_CACHE_RELATIVE_DEFAULT = (".cache", "huggingface")
+_LEROBOT_CACHE_SEGMENT = "lerobot"
+_CALIBRATION_SEGMENT = "calibration"
+
+
 def resolve_lerobot_calibration_root() -> Path:
-    """RED stub — see plan 05-04 Task 2."""
-    raise NotImplementedError("resolve_lerobot_calibration_root")
+    """Resolve LeRobot's calibration root from the documented env vars.
+
+    Mirrors ``lerobot.utils.constants``: ``HF_LEROBOT_CALIBRATION`` wins outright,
+    otherwise the root is ``HF_LEROBOT_HOME / "calibration"``, with
+    ``HF_LEROBOT_HOME`` itself defaulting to ``HF_HOME / "lerobot"``.
+
+    Re-derived rather than imported on purpose. The upstream constants are
+    module-level and therefore evaluated at import time, so an imported constant
+    cannot reflect an environment variable set after ``lerobot`` was first
+    imported — which is precisely what a hermetic test needs to do. No absolute
+    home-directory path is hardcoded; the fallback is composed from
+    ``Path.home()``.
+    """
+    explicit = os.getenv("HF_LEROBOT_CALIBRATION")
+    if explicit:
+        return Path(explicit).expanduser()
+
+    lerobot_home = os.getenv("HF_LEROBOT_HOME")
+    if lerobot_home:
+        return Path(lerobot_home).expanduser() / _CALIBRATION_SEGMENT
+
+    hf_home = os.getenv("HF_HOME")
+    base = (
+        Path(hf_home).expanduser()
+        if hf_home
+        else Path.home().joinpath(*_HF_CACHE_RELATIVE_DEFAULT)
+    )
+    return base / _LEROBOT_CACHE_SEGMENT / _CALIBRATION_SEGMENT
 
 
 def resolve_calibration_file(robot_name: str, robot_id: str) -> Path:
-    """RED stub — see plan 05-04 Task 2."""
-    raise NotImplementedError("resolve_calibration_file")
+    """Derive the calibration file path exactly as ``Robot.__init__`` does.
+
+    Upstream builds ``HF_LEROBOT_CALIBRATION / ROBOTS / self.name`` and appends
+    ``f"{self.id}.json"``. ``robot_name`` is the robot CLASS's ``name`` attribute,
+    not Dum-E's ``robot_type`` string: lerobot 0.6.1 consolidated both follower
+    classes into ``SOFollower``, whose ``name`` is ``so_follower``, so the derived
+    directory moved even though ``robot_type`` did not change.
+    """
+    return (
+        resolve_lerobot_calibration_root()
+        / _CALIBRATION_ROBOTS_SEGMENT
+        / robot_name
+        / f"{robot_id}.json"
+    )
 
 
 def assert_calibration_loaded(
@@ -281,8 +332,61 @@ def assert_calibration_loaded(
     robot_id: Optional[str] = None,
     expected_path: Optional[Path] = None,
 ) -> Tuple[Path, str]:
-    """RED stub — see plan 05-04 Task 2."""
-    raise NotImplementedError("assert_calibration_loaded")
+    """Assert the calibration FILE exists; return its path and content checksum.
+
+    Args:
+        robot_name: the robot class's ``name`` (used only when ``expected_path``
+            is not supplied).
+        robot_id: the calibration filename stem (likewise).
+        expected_path: an already-derived path, e.g. the robot object's own
+            ``calibration_fpath``, which is the authoritative answer to which
+            file lerobot will load because it already accounts for a
+            ``config.calibration_dir`` override.
+
+    Returns:
+        ``(resolved path, sha256 hex digest of its bytes)``.
+
+    Raises:
+        FileNotFoundError: the file is absent, with the checked path in the
+            message.
+
+    Two deliberate design points, each from an executed finding:
+
+    * It verifies the **file**, never the containing directory.
+      ``Robot.__init__`` calls ``mkdir(parents=True, exist_ok=True)`` on the
+      derived path, so after the ``so101_follower`` -> ``so_follower`` rename a
+      directory listing shows a freshly created, provisioned-looking, EMPTY
+      directory. Directory existence is not evidence.
+    * The checksum is an **integrity aid, not a security control** — it is not
+      tamper protection and must not be presented as such. Its one job is to make
+      a wrong-file copy visible, which is the failure mode the loud missing-file
+      error does not cover, and which is the accepted tradeoff of copying the
+      calibration rather than pinning its directory (CONTEXT.md D-05).
+    """
+    if expected_path is not None:
+        path = Path(expected_path)
+    else:
+        if not robot_name or not robot_id:
+            raise ValueError(
+                "assert_calibration_loaded needs either an expected_path or both "
+                f"robot_name and robot_id (got robot_name={robot_name!r}, "
+                f"robot_id={robot_id!r})"
+            )
+        path = resolve_calibration_file(robot_name, robot_id)
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"LeRobot calibration file not found at {path}. The arm would run "
+            f"with an EMPTY in-Python calibration, and because the raw encoder "
+            f"tick ranges in that file map physical poses onto the numbers fed to "
+            f"the policy, refusing to proceed is the only safe option. Note that "
+            f"the parent directory existing is not evidence: lerobot creates it "
+            f"unconditionally. Copy the calibration JSON into "
+            f"{path.parent} (the pre-0.6.x copy lives in the sibling "
+            f"'so101_follower' directory), or run lerobot-calibrate."
+        )
+
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 # ============================================================================
@@ -395,12 +499,40 @@ class SO10xArmController(IRobotController):
 
     def connect(self, calibrate: bool = True) -> None:
         self.robot.connect(calibrate=calibrate)
+        # Assert the calibration FILE loaded before anything reads an observation.
+        # `connect()` succeeding is not evidence: the calibrated flag reads the
+        # motors, so a firmware-calibrated arm makes connect skip calibration
+        # while the in-Python mapping stays empty, and the failure then surfaces
+        # at the first bus read instead of here.
+        self._assert_calibration_loaded()
         # Apply our preferred preset on connect
         self.set_so10x_robot_preset()
 
     def _assert_calibration_loaded(self) -> Tuple[Path, str]:
-        """RED stub — see plan 05-04 Task 2."""
-        raise NotImplementedError("_assert_calibration_loaded")
+        """Confirm the calibration file loaded, logging its path and checksum.
+
+        Prefers the robot object's own ``calibration_fpath`` — the authoritative
+        answer to which file lerobot will load — and falls back to re-deriving it
+        from the documented environment variables.
+
+        Deliberately does NOT consult the robot's calibrated flag, and does not
+        treat a successful ``connect()`` as evidence: that flag interrogates the
+        MOTORS, so if the servos still hold calibration in firmware the connect
+        path skips calibration entirely while the in-Python calibration mapping
+        stays empty. The resulting error then arrives at the first bus read, after
+        connect already reported success. Asserting the file here is what closes
+        that window.
+        """
+        robot = getattr(self, "robot", None)
+        path, checksum = assert_calibration_loaded(
+            robot_name=getattr(robot, "name", None),
+            robot_id=self._robot_id,
+            expected_path=getattr(robot, "calibration_fpath", None),
+        )
+        logger.info(
+            "Loaded LeRobot calibration: path={} sha256={}", path, checksum
+        )
+        return path, checksum
 
     def disconnect(self) -> None:
         self.robot.disconnect()

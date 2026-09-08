@@ -1328,8 +1328,14 @@ def demo_clamp(args: argparse.Namespace) -> dict:
     captured: list[str] = []
     sink_id = logger.add(lambda message: captured.append(message.record["message"]), level="WARNING")
 
-    controller, info = open_controller(args)
+    # `open_controller()` goes INSIDE the guarded region. It raising is the common
+    # case (no arm attached, wrong camera index, PID mismatch, calibration absent),
+    # and `check_clamp_demo` catches the exception and lets the run continue — so
+    # constructing the sink outside the try leaked one sink per failed attempt,
+    # each appending every WARNING to a list for the rest of the process.
+    controller = None
     try:
+        controller, info = open_controller(args)
         clamp = controller.config.max_relative_target
         if not isinstance(clamp, float):
             raise ValueError(
@@ -1416,7 +1422,8 @@ def demo_clamp(args: argparse.Namespace) -> dict:
         park_slowly(controller, list(DUME_POSES[REST_POSE]), label=REST_POSE)
         return record
     finally:
-        close_controller(controller)
+        if controller is not None:
+            close_controller(controller)
         logger.remove(sink_id)
 
 

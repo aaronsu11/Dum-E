@@ -1118,6 +1118,27 @@ class SO10xArmController(IRobotController):
         return clamped
 
     def move_to_initial_pose(self) -> None:
+        """Park at the initial pose, always reached via the retracted ready pose.
+
+        The initial pose is the low, extended one (``shoulder_lift`` -102,
+        ``elbow_flex`` 96). Driving to it directly from an arbitrary pose — which
+        is what every post-task reset does, since the policy leaves the arm
+        wherever the episode ended — can sweep the arm into the table. Reaching
+        the retracted ready pose first turns one unbounded move into two bounded
+        ones.
+
+        The waypoint lives HERE, not at the call sites. It was originally added at
+        two call sites and three others were missed (``ResetPoseSkill``, and the
+        post-task resets in both agent run paths), including the reset tool the
+        model is told to call after a failure — precisely the arbitrary-pose case.
+        A safety invariant enforced per-caller is one a new caller silently opts
+        out of.
+
+        Callers that want the arm to *end* at ready (the pick loop) still call
+        :meth:`move_to_ready_pose` afterwards; the extra ready move that implies is
+        a ~1 s no-op when the arm is already there.
+        """
+        self.move_to_ready_pose()
         # These target degrees mirror legacy behavior
         self.set_target_state(
             np.array([0.0, -102, 96.0, 76.0, -90.0, 0.0], dtype=np.float64)

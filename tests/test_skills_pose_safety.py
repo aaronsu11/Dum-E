@@ -1,99 +1,129 @@
-"""The ``pose="initial"`` reset ordering, which is a physical-safety property.
+"""The initial-pose reset ordering, which is a physical-safety property.
 
-``PickSkill.run(pose="initial")`` runs at the start of every scored baseline
-attempt, so it executes from wherever the *previous* attempt left the arm — an
-arbitrary policy pose, not a known one.
+The initial pose is the low, extended one (``shoulder_lift`` -102, ``elbow_flex``
+96); the ready pose is retracted (-90, 75). Driving straight to initial from an
+arbitrary pose was observed on hardware sweeping the arm toward the table. Every
+post-task reset is exactly that case, because the policy leaves the arm wherever
+the episode ended.
 
-The initial pose is the low, extended one (``shoulder_lift`` -102,
-``elbow_flex`` 96); the ready pose is retracted (-90, 75). Driving straight to
-initial from an arbitrary pose was observed on hardware sweeping the arm toward
-the table. Reaching ready first turns one unbounded move into two bounded ones.
-It is also the reset-from-extreme-pose case plan 05-05 predicted would produce
-the largest legitimate clamp delta (~190 on ``elbow_flex``, above the 160.0
-clamp).
+**The waypoint lives in the controller, not at the call sites.** It was first
+added at two call sites and three others were missed — ``ResetPoseSkill`` (the
+reset tool the model is told to call after a failure, i.e. the most
+arbitrary-pose situation there is) and the post-task resets in both agent run
+paths. A safety invariant enforced per-caller is one the next caller silently
+opts out of, so these tests pin it at the single chokepoint every caller shares.
 
-Two properties are pinned here, and the second is easy to lose while "fixing"
-the first:
+Two properties are pinned, and the second is easy to lose while fixing the first:
 
-1. ready comes BEFORE initial, so the descent never starts from an arbitrary pose;
-2. the sequence still ENDS at ready, because the pick begins from the ready pose
-   and changing that would make the run non-comparable to the v1.0 baseline.
+1. ``move_to_initial_pose()`` reaches ready BEFORE commanding the initial vector,
+   for every caller;
+2. ``PickSkill.run(pose="initial")`` still ENDS at ready, because the pick begins
+   from the ready pose and changing that would make the run non-comparable to the
+   v1.0 baseline.
 
 Hermetic: no serial port, no cameras, no policy server.
 """
 
 from types import SimpleNamespace
-from typing import List
+from typing import Any, List
 
-from embodiment.so_arm10x.skills import PickSkill
+import numpy as np
+
+from embodiment.so_arm10x.controller import SO10xArmController
+from embodiment.so_arm10x.skills import PickSkill, ResetPoseSkill
+
+#: The two pose vectors, as `controller.py` defines them. Indexed by joint order
+#: (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper).
+READY = [0.0, -90, 75.0, 75.0, -90.0, 0.0]
+INITIAL = [0.0, -102, 96.0, 76.0, -90.0, 0.0]
 
 
-class PoseRecordingController:
-    """Records pose-move calls in order; every other member is inert."""
+def _controller_recording_targets() -> Any:
+    """A controller shell that records the pose VECTORS handed to the arm.
 
-    def __init__(self) -> None:
-        self.calls: List[str] = []
+    Built via ``__new__`` so no serial port or camera config is demanded. Only
+    ``set_target_state`` and ``time.sleep`` are exercised by the pose helpers, so
+    recording the former captures everything that would reach the hardware.
+    """
+    controller = SO10xArmController.__new__(SO10xArmController)
+    controller.targets = []  # type: ignore[attr-defined]
 
-    def move_to_initial_pose(self) -> None:
-        self.calls.append("initial")
-
-    def move_to_ready_pose(self) -> None:
-        self.calls.append("ready")
-
-    # `run` returns the latest images after the loop; with zero iterations the
-    # pick loop body never executes, so these only need to exist.
-    def get_current_images(self):
+    def _record(target):
+        controller.targets.append(  # type: ignore[attr-defined]
+            [round(float(v), 4) for v in np.asarray(target).tolist()]
+        )
         return {}
 
-    def get_observation(self):  # pragma: no cover - unreachable at 0 iterations
-        raise AssertionError("the pick loop must not run in a pose-ordering test")
+    controller.set_target_state = _record  # type: ignore[assignment]
+    return controller
 
 
-def _skill() -> PickSkill:
-    controller = PoseRecordingController()
+def test_move_to_initial_pose_reaches_ready_first():
+    """The single chokepoint: the descent to initial is preceded by ready."""
+    controller = _controller_recording_targets()
+
+    controller.move_to_initial_pose()
+
+    assert controller.targets == [READY, INITIAL], (
+        "move_to_initial_pose must command ready before initial so the descent "
+        f"is never issued from an arbitrary pose; got {controller.targets}"
+    )
+
+
+def test_reset_pose_skill_inherits_the_waypoint():
+    """`ResetPoseSkill` is the reset tool the model calls on failure.
+
+    It was one of the three paths missed when the waypoint lived at call sites.
+    """
+    controller = _controller_recording_targets()
+    controller.get_current_images = lambda: {}  # type: ignore[assignment]
+
+    ResetPoseSkill(controller, SimpleNamespace()).run()
+
+    assert controller.targets == [READY, INITIAL], (
+        f"the reset tool must inherit the ready waypoint; got {controller.targets}"
+    )
+
+
+def test_pick_skill_initial_reset_ends_at_ready():
+    """The pick begins from ready -- keep the trailing move or the baseline shifts."""
+    controller = _controller_recording_targets()
+    controller.get_current_images = lambda: {}  # type: ignore[assignment]
+
     # `actions_to_execute=0` isolates the pose reset: the obs -> policy -> action
-    # loop never runs, so no policy client is needed and nothing commands motion.
-    return PickSkill(controller, SimpleNamespace())
-
-
-def test_initial_pose_reset_reaches_ready_before_initial():
-    """The descent to the low initial pose must start from ready, not arbitrary."""
-    skill = _skill()
-
-    skill.run(actions_to_execute=0, pose="initial", language_instruction="x")
-
-    calls = skill.controller.calls
-    assert "ready" in calls and "initial" in calls
-    assert calls.index("ready") < calls.index("initial"), (
-        f"ready must precede initial so the descent is bounded; got {calls}"
+    # loop never runs, so no policy client is needed and nothing else commands motion.
+    PickSkill(controller, SimpleNamespace()).run(
+        actions_to_execute=0, pose="initial", language_instruction="x"
     )
 
-
-def test_initial_pose_reset_still_ends_at_ready():
-    """The pick starts from ready -- keep the trailing move or the baseline shifts."""
-    skill = _skill()
-
-    skill.run(actions_to_execute=0, pose="initial", language_instruction="x")
-
-    assert skill.controller.calls[-1] == "ready", (
-        "the sequence must end at ready, because the pick begins there and the "
-        f"v1.0 baseline was taken from there; got {skill.controller.calls}"
+    assert controller.targets == [READY, INITIAL, READY], (
+        "the pick reset must be ready -> initial -> ready: the waypoint protects "
+        "the descent, and the final ready is where the pick begins; got "
+        f"{controller.targets}"
     )
-
-
-def test_initial_pose_reset_full_expected_order():
-    """Pin the whole sequence: ready -> initial -> ready."""
-    skill = _skill()
-
-    skill.run(actions_to_execute=0, pose="initial", language_instruction="x")
-
-    assert skill.controller.calls == ["ready", "initial", "ready"]
+    assert controller.targets[-1] == READY
 
 
 def test_resume_pose_commands_no_reset_motion():
     """``pose="resume"`` must not move the arm at all."""
-    skill = _skill()
+    controller = _controller_recording_targets()
+    controller.get_current_images = lambda: {}  # type: ignore[assignment]
 
-    skill.run(actions_to_execute=0, pose="resume", language_instruction="x")
+    PickSkill(controller, SimpleNamespace()).run(
+        actions_to_execute=0, pose="resume", language_instruction="x"
+    )
 
-    assert skill.controller.calls == []
+    assert controller.targets == []
+
+
+def test_ready_pose_does_not_route_through_initial():
+    """Guard against a symmetric "fix" that makes the two helpers mutually recursive.
+
+    ``move_to_ready_pose`` must stay a single primitive move; routing it via
+    initial would both invert the safety property and recurse forever.
+    """
+    controller = _controller_recording_targets()
+
+    controller.move_to_ready_pose()
+
+    assert controller.targets == [READY]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay and validate the frozen v1.0 corpus — exits non-zero, never skips quietly.
 
-The corpus under ``corpus/frozen_v1_0/`` is the evidence Phase 7's parity gate is
+The corpus under ``corpus/frozen_v1_0/`` is the evidence the checkpoint parity gate is
 measured against, and Phases 6-8 read it repeatedly. This harness is the
 instrument that proves it is actually replayable: it walks every record on disk,
 re-loads it, and asserts the schema, geometry and provenance the capture script
@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 #: The only corpus schema version this verifier understands.
 EXPECTED_SCHEMA_VERSION = 1
 
-#: The permitted D-07 verdict literals.
+#: The permitted seed-reproducibility verdict literals.
 SEED_VERDICTS = ("honored", "not-honored", "undetermined")
 
 #: Arrays every record must carry, with their expected dtype.
@@ -185,7 +185,7 @@ def verify_corpus(
     else:
         checks.ok("disk_agreement", f"{len(on_disk)} .npz files match the manifest exactly")
 
-    # [5] D-07 seed verdict.
+    # [5] seed-reproducibility verdict.
     checks.start("seed_verdict is recorded with cited numbers")
     verdict = manifest.get("seed_verdict")
     evidence = manifest.get("seed_verdict_evidence")

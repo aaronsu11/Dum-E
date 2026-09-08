@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture the frozen v1.0 observation-to-action corpus (LR-05 / D-06 / D-07 / D-09).
+"""Capture the frozen v1.0 observation-to-action corpus.
 
 Reads a stratified subset of the ``aaronsu11/so101_fruit`` LeRobot dataset
 DIRECTLY from raw parquet + AV1 video, pushes each frame through the running
@@ -29,7 +29,7 @@ Usage:
     uv run python scripts/capture_frozen_corpus.py --records 1 --samples-per-obs 1 \
         --out corpus/smoke_one
 
-    # 2. D-07 seed-reproducibility verdict (double run + different-seed control)
+    # 2. seed-reproducibility verdict (double run + different-seed control)
     uv run python scripts/capture_frozen_corpus.py --seed-check-only --out corpus/smoke_seed
 
     # 3. bulk stratified capture (the deliverable)
@@ -55,7 +55,7 @@ On-disk layout written under ``--out``:
 why the capture calls ``ExternalRobotInferenceClient.get_action`` directly rather
 than ``Gr00tRobotInferenceClient.get_action`` — the wrapper passes no ``options``
 (the only channel a seed can ride) and flattens the chunk into per-step python
-floats, discarding the arrays Phase 7 needs to diff.
+floats, discarding the arrays the parity gate needs to diff.
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ from policy.gr00t.service import ExternalRobotInferenceClient  # noqa: E402
 #: Corpus schema version written into (and asserted by) the manifest.
 CORPUS_SCHEMA_VERSION = 1
 
-#: The corpus source and ground-truth reference (CONTEXT.md D-09).
+#: The corpus source and ground-truth reference.
 DEFAULT_REPO_ID = "aaronsu11/so101_fruit"
 
 #: The dataset's codebase version. The AWS recipe that produced the checkpoint
@@ -516,12 +516,13 @@ def validate_seed_reproducibility(
     seed: int,
     option_keys: Sequence[str] = SEED_OPTION_KEYS,
 ) -> tuple[str, dict[str, Any]]:
-    """Settle D-07 empirically: does the server reproduce a chunk under one seed?
+    """Settle seed reproducibility empirically: does the server reproduce a chunk
+    under one seed?
 
     For each candidate ``options`` key: two calls with the SAME seed, then a
     control call with a DIFFERENT seed. Same-seed equality alone is NOT enough —
     a server that ignores ``options`` but is deterministic would read as
-    "honored", which is the false positive that would send Phase 7 down the wrong
+    "honored", which is the false positive that would send the parity gate down the wrong
     comparison path. ``honored`` therefore requires same-seed diff == 0 AND
     different-seed diff > 0.
 
@@ -791,7 +792,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-count", type=int, default=None,
                         help="Number of episodes to spread records over.")
     parser.add_argument("--seed-check-only", action="store_true",
-                        help="Run the D-07 seed check, write its verdict, capture nothing.")
+                        help="Run the seed check, write its verdict, capture nothing.")
     parser.add_argument("--server-label", default="gr00t:latest",
                         help="Provenance label for the producing server image.")
     parser.add_argument("--force", action="store_true",
@@ -873,8 +874,8 @@ def main() -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # [4] D-07 seed verdict — reuse a recorded verdict, never recompute silently.
-    checks.start("D-07 seed reproducibility verdict (double run + control)")
+    # [4] seed verdict — reuse a recorded verdict, never recompute silently.
+    checks.start("seed reproducibility verdict (double run + control)")
     manifest_path = out_dir / "manifest.json"
     existing: dict[str, Any] = {}
     if manifest_path.exists():
@@ -909,7 +910,7 @@ def main() -> int:
         }
         seed_evidence["server_label"] = args.server_label
         # A not-honored/undetermined verdict is a legitimate recorded outcome; it
-        # decides which comparison Phase 7 USES, and never blocks capture.
+        # decides which comparison the parity gate USES, and never blocks capture.
         checks.ok(
             "seed_verdict",
             f"VERDICT {seed_verdict} "

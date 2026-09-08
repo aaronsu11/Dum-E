@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Arm-free normalization-units discriminators for PAR-04 / PAR-06.
+"""Arm-free normalization-units discriminators for the joint-value convention.
 
 Settles offline which ``MotorNormMode`` the GR00T checkpoint was trained in, and
 derives the real per-joint convention seam. The verdict is ``RANGE_M100_100``
@@ -19,7 +19,8 @@ Four arm-free discriminators, in order of strength:
      ``wrist_roll`` cross-check against the training dataset's recorded band.
   4. ``envelope_contains()`` — run against the INITIAL pose. Never the ready
      pose: the ready pose is inside the envelope under BOTH conventions, so
-     PAR-04's literal assertion decides nothing. The harness prints that as an
+     the envelope assertion as originally specified decides nothing. The harness
+     prints that as an
      explicit non-discrimination note rather than citing it as evidence.
 
 The hardware half (``units_verdict()`` / ``active_mode_from_raw_tick()``,
@@ -293,7 +294,7 @@ MEASURED_SCALE_TOL = 5e-6
 # Maximum_Acceleration/Acceleration to 254 (as fast as the servo goes), so slow
 # motion has to come from small commanded increments rather than from a register:
 # each interpolation step moves at most this many units, and every step still
-# passes through the SAFE-02 clamp.
+# passes through the per-step motion clamp.
 PARK_MAX_STEP = 4.0
 PARK_STEP_DELAY_S = 0.04
 PARK_SETTLE_S = 1.5
@@ -498,7 +499,7 @@ def degrees_to_percent(vector_deg: list[float]) -> list[float]:
 
     DERIVED BY ARITHMETIC, NOT MEASURED. Exact given the verified formulas and
     the verified calibration file, but unconfirmed on hardware — a hypothesis for
-    the raw-tick probe (plan 05-06) to confirm. It also depends on the current
+    the raw-tick probe to confirm. It also depends on the current
     calibration file, so recalibration changes it.
     """
     if len(vector_deg) != 5:
@@ -546,7 +547,8 @@ def envelope_contains(vector: list[float], group: str = "state") -> list[bool]:
 
     Run this against the INITIAL pose. Against the ready pose it returns all-True
     under both candidate conventions and is therefore not admissible as the units
-    verdict's evidence (PAR-04's silent-pass hazard).
+    verdict's evidence — the silent-pass hazard in the originally specified
+    ready-pose assertion.
     """
     groups = {"state": CHECKPOINT_STATE_STATS, "action": CHECKPOINT_ACTION_STATS}
     if group not in groups:
@@ -562,7 +564,7 @@ def envelope_contains(vector: list[float], group: str = "state") -> list[bool]:
     ]
 
 
-# --- The hardware half: shipped here, RUN in plan 05-06 ----------------------
+# --- The hardware half -------------------------------------------------------
 
 
 def active_mode_from_raw_tick(
@@ -590,8 +592,8 @@ def active_mode_from_raw_tick(
 def units_verdict(bus, calibration) -> dict:
     """Read the same register twice — raw then normalized — and report the mode.
 
-    REQUIRES THE ARM. Plan 05-03 ships this unrun; plan 05-06 runs it behind the
-    hardware-attach gate. The ``normalize`` keyword is present and keyword-only in
+    REQUIRES THE ARM, and runs behind the hardware-attach gate. The ``normalize``
+    keyword is present and keyword-only in
     BOTH lerobot 0.3.3 and 0.6.1, so this identical probe runs on either side of
     the version bump — which is what makes the before/after comparison meaningful.
     """
@@ -663,7 +665,7 @@ def envelope_row(joint: str, degrees_value: float, percent_value: float, group: 
 
     ``discriminates`` is the load-bearing field: when it is False the joint's
     reading is inside (or outside) the envelope under both conventions and
-    therefore decides nothing — PAR-04's documented silent-pass hazard. Only rows
+    therefore decides nothing — the documented silent-pass hazard. Only rows
     where it is True are admissible as evidence of the checkpoint's convention.
     """
     groups = {"state": CHECKPOINT_STATE_STATS, "action": CHECKPOINT_ACTION_STATS}
@@ -713,7 +715,7 @@ def interpolate_steps(
     Upstream sets the servos' acceleration registers to their maximum during
     ``configure()``, so "move slowly" cannot be expressed as a register value —
     it has to be expressed as small commanded increments. Every increment still
-    passes through the SAFE-02 clamp; this only ensures none of them needs to.
+    passes through the per-step motion clamp; this only ensures none of them needs to.
     """
     if len(present) != len(target):
         raise ValueError(f"Vector length mismatch: {len(present)} != {len(target)}")
@@ -765,7 +767,7 @@ def compare_pre_and_post_upgrade(
     """Per-joint |pre-upgrade computed value - post-upgrade reported value|.
 
     The pre-upgrade value is recomputed from the SAME raw ticks with the 0.3.3
-    formula. That is exact rather than approximate: plan 05-03 proved the two
+    formula. That is exact rather than approximate: a swept-tick comparison proved the two
     versions' ``_normalize`` bodies byte-identical by sweeping every raw tick
     across each joint's calibrated span, so this is a genuine before-and-after
     comparison taken from one physical pose and one tick read — strictly less
@@ -949,7 +951,7 @@ def _repo_on_path() -> None:
 
     Running this file as a script puts ``scripts/`` on ``sys.path[0]``, not the
     repo root, so the controller import fails without this. Discovered by running
-    the hardware half for the first time (plan 05-06).
+    the hardware half for the first time.
     """
     root = str(REPO_ROOT)
     if root not in sys.path:
@@ -1238,11 +1240,11 @@ def live_pose_sweep(args: argparse.Namespace, pose_names: list[str]) -> dict:
 def reset_to_initial_deltas(pose_names: list[str]) -> dict:
     """Per-joint single-step delta a reset-to-initial would command from each pose.
 
-    Plan 05-05 flagged the reset-to-initial-pose from an extreme policy pose as the
+    The reset-to-initial-pose from an extreme policy pose was flagged as the
     likeliest LEGITIMATE clamp trigger, with a worst-case ``elbow_flex`` delta near
     190 against a clamp of 160. ``move_to_initial_pose()`` issues ONE unsmoothed
     command, so the delta it presents is the full pose difference — this records
-    that difference for each pose actually visited, so Phase 7 can compare a real
+    that difference for each pose actually visited, so the parity gate can compare a real
     clamp warning against a number rather than against a recollection.
     """
     initial = DUME_POSES["initial"]
@@ -1261,11 +1263,11 @@ def observe_reset_to_initial(controller) -> dict:
 
     Deliberately the real helper rather than an interpolated park: this is the
     single-command reset the production pick loop performs, so it is the honest
-    place to observe whether a nominal reset trips the SAFE-02 clamp. It is also
+    place to observe whether a nominal reset trips the motion clamp. It is also
     the safe pose to leave the arm in before the torque drops at disconnect.
 
     The clamp signal is read off Dum-E's own loguru stream, which is the surface
-    SAFE-02 requires it on — not off a return value the helper discards.
+    it has to be visible on — not off a return value the helper discards.
     """
     _repo_on_path()
     from loguru import logger
@@ -1521,7 +1523,7 @@ def check_scale_and_cross_check(index: str) -> bool:
     )
     print(
         "       NOTE: these magnitudes are exact ARITHMETIC on verified inputs, "
-        "NOT a hardware measurement — the raw-tick probe (plan 05-06) confirms them"
+        "NOT a hardware measurement — the raw-tick probe below confirms them"
     )
     return True
 
@@ -1555,7 +1557,7 @@ def check_envelope_discrimination(index: str, poses: list[str]) -> bool:
         else:
             print(
                 "       NOTE: this pose reads IDENTICALLY under both conventions, so "
-                "PAR-04's literal assertion on it decides nothing — recorded as a "
+                "an envelope assertion on it decides nothing — recorded as a "
                 "documented negative, never as the verdict's evidence"
             )
     if ok:
@@ -1871,7 +1873,7 @@ def check_clamp_demo(index: str, args: argparse.Namespace) -> bool:
     if not record["dume_loguru_warning"]:
         print(_red("  FAIL: no clamp warning was captured on Dum-E's loguru stream — the clamp "
                    "fired but is still not surfaced, which is the swallowed-warning failure "
-                   "SAFE-02 targets"))
+                   "the clamp re-emission targets"))
         ok = False
     if not record["upstream_bridged_warning"]:
         print("       NOTE: upstream's own root-logger warning did NOT arrive through the "
@@ -1924,7 +1926,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Command one deliberately oversized per-step joint delta and prove the "
-            "SAFE-02 clamp clipped it. REQUIRES THE ARM and COMMANDS MOTION."
+            "per-step motion clamp clipped it. REQUIRES THE ARM and COMMANDS MOTION."
         ),
     )
     parser.add_argument(
@@ -1957,7 +1959,7 @@ def main() -> int:
     total = 5 + (0 if args.skip_hardware else 1) + bool(sweep_poses) + bool(args.demo_clamp)
 
     print("=" * 72)
-    print(" Normalization-units probe (PAR-04 / PAR-06) — verdict: RANGE_M100_100")
+    print(" Normalization-units probe — verdict: RANGE_M100_100")
     print("=" * 72)
 
     results: dict[str, bool] = {}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Operator-interactive live pick baseline for the ``groot-native`` backend (LR-06 / BACK-06).
+"""Operator-interactive live pick baseline for the ``groot-native`` backend.
 
 Re-establishes the live comparison point the milestone is measured against: with
 ``groot-native`` selected **through the policy-backend switch** on the upgraded
@@ -13,16 +13,16 @@ here rather than assumed:
    ``policy.factory.make_policy_backend()`` with ``DUME_POLICY_BACKEND`` resolved
    through the allowlist. This file never constructs the concrete GR00T client
    class itself, so a passing run proves the fallback is *functional*, not merely
-   importable (BACK-06).
+   importable.
 2. **The success judgment is a human's.** Whether the object was actually picked
    up is not observable from an exit code, so it is read from an interactive
    terminal, once per attempt, with no default and no way to answer it in bulk.
    There is deliberately **no** ``--yes``/``--assume-success`` flag: a
    machine-supplied judgment would be a fabricated baseline, and a fabricated
-   baseline corrupts the exact comparison Phase 7's parity gate depends on.
+   baseline corrupts the exact comparison the checkpoint parity gate depends on.
 
-**What this baseline is (CONTEXT.md D-10).** Only the instruction string is
-pinned; scene variation between attempts is *accepted*. The score is therefore a
+**What this baseline is.** Only the instruction string is pinned; scene variation
+between attempts is *accepted* by the governing decision. The score is therefore a
 **functional smoke check, not a controlled numerical comparison** — the entire
 numerical burden for the parity gate rests on the offline frozen-corpus evidence.
 Do not cite a score produced by this script as evidence of numerical parity.
@@ -228,7 +228,7 @@ class NonInteractiveError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Clamp-warning counting (SAFE-02 / parity-gate zero-warning requirement)
+# Clamp-warning counting (the parity gate's zero-warning requirement)
 # ---------------------------------------------------------------------------
 
 
@@ -639,7 +639,7 @@ def synthetic_observation(
 def prompt_place_object(index: int, total: int, prompt: Callable[[str], str] = input) -> str:
     """Ask the operator to reset the scene. Returns ``"go"`` or ``"abort"``.
 
-    Scene variation between attempts is ACCEPTED by the locked decision (D-10),
+    Scene variation between attempts is ACCEPTED by design,
     so this asks for a reset, not for a reproduction.
     """
     while True:
@@ -929,7 +929,7 @@ def build_run_payload(
         "stack": stack,
         "checks": checks,
         "scene_variation": (
-            "ACCEPTED (CONTEXT.md D-10): the instruction string is the only pinned "
+            "ACCEPTED BY DESIGN: the instruction string is the only pinned "
             "variable; the operator resets the scene between attempts and variation "
             "is not treated as a defect."
         ),
@@ -1338,7 +1338,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     mode = "dry-run" if args.dry_run else "scored"
     print("=" * 72)
-    print(f" groot-native live pick baseline (LR-06 / BACK-06) — mode: {mode}")
+    print(f" groot-native live pick baseline — mode: {mode}")
     print(f" instruction (pinned): {args.instruction!r}")
     if args.dry_run:
         print(" NO MOTION IS COMMANDED IN THIS MODE.")
@@ -1413,7 +1413,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("\n" + "-" * 72)
                 print(
                     f" Scored series: {args.attempts} attempts on {args.instruction!r}.\n"
-                    " Scene variation between attempts is ACCEPTED (D-10) — reset the\n"
+                    " Scene variation between attempts is ACCEPTED — reset the\n"
                     " scene, do not try to reproduce it. Answer each judgment honestly;\n"
                     " a sub-10 score is a finding to record, never a run to repeat."
                 )
@@ -1501,7 +1501,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         if voided:
             print(_red(f" RUN VOID: {void_reason}"))
-        print(_yellow(" Functional smoke check, NOT numerical parity evidence (D-10)."))
+        print(_yellow(" Functional smoke check, NOT numerical parity evidence."))
     print(f" evidence: {_redact_home(target)}")
     print("=" * 72)
 

@@ -1,6 +1,7 @@
 # Normalization Units Verdict
 
-**Status:** Resolved (offline, no hardware). Standing engineering resolution — not a changelog entry.
+**Status:** Resolved offline (§1-§8), then **CONFIRMED on hardware (§9)**. Standing engineering
+resolution — not a changelog entry.
 
 This document records which joint-value convention the GR00T checkpoint
 `GR00T-N1.7-3B-SO101` was trained in, the evidence for it, the requirement mechanism it had
@@ -185,11 +186,11 @@ identity (§4.1), and the delta that actually matters is the degrees-to-percent 
 (§4.2). This is recorded as a *correction of a wrong premise*, not as a criterion quietly
 redefined — the original question has a real answer, and that answer is "no change".
 
-**The scale magnitudes are a hypothesis derived by arithmetic, not a hardware measurement.**
-They are exact given a verified formula and a verified calibration file, but nothing on the arm
-has confirmed them. `units_verdict()` / `active_mode_from_raw_tick()` — the raw-tick round-trip
-probe, shipped unrun in this harness behind `--skip-hardware` — is what converts them into a
-measurement, and it runs in the plan that follows the hardware-attach gate. **Pending hardware.**
+**The scale magnitudes were derived by arithmetic here, and are MEASURED in §9.5.** They are
+exact given a verified formula and a verified calibration file, and the raw-tick round-trip probe
+(`units_verdict()` / `active_mode_from_raw_tick()` / `live_pose_sweep()`) has since reproduced
+every one of them on the live bus to five decimal places at three independent poses. The
+gripper's convention-independence is confirmed live too. **No longer pending hardware.**
 
 The scale transform is deliberately **not implemented** anywhere in the runtime in this phase.
 It is documented here precisely so a later phase does not inherit it unexamined.
@@ -286,9 +287,13 @@ alongside this record.
    arguments intact. `check_pinned_constants_against_local_artifacts()` reports drift between
    the pinned constants and the local artifacts as a failure, so a recalibration or a
    checkpoint swap surfaces instead of silently invalidating the scale table.
-2. **The per-joint scale factors are exact arithmetic on verified inputs, not measured on
-   hardware.** Everything in §4.2 and the conversion table in §7 is derived. **Pending
-   hardware:** the raw-tick round-trip probe is what measures it.
+2. ~~**The per-joint scale factors are exact arithmetic on verified inputs, not measured on
+   hardware.**~~ **DISCHARGED — see §9.5.** The raw-tick round-trip probe measured all five
+   factors on the live bus, at three independent poses, and reproduced the derived table of §4.2
+   exactly to five decimal places. Research assumption A2 is closed. The conversion table in §7
+   remains a *starting hypothesis for the flip* for a different reason — it depends on the
+   calibration file currently on disk, and recalibration changes it — but its scale column is no
+   longer unverified arithmetic.
 3. **The `wrist_roll` cross-check assumes the dataset's operator held the wrist near where
    Dum-E holds it.** If the recording used a materially different wrist angle, the
    `-53.64`-inside-the-band coincidence is weaker evidence. §2.1 and §2.2 are independent of
@@ -301,14 +306,267 @@ alongside this record.
 
 ---
 
+## 9. Live confirmation
+
+**Status: the offline verdict is CONFIRMED on hardware.** Everything below was measured on the
+physical arm behind the hardware-attach gate, on a bus running `lerobot` 0.6.1. Where a number
+was previously derived by arithmetic and is now measured, both appear side by side with their
+provenance; nothing derived has been silently relabelled as measured.
+
+### 9.0 The corrected mechanism, stated as such
+
+Roadmap criterion 2 asks that parking the arm at fixed poses report *"the same joint vector to
+under 0.5 degrees per joint before and after the upgrade"*. **A literal pre-upgrade live reading
+is unobtainable:** no serial device was present at any point before the version bump, and the
+bump had already landed by the time hardware was attached. Rather than drop the comparison or
+present a one-sided measurement as if it were two, it was taken in **one live run**:
+
+1. Read raw encoder ticks with `normalize=False`. That keyword is present and keyword-only in
+   **both** 0.3.3 and 0.6.1, which is exactly why one probe is valid on both sides of the bump.
+2. Compute what the **pre-upgrade** stack would have reported from those same ticks. This is
+   *exact*, not approximate: the `_normalize` body is byte-identical between the two versions
+   (§4.1), and `test_upgrade_normalization_delta_is_identity_across_swept_ticks` re-proves that
+   mechanically across every raw tick in each joint's calibrated span.
+3. Compare against what the upgraded stack actually reports for the same registers.
+
+**This is at least as strong as two separate live runs, and strictly less noisy**, because both
+sides come from the *same* physical pose and the *same* tick read — a two-run comparison would
+carry servo read noise and re-parking error on top of any real delta. It also yields something a
+before/after diff cannot: it identifies *which* normalization mode is active, by proof rather
+than inference. This is a comparison taken a better way, **not** a criterion quietly redefined.
+
+### 9.1 Provenance of the run
+
+| Item | Value |
+|------|-------|
+| Harness | `scripts/pose_sweep_units_probe.py --pose-sequence initial,ready,remote` and `--demo-clamp` |
+| Client stack | `lerobot` 0.6.1, `torch` 2.7.1 + CUDA 12.6 |
+| Calibration file | `~/.cache/huggingface/lerobot/calibration/robots/so_follower/my_awesome_follower_arm.json` |
+| Calibration `checksum` (sha256) | `5bd471fbbb4e1be0c6ede80472d365b527bc0808befdd67f123148ed49e3dc50` |
+| Effective controller config | `use_degrees=True`, `max_relative_target=160.0` |
+| Poses swept | `initial`, `ready`, `remote` (3), plus an as-found reading taken before any motion |
+| Raw numeric output | the gitignored `corpus/pose_sweep_<timestamp>/results.json`; this section is the committed record |
+
+### 9.2 What was read before anything moved
+
+Every tick read, the PID read-back and the calibration assertion were taken **before** the first
+command that moved a joint, so a bus or calibration fault would have surfaced while the arm was
+stationary. The as-found reading (no motion commanded at all):
+
+| Joint | raw tick | reported (`use_degrees=True`) | recomputed percent |
+|-------|---------:|------------------------------:|-------------------:|
+| `shoulder_pan` | 2028 | -7.8681 | -6.7522 |
+| `shoulder_lift` | 875 | -101.6264 | -97.9661 |
+| `elbow_flex` | 3090 | 96.3516 | **100.0000** |
+| `wrist_flex` | 2930 | 75.3846 | 74.7928 |
+| `wrist_roll` | 1006 | -92.3516 | -55.0432 |
+| `gripper` | 2056 | 0.7634 | 0.7634 |
+
+**A safety precondition was discovered by taking those reads first, and it is the reason the
+read-only-first ordering is not ceremony.** With torque disabled, every motor reported
+`Goal_Position = 0`. Upstream's `configure()` runs inside `bus.torque_disabled()`, whose exit
+calls `enable_torque()`, and `enable_torque()` writes `Torque_Enable` and `Lock` only — it does
+**not** synchronise `Goal_Position` to the present position. Connecting without intervention
+would therefore have commanded all six joints to raw tick 0 the instant torque returned, a jump
+of up to 3090 ticks on `elbow_flex`. The harness now writes `Goal_Position <- Present_Position`
+while torque is still off (`prearm_goal_to_present()`), which cannot itself move the arm and
+turns the torque-enable into a hold. **The dangerous path was never exercised, so this is a
+hazard prevented, not a hazard demonstrated.**
+
+### 9.3 `active_mode`: two different questions, answered separately
+
+The probe recomputes all three candidate normalizations from the calibration file and reports
+which one matched the value the bus reported, within 1e-3. **Exactly one candidate matched every
+joint at every pose** — no ambiguity, at no point, so no tolerance was widened.
+
+| Question | Answer | How it was established |
+|----------|--------|------------------------|
+| Which mode is **the bus** producing? | `DEGREES` on all five arm joints, `RANGE_0_100` on the gripper | Recompute-and-match against the bus's reported value |
+| Which mode does the bus produce at `use_degrees=False`? | `RANGE_M100_100` on all five arm joints, `RANGE_0_100` on the gripper | The bus's own norm modes flipped in place and the same physical pose re-read through the same upstream `_normalize` |
+| Which mode was **the checkpoint** trained in? | **`RANGE_M100_100`** — the offline verdict, **CONFIRMED** | §9.6 and §9.7 below, using only rows that discriminate |
+
+**These are not the same question, and the first is not evidence about the third.** The bus
+produces whatever `use_degrees` selects, and Dum-E deliberately runs `use_degrees=True` (§7), so
+`DEGREES` is a fact about the *configuration*. The checkpoint question is settled by which
+reading of a physical pose is consistent with the checkpoint's own recorded statistics. Reading
+the first answer as a refutation of the verdict would be the category error this section exists
+to prevent. The gripper's `RANGE_0_100` under `use_degrees=True` is also now confirmed live,
+which is what makes §4.2's claim that the gripper needs no conversion a measurement.
+
+### 9.4 `before_after`: the per-joint upgrade comparison
+
+Per joint at each pose: the raw tick, what the upgraded stack reported, what the **pre-upgrade**
+0.3.3 formula computes from that same tick, and the difference. Criterion 2 budgets 0.5.
+
+| Pose | Joint | raw tick | post-upgrade reported | pre-upgrade computed | difference |
+|------|-------|---------:|----------------------:|---------------------:|-----------:|
+| `initial` | `shoulder_pan` | 2114 | -0.3077 | -0.3077 | **0.0** |
+| `initial` | `shoulder_lift` | 875 | -101.6264 | -101.6264 | **0.0** |
+| `initial` | `elbow_flex` | 3090 | 96.3516 | 96.3516 | **0.0** |
+| `initial` | `wrist_flex` | 2931 | 75.4725 | 75.4725 | **0.0** |
+| `initial` | `wrist_roll` | 1027 | -90.5055 | -90.5055 | **0.0** |
+| `initial` | `gripper` | 2049 | 0.2776 | 0.2776 | **0.0** |
+| `ready` | `shoulder_pan` | 2115 | -0.2198 | -0.2198 | **0.0** |
+| `ready` | `shoulder_lift` | 1005 | -90.1978 | -90.1978 | **0.0** |
+| `ready` | `elbow_flex` | 2889 | 78.6813 | 78.6813 | **0.0** |
+| `ready` | `wrist_flex` | 2933 | 75.6484 | 75.6484 | **0.0** |
+| `ready` | `wrist_roll` | 1026 | -90.5934 | -90.5934 | **0.0** |
+| `ready` | `gripper` | 2049 | 0.2776 | 0.2776 | **0.0** |
+| `remote` | `shoulder_pan` | 2115 | -0.2198 | -0.2198 | **0.0** |
+| `remote` | `shoulder_lift` | 2038 | 0.6154 | 0.6154 | **0.0** |
+| `remote` | `elbow_flex` | 2043 | 4.3077 | 4.3077 | **0.0** |
+| `remote` | `wrist_flex` | 2655 | 51.2088 | 51.2088 | **0.0** |
+| `remote` | `wrist_roll` | 1026 | -90.5934 | -90.5934 | **0.0** |
+| `remote` | `gripper` | 2904 | 59.6114 | 59.6114 | **0.0** |
+
+**Every difference is exactly zero — bit-for-bit, not merely under 0.5.** That is the outcome
+§4.1 predicted from byte-identical formula bodies, and it is the strongest available form of the
+criterion: the upgrade delta at the robot layer is *identity*, measured rather than argued. A
+nonzero difference here would have implicated the calibration file, not the version change.
+
+Note that `reported` tracks the *commanded* pose only to within the servos' own PID lag — e.g.
+`elbow_flex` settles at 78.68 against a commanded 75.0 at the `ready` pose, sagging under gravity
+at `P=10`. That lag is irrelevant to this comparison, which is precisely its virtue: both sides
+are derived from the same tick, so wherever the arm actually came to rest, the two formulas are
+compared at the same physical position.
+
+### 9.5 The per-joint scale: derived, and now measured
+
+Measured by reading the same register twice at one physical pose — once as degrees off the bus,
+once as percent off the bus with its norm modes flipped in place — and taking the ratio. **Both
+sides come from hardware**, and the measurement was repeated independently at all three poses.
+
+| Joint | derived (§4.2, arithmetic) | measured (live, all 3 poses) | agreement |
+|-------|---------------------------:|-----------------------------:|-----------|
+| `shoulder_pan` | 1.16527 | **1.16527** | exact to 5dp |
+| `shoulder_lift` | 1.03736 | **1.03736** | exact to 5dp |
+| `elbow_flex` | 0.96352 | **0.96352** | exact to 5dp |
+| `wrist_flex` | 1.00791 | **1.00791** | exact to 5dp |
+| `wrist_roll` | 1.67780 | **1.67780** | exact to 5dp |
+
+**The derived table is now a measurement.** Research assumption A2 — that the per-joint scale
+factors were arithmetic rather than hardware-confirmed — is **discharged**. The two tables agree,
+so there is no disagreement to record with competing provenances; had they disagreed, both would
+have stayed on the record and A2 would have remained open.
+
+### 9.6 The `initial`-pose envelope check, run live
+
+Run against the `initial` pose, never the ready pose (§3). All five arm joints, both conventions,
+against the checkpoint's `state` q01/q99 envelope:
+
+| Joint | q01 | q99 | live as degrees | inside? | live as percent | inside? | discriminates? |
+|-------|----:|----:|----------------:|:-------:|----------------:|:-------:|:--------------:|
+| `shoulder_pan` | -63.7670 | 44.0485 | -0.3077 | yes | -0.2641 | yes | no |
+| **`shoulder_lift`** | **-99.7433** | **54.0454** | **-101.6264** | **NO** | **-97.9661** | **yes** | **YES** |
+| `elbow_flex` | -53.3910 | 100.0000 | 96.3516 | yes | 100.0000 | yes | no |
+| `wrist_flex` | 12.6699 | 98.6112 | 75.4725 | yes | 74.8801 | yes | no |
+| `wrist_roll` | -99.6330 | -14.2483 | -90.5055 | yes | -53.9429 | yes | no |
+
+**One joint discriminates, and it decides for percent.** `shoulder_lift`'s live reading falls
+*outside* the envelope read as degrees (-101.6264 against a q01 of -99.7433) and *inside* it read
+as percent (-97.9661). The four non-discriminating rows are recorded for completeness and are
+**not** cited as evidence — under the prohibition against evidence that reads identically under
+both conventions, only the `shoulder_lift` row is admissible. This is the offline table of §3
+reproduced from live encoder ticks instead of from hardcoded pose literals.
+
+### 9.7 The `elbow_flex` at-limit fingerprint — the strongest live datum
+
+The arm was found with `elbow_flex` at raw tick **3090**, which is *exactly* its calibrated
+`range_max`, i.e. the joint sitting at its recorded mechanical limit. At that physical position:
+
+- read as **degrees** it reports **96.3516** — the full extent of its physical span;
+- read as **percent** it reports **exactly 100.0000**, by construction of the clamp;
+- the checkpoint records `state.single_arm.max[elbow_flex] = 100.0` **and** `q99 = 100.0`.
+
+**The checkpoint recorded precisely the number the percent convention produces at this exact
+physical position, and a number the degrees convention cannot produce at any position.** This
+converts §2.2 from a falsification computed off the calibration file into a direct hardware
+observation, and it is independent of the envelope check in §9.6.
+
+### 9.8 `pid_readback` on the live bus
+
+Read back from **every** motor with `normalize=False` and a retry floor, at connect, on the real
+Feetech bus:
+
+| Motor | P | I | D |
+|-------|--:|--:|--:|
+| `shoulder_pan` | 10 | 0 | 5 |
+| `shoulder_lift` | 10 | 0 | 5 |
+| `elbow_flex` | 10 | 0 | 5 |
+| `wrist_flex` | 10 | 0 | 5 |
+| `wrist_roll` | 10 | 0 | 5 |
+| `gripper` | 10 | 0 | 5 |
+
+**All six motors report the Dum-E preset 10/0/5.** Every measurement in this section was
+therefore taken at a known, recorded stiffness. This is the value a later phase should cite as
+the stiffness the arm actually ran at — not the value that was requested.
+
+### 9.9 The `clamp` demonstrated on real motion
+
+A single per-step delta of **1.5x the clamp** was commanded on one joint. `wrist_roll` was chosen
+because it is the only joint with more than twice the clamp in calibrated travel (+/-167.78
+degrees against +/-116.53 for the next widest), which means **even a clamp that failed to engage
+would have commanded a physically reachable pose** — the demonstration cannot damage the arm by
+succeeding *or* by failing.
+
+| Item | Value |
+|------|-------|
+| Start pose | `initial` (the `move_to_initial_pose()` target; operator-designated safe testing pose) |
+| Joint | `wrist_roll` |
+| Present | -89.9780 |
+| Requested | +150.0220 (a delta of 240.0 = 1.5 x the clamp) |
+| Returned by `send_action` | **+70.0220** |
+| Returned delta | **exactly 160.0000** — the configured clamp |
+| Settled | +68.2637 (1.76 of PID lag) |
+
+All three assertions hold, two of them from data rather than from a log:
+
+1. **The returned action differs from the requested action** on that joint, by 80.0.
+2. **The magnitude of the returned delta equals the clamp** within upstream's own 1e-4
+   divergence threshold.
+3. **The warning reached Dum-E's own loguru stream**, naming the joint, the requested value and
+   the clipped value, and carrying upstream's exact sentence:
+   `Relative goal position magnitude had to be clamped to be safe. max_relative_target=160.0 clamped 1 joint(s): wrist_roll.pos requested=150.0220 clipped=70.0220`
+
+**Upstream's own root-logger warning ALSO arrived**, through the stdlib-to-loguru bridge, carrying
+its `original goal_pos` / `safe goal_pos` payload. Both emitters are confirmed live, so the
+documented failure mode — a check grepping stderr while Dum-E logs to stdout — is closed on
+hardware and not merely in a unit test.
+
+**A nominal reset does not trip the clamp.** The production `move_to_initial_pose()` was called
+from the `remote` pose as the single unsmoothed command it is: the worst commanded delta was
+**102.62** on `shoulder_lift`, comfortably below 160.0, and **no clamp warning was emitted**. The
+worst case reachable from Dum-E's own fixed poses is 102 (`remote` -> `initial`). The ~190
+`elbow_flex` delta that was flagged as the likeliest legitimate trigger requires an *extreme
+policy* pose, not one of Dum-E's fixed poses, so it remains unobserved and is a live-run question
+for the parity phase. No clamp fired at any point during the interpolated pose sweep either.
+
+### 9.10 What this run did NOT establish
+
+- **It did not flip `use_degrees`, and did not need to.** §7 still stands unchanged: the correct
+  value is `False`, the flip requires converting all four pose vectors in the same change, and it
+  is a later-phase decision. The two-configuration read used here changed the bus's norm modes
+  in place for the duration of a single read and restored them, verified, before returning.
+- **It did not validate the magnitude of the clamp for nominal operation.** It shows the clamp
+  *engages* and *is visible*. Whether 160.0 is right for nominal operation is settled by the
+  requirement of zero clamp warnings during a nominal run. If nominal operation trips it,
+  re-derive the value — do not remove the clamp and do not suppress the warning.
+- **It did not confirm which calibration was in use at training time** (see §8.1). Nothing
+  available on this hardware can.
+
+---
+
 ## References
 
 - **Harness:** `scripts/pose_sweep_units_probe.py` — `clip_fingerprint_count()`,
   `degrees_reachable_range()`, `deg_per_pct_table()`, `wrist_roll_cross_check()`,
   `envelope_contains()`, `normalize_v033()` / `normalize_v061()`,
   `check_pinned_constants_against_local_artifacts()`, and the arm-required
-  `units_verdict()` / `active_mode_from_raw_tick()`.
-- **Gate:** `tests/test_units_verdict.py` — eight hermetic tests, none of which may skip.
+  `units_verdict()` / `active_mode_from_raw_tick()` / `live_pose_sweep()` /
+  `compare_pre_and_post_upgrade()` / `measured_deg_per_pct()` / `envelope_row()` /
+  `demo_clamp()`, plus the safety guards `prearm_goal_to_present()` and
+  `assert_pose_reachable()` / `tick_for_degrees()`.
+- **Gate:** `tests/test_units_verdict.py` — sixteen hermetic tests, none of which may skip.
 - **Upstream:** `lerobot.motors.motors_bus.MotorsBus._normalize` and
   `lerobot.motors.motors_bus.MotorNormMode` (identical in 0.3.3 and 0.6.1);
   `lerobot.robots.so_follower` (the gripper's hardcoded `RANGE_0_100`);

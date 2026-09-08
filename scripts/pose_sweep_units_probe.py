@@ -727,17 +727,27 @@ def interpolate_steps(
     ]
 
 
-def assert_pose_reachable(vector: list[float]) -> None:
+def assert_pose_reachable(vector: list[float], calibration) -> None:
     """Refuse a commanded arm vector whose DEGREES target lands past a stop.
 
     Applies to the five arm joints only: the gripper is ``RANGE_0_100``, whose
     ``_unnormalize`` branch IS clamped upstream, so it cannot be driven out of
     range by an out-of-band value.
+
+    ``calibration`` is REQUIRED and must be the calibration the BUS is using
+    (``bus.calibration``), not :data:`CALIBRATION_TICK_RANGES`. The pinned table
+    is a snapshot, and where it is wider than the live span — it is on
+    ``shoulder_pan``, ``shoulder_lift`` and ``wrist_flex`` after the mid-phase
+    recalibration — a guard computing against it would approve a target the bus
+    then maps outside the calibrated span. Since the DEGREES ``_unnormalize``
+    branch has no upstream clamp, that is the one input whose staleness makes this
+    guard wrong in the unsafe direction. There is deliberately no default: an
+    omitted calibration must be a ``TypeError``, never a silent fallback to the
+    pinned table.
     """
     offenders = []
     for value, joint in zip(vector[:5], ARM_JOINTS):
-        cal = CALIBRATION_TICK_RANGES[joint]
-        lo, hi = float(cal["range_min"]), float(cal["range_max"])
+        lo, hi, _drive_mode = calibration_bounds(calibration, joint)
         tick = tick_for_degrees(value, lo, hi)
         if not within_calibrated_ticks(tick, lo, hi):
             offenders.append(f"{joint}={value:.3f}deg -> tick {tick:.1f} outside [{lo:.0f}, {hi:.0f}]")
@@ -1123,7 +1133,7 @@ def park_slowly(controller, target: list[float], *, label: str = "") -> list[tup
     _repo_on_path()
     from embodiment.so_arm10x.controller import diff_clamped_joints
 
-    assert_pose_reachable(target)
+    assert_pose_reachable(target, controller.robot.bus.calibration)
     present = read_joint_vector(controller)
     clamped: list[tuple] = []
     for step_vector in interpolate_steps(present, list(target), PARK_MAX_STEP):
@@ -1313,7 +1323,7 @@ def observe_reset_to_initial(controller) -> dict:
 
     before = read_joint_vector(controller)
     target = list(DUME_POSES["initial"])
-    assert_pose_reachable(target)
+    assert_pose_reachable(target, controller.robot.bus.calibration)
     captured: list[str] = []
     sink_id = logger.add(lambda message: captured.append(message.record["message"]), level="WARNING")
     try:
@@ -1382,8 +1392,12 @@ def demo_clamp(args: argparse.Namespace) -> dict:
         present = present_vector[index]
         requested_value, expected_clipped = clamp_demo_targets(present, clamp)
 
-        cal = CALIBRATION_TICK_RANGES[CLAMP_DEMO_JOINT]
-        lo, hi = float(cal["range_min"]), float(cal["range_max"])
+        # The LIVE calibration, never the pinned snapshot: this is the span the
+        # bus will map the commanded degrees through, and the DEGREES unnormalize
+        # branch has no upstream clamp to catch a target derived from a stale one.
+        lo, hi, _drive_mode = calibration_bounds(
+            controller.robot.bus.calibration, CLAMP_DEMO_JOINT
+        )
         for label, value in (("requested", requested_value), ("clipped", expected_clipped)):
             tick = tick_for_degrees(value, lo, hi)
             if not within_calibrated_ticks(tick, lo, hi):
@@ -1997,24 +2011,41 @@ def main() -> int:
     )
     results["pinned_constants"] = check_pinned_constants(f"5/{total}", args)
     next_index = 6
-    if not args.skip_hardware:
-        results["hardware_raw_tick"] = check_hardware_raw_tick(f"{next_index}/{total}", args)
-        next_index += 1
-    else:
+    if args.skip_hardware:
         print(
             "\n[not run] raw-tick round-trip probe, live pose sweep and clamp "
             "demonstration — all three need the arm (--skip-hardware). The per-joint "
-            "scale above is a MEASUREMENT as of plan 05-06; see the '## Live "
+            "scale above is a MEASUREMENT taken on this arm; see the '## Live "
             "confirmation' section of docs/UNITS-VERDICT.md for the numbers."
         )
-    if sweep_poses:
-        results["live_pose_sweep"] = check_live_pose_sweep(
-            f"{next_index}/{total}", args, sweep_poses
+    elif not results["pinned_constants"]:
+        # A FAILED drift check must STOP the arm half, not merely colour the exit
+        # code. The pinned constants are the input the per-joint scale table is
+        # derived from, and the arm half opens the bus, enables torque and (with
+        # --pose-sequence / --demo-clamp) commands motion. Proceeding would measure
+        # a stack the pinned table no longer describes, and would validate every
+        # commanded target against a calibration the bus is not using. Neither of
+        # these checks is recorded as PASS or FAIL: they did not run.
+        print(
+            _red(
+                "\n[REFUSED] raw-tick round-trip probe, live pose sweep and clamp "
+                "demonstration — the pinned constants drifted from the local "
+                "artifacts, so nothing derived from them may be measured or "
+                "commanded against this arm. Re-derive the constants first, or pass "
+                "--calibration if the derived path is wrong."
+            )
         )
+    else:
+        results["hardware_raw_tick"] = check_hardware_raw_tick(f"{next_index}/{total}", args)
         next_index += 1
-    if args.demo_clamp:
-        results["clamp_demo"] = check_clamp_demo(f"{next_index}/{total}", args)
-        next_index += 1
+        if sweep_poses:
+            results["live_pose_sweep"] = check_live_pose_sweep(
+                f"{next_index}/{total}", args, sweep_poses
+            )
+            next_index += 1
+        if args.demo_clamp:
+            results["clamp_demo"] = check_clamp_demo(f"{next_index}/{total}", args)
+            next_index += 1
 
     print("\n" + "=" * 72)
     passed = sum(1 for ok in results.values() if ok)

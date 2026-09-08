@@ -25,6 +25,8 @@ test is a silent pass on the one fact this whole phase turns on.
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Make scripts/ importable so the tests and the harness share ONE source of
@@ -32,6 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT))
 
+import pose_sweep_units_probe as probe  # noqa: E402
 from pose_sweep_units_probe import (  # noqa: E402
     CALIBRATION_TICK_RANGES,
     CHECKPOINT_ACTION_STATS,
@@ -410,9 +413,13 @@ def test_assert_pose_reachable_accepts_dume_poses_and_rejects_a_pose_past_a_stop
     joint's calibrated span therefore becomes an out-of-range tick and drives the
     servo into a stop. Every one of Dum-E's own poses must pass; a value past
     ``elbow_flex``'s +/-96.35 span must not.
+
+    The calibration is passed in explicitly. On the live path the caller hands it
+    ``bus.calibration``; here it is the pinned table, which is what makes the
+    +/-96.35 span in this test's arithmetic well-defined.
     """
     for pose in DUME_POSES.values():
-        assert_pose_reachable(list(pose))
+        assert_pose_reachable(list(pose), CALIBRATION_TICK_RANGES)
 
     low, high = degrees_reachable_range("elbow_flex")
     assert round(high, 2) == 96.35
@@ -420,12 +427,130 @@ def test_assert_pose_reachable_accepts_dume_poses_and_rejects_a_pose_past_a_stop
     unreachable = list(DUME_POSES["initial"])
     unreachable[2] = high + 5.0
     try:
-        assert_pose_reachable(unreachable)
+        assert_pose_reachable(unreachable, CALIBRATION_TICK_RANGES)
     except ValueError as exc:
         assert "elbow_flex" in str(exc)
         assert "outside" in str(exc)
     else:  # pragma: no cover - the guard must not silently accept it
         raise AssertionError("assert_pose_reachable accepted a pose past a stop")
+
+
+def test_assert_pose_reachable_requires_a_calibration_rather_than_defaulting():
+    """The guard must not fall back to the pinned snapshot when none is supplied.
+
+    The pinned table is wider than the live calibration on three joints, so a
+    default would let the guard approve a target the bus maps past a mechanical
+    stop — and the DEGREES unnormalize branch has no upstream clamp to catch it.
+    A missing calibration has to be a loud programming error.
+    """
+    with pytest.raises(TypeError):
+        assert_pose_reachable(list(DUME_POSES["initial"]))
+
+
+def test_assert_pose_reachable_rejects_a_pose_the_live_span_no_longer_reaches():
+    """A pose inside the pinned span but outside the LIVE span must be refused.
+
+    This is the failure the guard existed to prevent and could not: the pinned
+    ``shoulder_pan`` span is 2651 ticks against a live 2592, so a commanded value
+    the snapshot calls reachable can land past the live calibrated stop. Using a
+    narrowed calibration here reproduces that relationship without needing an arm.
+    """
+    narrowed = {
+        joint: dict(entry) for joint, entry in CALIBRATION_TICK_RANGES.items()
+    }
+    narrowed["shoulder_pan"].update(range_min=1500, range_max=2600)
+
+    pose = list(DUME_POSES["remote"])
+    pose[0] = 60.0  # inside the pinned +/-116.53 span, outside the narrowed one
+
+    assert_pose_reachable(pose, CALIBRATION_TICK_RANGES)
+    with pytest.raises(ValueError, match="shoulder_pan"):
+        assert_pose_reachable(pose, narrowed)
+
+
+def test_a_failed_drift_check_refuses_the_whole_arm_half(monkeypatch, capsys):
+    """A FAILED drift check must stop the arm half, not merely set the exit code.
+
+    The arm half opens the bus and, with ``--pose-sequence`` / ``--demo-clamp``,
+    commands motion — against targets validated with the very constants that just
+    failed. This is the fail-open the drift check existed to prevent, so it is
+    pinned here rather than rediscovered on hardware. Nothing in this test touches
+    a serial port: the three arm-half entry points are replaced with recorders that
+    fail the test if they are ever reached.
+    """
+    reached: list[str] = []
+
+    monkeypatch.setattr(probe, "check_clip_fingerprint", lambda index: True)
+    monkeypatch.setattr(probe, "check_degrees_falsification", lambda index: True)
+    monkeypatch.setattr(probe, "check_scale_and_cross_check", lambda index: True)
+    monkeypatch.setattr(
+        probe, "check_envelope_discrimination", lambda index, poses: True
+    )
+    monkeypatch.setattr(probe, "check_pinned_constants", lambda index, args: False)
+    monkeypatch.setattr(
+        probe,
+        "check_hardware_raw_tick",
+        lambda index, args: reached.append("hardware_raw_tick") or True,
+    )
+    monkeypatch.setattr(
+        probe,
+        "check_live_pose_sweep",
+        lambda index, args, poses: reached.append("live_pose_sweep") or True,
+    )
+    monkeypatch.setattr(
+        probe,
+        "check_clamp_demo",
+        lambda index, args: reached.append("clamp_demo") or True,
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["probe", "--pose-sequence", "initial", "--demo-clamp"]
+    )
+
+    exit_code = probe.main()
+
+    assert reached == [], f"the arm half must not run after a drift failure: {reached}"
+    assert exit_code == 1
+    assert "REFUSED" in capsys.readouterr().out
+
+
+def test_a_passing_drift_check_still_lets_the_arm_half_run(monkeypatch):
+    """The refusal must be conditional, not a blanket disable of the arm half.
+
+    Without this, a guard that always refused would pass the test above while
+    silently removing the probe's whole reason to exist.
+    """
+    reached: list[str] = []
+
+    monkeypatch.setattr(probe, "check_clip_fingerprint", lambda index: True)
+    monkeypatch.setattr(probe, "check_degrees_falsification", lambda index: True)
+    monkeypatch.setattr(probe, "check_scale_and_cross_check", lambda index: True)
+    monkeypatch.setattr(
+        probe, "check_envelope_discrimination", lambda index, poses: True
+    )
+    monkeypatch.setattr(probe, "check_pinned_constants", lambda index, args: True)
+    monkeypatch.setattr(
+        probe,
+        "check_hardware_raw_tick",
+        lambda index, args: reached.append("hardware_raw_tick") or True,
+    )
+    monkeypatch.setattr(
+        probe,
+        "check_live_pose_sweep",
+        lambda index, args, poses: reached.append("live_pose_sweep") or True,
+    )
+    monkeypatch.setattr(
+        probe,
+        "check_clamp_demo",
+        lambda index, args: reached.append("clamp_demo") or True,
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["probe", "--pose-sequence", "initial", "--demo-clamp"]
+    )
+
+    exit_code = probe.main()
+
+    assert reached == ["hardware_raw_tick", "live_pose_sweep", "clamp_demo"]
+    assert exit_code == 0
 
 
 def test_clamp_demo_targets_exceed_the_clamp_and_clip_to_exactly_it():

@@ -148,9 +148,22 @@ directionally correct behaviour.
 
 **The instrument that carries the numerical burden is the frozen observation-to-action corpus,
 and its gate is `scripts/verify_frozen_corpus.py`.** That verifier fails loudly on an absent,
-short, or malformed corpus, checks the recorded producer so a mock-produced corpus can never be
-cited as v1.0 evidence, and replays every record with pickle loading disabled. Any parity claim
+short, or malformed corpus, and replays every record with pickle loading disabled. Any parity claim
 must be made against that instrument.
+
+**Known limit of that gate — corrected after a security audit.** An earlier version of this section
+claimed the verifier "checks the recorded producer so a mock-produced corpus can never be cited as
+v1.0 evidence". **That overstated what the code does, and the claim is withdrawn.** The producer
+check tests a *self-declared* `--server-label` (default `gr00t:latest`) against a list of
+mock-ish substrings; it is never cross-checked against the container that actually served the
+requests. Array validation covers dtype and shape only — there is no degeneracy, variance or
+non-zero check — so an all-zeros corpus at the correct shape would pass all eight checks.
+
+The corpus shipped here **is** genuine: it was captured against the running `gr00t:latest`
+container, and its action samples are non-degenerate (mean ≈ 5.2–8.7, std ≈ 33–68 across records,
+no all-zero record). The artifact is sound; the mechanism that was supposed to guarantee it is not.
+Closing the gap means recording the container image digest at capture time and failing the verifier
+on an unverified producer, and/or adding a non-degeneracy check. Tracked as threat T-05-09.
 
 ---
 

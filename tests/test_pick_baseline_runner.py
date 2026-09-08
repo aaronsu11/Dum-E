@@ -199,6 +199,46 @@ def test_record_run_refuses_to_write_an_unreadable_record(tmp_path):
     assert list(tmp_path.glob("**/*.json")) == []
 
 
+def test_a_scored_record_with_no_attempts_is_refused_outright(tmp_path):
+    """A zero-attempt file may never be written under the scored filename.
+
+    This is the preflight-abort path's failure: it set ``voided`` and fell through
+    to a scored write with ``attempts == []``, producing a
+    ``pick_baseline_<stamp>/run.json`` carrying ``score: null`` and
+    ``attempts_performed: 0`` — which, being the newest, won the documented
+    selection. Nothing about the schema caught it, because ``attempts`` was still a
+    list.
+    """
+    payload = _valid_payload(attempts=[])
+    assert runner.validate_record(payload) == []
+    assert any("at least one attempt" in p for p in runner.validate_record(payload, scored=True))
+    with pytest.raises(ValueError, match="at least one attempt"):
+        runner.record_run(payload, dry_run=False, out_root=str(tmp_path))
+    assert list(tmp_path.glob("**/*.json")) == []
+
+
+def test_an_aborted_scored_series_lands_under_the_voided_name(tmp_path):
+    """A void run is recorded, but never where a baseline is looked for.
+
+    The evidence still has to be written — an aborted series is a finding worth
+    keeping — so it goes to a third prefix AND filename. The selection glob must
+    find nothing, whether the abort happened before the first attempt or partway
+    through the series.
+    """
+    for attempts in ([], [_valid_attempt(1), _valid_attempt(2, success=False)]):
+        target = runner.record_run(
+            _valid_payload(attempts=attempts),
+            dry_run=False,
+            out_root=str(tmp_path),
+            voided=True,
+        )
+        assert target.name == runner.VOIDED_FILENAME
+        assert target.name not in (runner.SCORED_FILENAME, runner.DRYRUN_FILENAME)
+        assert target.parent.name.startswith(runner.VOIDED_DIR_PREFIX)
+
+    assert sorted(tmp_path.glob("pick_baseline_*/run.json")) == []
+
+
 # ---------------------------------------------------------------------------
 # The operator judgment: no default, no bulk answer, no invention
 # ---------------------------------------------------------------------------

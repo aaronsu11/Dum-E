@@ -60,14 +60,17 @@ Usage
     # the scored baseline (REQUIRES a human at the terminal and props on the table)
     uv run python scripts/run_pick_baseline.py --attempts 10 --instruction "pick up the fruit"
 
-Evidence layout (both gitignored)
----------------------------------
-    corpus/pick_baseline_<stamp>/run.json            scored runs only
+Evidence layout (all gitignored)
+--------------------------------
+    corpus/pick_baseline_<stamp>/run.json                completed scored runs only
     corpus/pick_baseline_dryrun_<stamp>/preflight.json   preflight runs only
+    corpus/pick_baseline_voided_<stamp>/voided.json      aborted / voided scored runs
 
-The two are deliberately distinct in BOTH directory prefix and filename: the
+All three are deliberately distinct in BOTH directory prefix and filename: the
 standing record's verifier selects the newest ``corpus/pick_baseline_*/run.json``,
-and a preflight must never be able to present itself as a scored baseline.
+and neither a preflight nor an aborted series must be able to present itself as a
+scored baseline. ``run.json`` is additionally guaranteed to carry at least one
+scored attempt — :func:`validate_record` refuses to write one that does not.
 """
 
 from __future__ import annotations
@@ -97,6 +100,14 @@ SCORED_FILENAME = "run.json"
 #: Preflight runs. Different prefix AND different filename on purpose.
 DRYRUN_DIR_PREFIX = "pick_baseline_dryrun_"
 DRYRUN_FILENAME = "preflight.json"
+
+#: Aborted or voided scored runs. A third prefix and filename rather than reuse of
+#: the preflight pair, so "the operator aborted / the stack changed under the run"
+#: stays distinguishable from "this was only ever a motion-free preflight". What
+#: matters for the selection rule is the FILENAME: neither of these is `run.json`,
+#: so the newest-`pick_baseline_*/run.json` glob cannot reach either.
+VOIDED_DIR_PREFIX = "pick_baseline_voided_"
+VOIDED_FILENAME = "voided.json"
 
 #: The backend this baseline is for. Passed through the allowlist, never used to
 #: build an import path.
@@ -721,12 +732,21 @@ def exception_voids_series(exception: Optional[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def validate_record(payload: Dict[str, Any]) -> List[str]:
+def validate_record(payload: Dict[str, Any], *, scored: bool = False) -> List[str]:
     """Return a list of schema problems in ``payload``; empty means valid.
 
     Checked before anything is written, in both modes, so a drift in the keys the
     standing record's verifier reads surfaces during preflight rather than after
     ten live attempts.
+
+    Args:
+        payload: the assembled run record.
+        scored: whether this record is about to be written under the SCORED
+            filename. A scored record must contain at least one scored attempt —
+            a zero-attempt file at the path reserved for baselines wins the
+            documented newest-``run.json`` selection rule while carrying no
+            score at all, which is the mis-selection the distinct filenames
+            exist to make impossible.
     """
     problems: List[str] = []
     for key in REQUIRED_RUN_KEYS:
@@ -734,6 +754,12 @@ def validate_record(payload: Dict[str, Any]) -> List[str]:
             problems.append(f"missing top-level key {key!r}")
     if not isinstance(payload.get("attempts"), list):
         problems.append("'attempts' must be a list")
+    elif scored and not payload["attempts"]:
+        problems.append(
+            "a scored record must contain at least one attempt: a zero-attempt "
+            "file under the scored filename would be selected as the standing "
+            "baseline while recording no score"
+        )
     if not payload.get("instruction"):
         problems.append("'instruction' must be a non-empty string")
     for position, attempt in enumerate(payload.get("attempts") or []):
@@ -750,27 +776,47 @@ def validate_record(payload: Dict[str, Any]) -> List[str]:
     return problems
 
 
-def record_run(payload: Dict[str, Any], *, dry_run: bool, out_root: Optional[str] = None) -> Path:
+def record_run(
+    payload: Dict[str, Any],
+    *,
+    dry_run: bool,
+    out_root: Optional[str] = None,
+    voided: bool = False,
+) -> Path:
     """Write the run payload under the gitignored corpus directory.
 
     Scored runs land at ``pick_baseline_<stamp>/run.json``; preflights land at
-    ``pick_baseline_dryrun_<stamp>/preflight.json``. Distinct in both prefix and
-    filename so a preflight can never be mistaken for — or selected as — a
-    scored baseline.
+    ``pick_baseline_dryrun_<stamp>/preflight.json``; aborted or voided scored runs
+    land at ``pick_baseline_voided_<stamp>/voided.json``. All three are distinct in
+    both prefix and filename so nothing but a completed scored series can be
+    mistaken for — or selected as — a baseline.
+
+    Args:
+        payload: the assembled run record.
+        dry_run: this is a motion-free preflight.
+        out_root: override the evidence root.
+        voided: the scored series was aborted or invalidated. Routed away from the
+            scored filename because a void run is not a baseline, and a
+            zero-attempt one is the newest match for the selection glob.
 
     Raises:
         ValueError: the payload does not satisfy :func:`validate_record`. Writing
             an unreadable record would be worse than failing loudly.
     """
-    problems = validate_record(payload)
+    scored = not dry_run and not voided
+    problems = validate_record(payload, scored=scored)
     if problems:
         raise ValueError(
             "Refusing to write a run record that the standing baseline's verifier "
             f"could not read: {problems}"
         )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    prefix = DRYRUN_DIR_PREFIX if dry_run else SCORED_DIR_PREFIX
-    filename = DRYRUN_FILENAME if dry_run else SCORED_FILENAME
+    if dry_run:
+        prefix, filename = DRYRUN_DIR_PREFIX, DRYRUN_FILENAME
+    elif voided:
+        prefix, filename = VOIDED_DIR_PREFIX, VOIDED_FILENAME
+    else:
+        prefix, filename = SCORED_DIR_PREFIX, SCORED_FILENAME
     root = Path(out_root).expanduser() if out_root else REPO_ROOT / CORPUS_DIRNAME
     directory = root / f"{prefix}{stamp}"
     directory.mkdir(parents=True, exist_ok=True)
@@ -1348,7 +1394,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 },
             )
 
-        target = record_run(payload, dry_run=args.dry_run, out_root=args.out)
+        # `voided` routes an aborted or invalidated scored series away from the
+        # scored filename. The preflight-abort path in particular reaches here with
+        # `attempts == []`, and writing that as `pick_baseline_<stamp>/run.json`
+        # put a zero-attempt file at exactly the path the standing record's
+        # newest-first selection reads.
+        target = record_run(
+            payload, dry_run=args.dry_run, out_root=args.out, voided=voided
+        )
     except NonInteractiveError as exc:
         print(_red(f"\n  ABORTED: {exc}. No judgment was invented; nothing was recorded."))
         return 1

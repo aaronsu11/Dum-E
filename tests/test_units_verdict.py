@@ -43,16 +43,26 @@ from pose_sweep_units_probe import (  # noqa: E402
     GRIPPER_NORM_MODE,
     JOINT_NAMES,
     MAX_RES,
+    MEASURED_SCALE_TOL,
+    assert_pose_reachable,
+    calibration_bounds,
+    clamp_demo_targets,
     clip_fingerprint_count,
+    compare_pre_and_post_upgrade,
     deg_per_pct_table,
     degrees_reachable_range,
     degrees_to_percent,
     envelope_contains,
+    envelope_row,
+    interpolate_steps,
+    measured_deg_per_pct,
     norm_mode_for,
     normalize_degrees,
     normalize_m100_100,
     normalize_v033,
     normalize_v061,
+    tick_for_degrees,
+    within_calibrated_ticks,
 )
 
 ARM_JOINTS = JOINT_NAMES[:5]
@@ -361,3 +371,236 @@ def test_gripper_needs_no_conversion_under_either_mode():
         assert 0.0 <= as_use_degrees_true <= 100.0
 
     assert "gripper" not in deg_per_pct_table()
+
+
+# --- The live half's pure helpers: hermetic, so CI covers them arm-free -------
+#
+# Plan 05-06 ran the hardware half against a real bus. The MEASUREMENTS live in
+# docs/UNITS-VERDICT.md's "## Live confirmation" section and in the gitignored
+# corpus output; what belongs in an always-running gate is the arithmetic those
+# measurements were derived through, plus the safety guards that decided which
+# commands were allowed to reach the arm. Nothing here opens a serial port.
+
+
+def test_tick_for_degrees_inverts_normalize_degrees():
+    """The commanded-tick predictor must invert the reported-degrees formula.
+
+    This is a safety-critical inverse, not a convenience: it is what
+    ``assert_pose_reachable`` uses to refuse a command that would drive a joint
+    past a mechanical stop.
+    """
+    for joint in ARM_JOINTS:
+        cal = CALIBRATION_TICK_RANGES[joint]
+        low, high = float(cal["range_min"]), float(cal["range_max"])
+        for tick in (low, (low + high) / 2, high, low + 17.0):
+            degrees = normalize_degrees(tick, low, high)
+            assert abs(tick_for_degrees(degrees, low, high) - tick) < 1e-9
+
+        assert within_calibrated_ticks(low, low, high)
+        assert within_calibrated_ticks(high, low, high)
+        assert not within_calibrated_ticks(low - 1, low, high)
+        assert not within_calibrated_ticks(high + 1, low, high)
+
+
+def test_assert_pose_reachable_accepts_dume_poses_and_rejects_a_pose_past_a_stop():
+    """Upstream's DEGREES un-normalization has NO clamp, so this guard is required.
+
+    ``_unnormalize``'s DEGREES branch is ``int(val * max_res / 360 + mid)``
+    (motors_bus.py :904-907) — unbounded. A commanded degree value outside a
+    joint's calibrated span therefore becomes an out-of-range tick and drives the
+    servo into a stop. Every one of Dum-E's own poses must pass; a value past
+    ``elbow_flex``'s +/-96.35 span must not.
+    """
+    for pose in DUME_POSES.values():
+        assert_pose_reachable(list(pose))
+
+    low, high = degrees_reachable_range("elbow_flex")
+    assert round(high, 2) == 96.35
+
+    unreachable = list(DUME_POSES["initial"])
+    unreachable[2] = high + 5.0
+    try:
+        assert_pose_reachable(unreachable)
+    except ValueError as exc:
+        assert "elbow_flex" in str(exc)
+        assert "outside" in str(exc)
+    else:  # pragma: no cover - the guard must not silently accept it
+        raise AssertionError("assert_pose_reachable accepted a pose past a stop")
+
+
+def test_clamp_demo_targets_exceed_the_clamp_and_clip_to_exactly_it():
+    """The demonstration delta must be above the clamp, and clip to the clamp."""
+    requested, clipped = clamp_demo_targets(-90.0, 160.0, 1.5)
+    assert requested == -90.0 + 240.0
+    assert clipped == -90.0 + 160.0
+    assert abs(requested - (-90.0)) > 160.0
+    assert abs(clipped - (-90.0)) == 160.0
+
+    # A multiple at or below 1.0 proves nothing and must be refused outright.
+    for bad_multiple in (1.0, 0.5, 0.0):
+        try:
+            clamp_demo_targets(0.0, 160.0, bad_multiple)
+        except ValueError as exc:
+            assert "EXCEED" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"accepted multiple={bad_multiple}")
+
+    for bad_clamp in (0.0, -1.0, float("inf")):
+        try:
+            clamp_demo_targets(0.0, bad_clamp, 1.5)
+        except ValueError as exc:
+            assert "positive finite" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"accepted clamp={bad_clamp}")
+
+
+def test_interpolate_steps_lands_exactly_on_target_without_exceeding_max_step():
+    """Slow motion has to come from small increments, not from a servo register.
+
+    ``configure_motors`` sets Maximum_Acceleration/Acceleration to 254 — the
+    servo's maximum — so the only lever on speed is the size of each commanded
+    increment. The final step must land EXACTLY on the target: an interpolation
+    that stops short would leave the arm somewhere the measurement did not name.
+    """
+    present = [0.0, -102.0, 96.0, 76.0, -90.0, 0.0]
+    target = [0.0, 0.0, 0.0, 50.0, -90.0, 60.0]
+    steps = interpolate_steps(present, target, 4.0)
+
+    assert steps[-1] == target
+    assert len(steps) == 26  # ceil(102 / 4)
+
+    previous = present
+    for step in steps:
+        assert max(abs(a - b) for a, b in zip(step, previous)) <= 4.0 + 1e-9
+        previous = step
+
+    # An already-satisfied move is one no-op step, never zero steps.
+    assert interpolate_steps(target, target, 4.0) == [target]
+
+    for bad in (0.0, -1.0):
+        try:
+            interpolate_steps(present, target, bad)
+        except ValueError as exc:
+            assert "positive" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"accepted max_step={bad}")
+
+
+def test_measured_deg_per_pct_recovers_the_derived_table_from_one_tick():
+    """The ratio of the two readings of ONE tick IS the per-joint scale factor.
+
+    This is the arithmetic behind the live measurement that discharged research
+    assumption A2: reading the same register once as degrees and once as percent
+    yields both sides of the seam from a single physical pose, and their ratio is
+    the scale. Here both sides are computed from a synthetic tick, which proves
+    the method; the live run supplied the hardware numbers.
+    """
+    table = deg_per_pct_table()
+    for joint in ARM_JOINTS:
+        cal = CALIBRATION_TICK_RANGES[joint]
+        low, high = float(cal["range_min"]), float(cal["range_max"])
+        for tick in (low, low + 100.0, high):
+            degrees = normalize_degrees(tick, low, high)
+            percent = normalize_m100_100(tick, low, high, cal["drive_mode"])
+            measured = measured_deg_per_pct(degrees, percent)
+            assert measured is not None
+            assert abs(measured - table[joint]) < MEASURED_SCALE_TOL
+
+    # At the calibrated midpoint both readings are zero and the ratio is
+    # meaningless. It must report "not measurable", never a fabricated number.
+    cal = CALIBRATION_TICK_RANGES["wrist_roll"]
+    midpoint = (cal["range_min"] + cal["range_max"]) / 2
+    assert measured_deg_per_pct(
+        normalize_degrees(midpoint, cal["range_min"], cal["range_max"]), 0.0
+    ) is None
+
+
+def test_envelope_row_discriminates_at_initial_and_does_not_at_ready():
+    """The row-level restatement of PAR-04's silent-pass hazard.
+
+    ``initial``'s ``shoulder_lift`` is the one joint whose envelope membership
+    differs between the conventions; every ``ready`` joint reads the same under
+    both, so no ``ready`` row is admissible as the verdict's evidence.
+    """
+    initial_deg = DUME_POSES["initial"][:5]
+    initial_pct = degrees_to_percent(initial_deg)
+    rows = [
+        envelope_row(joint, initial_deg[index], initial_pct[index])
+        for index, joint in enumerate(ARM_JOINTS)
+    ]
+    discriminating = [row for row in rows if row["discriminates"]]
+    assert [row["joint"] for row in discriminating] == ["shoulder_lift"]
+    assert discriminating[0]["percent_inside"] is True
+    assert discriminating[0]["degrees_inside"] is False
+    assert round(discriminating[0]["as_degrees"], 2) == -102.0
+    assert round(discriminating[0]["as_percent"], 2) == -98.33
+
+    ready_deg = DUME_POSES["ready"][:5]
+    ready_pct = degrees_to_percent(ready_deg)
+    for index, joint in enumerate(ARM_JOINTS):
+        row = envelope_row(joint, ready_deg[index], ready_pct[index])
+        assert row["discriminates"] is False
+        assert row["degrees_inside"] and row["percent_inside"]
+
+    # The gripper has no arm-envelope row: its stats live in a separate group.
+    try:
+        envelope_row("gripper", 0.0, 0.0)
+    except ValueError as exc:
+        assert "arm joints" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("envelope_row accepted the gripper")
+
+
+def test_compare_pre_and_post_upgrade_is_exact_identity_on_synthetic_ticks():
+    """The before/after comparison must be an EXACT identity, not merely <0.5.
+
+    Roadmap criterion 2 budgets 0.5 per joint, but the two versions' ``_normalize``
+    bodies are byte-identical, so the honest expectation is bit-for-bit equality.
+    Asserting the identity here is what makes a nonzero live difference readable
+    as a calibration problem rather than as an upgrade artefact.
+    """
+    calibration = {
+        joint: dict(cal) for joint, cal in CALIBRATION_TICK_RANGES.items()
+    }
+    raw = {joint: cal["range_min"] + 137 for joint, cal in CALIBRATION_TICK_RANGES.items()}
+
+    for use_degrees in (True, False):
+        reported = {
+            joint: normalize_v061(
+                tick,
+                calibration[joint]["range_min"],
+                calibration[joint]["range_max"],
+                calibration[joint]["drive_mode"],
+                norm_mode_for(joint, use_degrees),
+            )
+            for joint, tick in raw.items()
+        }
+        result = compare_pre_and_post_upgrade(raw, reported, calibration, use_degrees)
+        assert set(result) == set(JOINT_NAMES)
+        for joint, row in result.items():
+            assert row["formula_delta"] == 0.0
+            assert row["diff"] == 0.0
+            assert row["pre_upgrade_v033"] == row["post_upgrade_v061"]
+            assert row["norm_mode"] == norm_mode_for(joint, use_degrees)
+
+
+def test_calibration_bounds_reads_a_dataclass_and_a_plain_dict_alike():
+    """Live code hands over MotorCalibration dataclasses; the tests hand over dicts.
+
+    Both shapes must work, so the same derivation functions the hardware run used
+    are the ones CI exercises — not a parallel reimplementation.
+    """
+    class _Entry:
+        range_min, range_max, drive_mode = 898, 3090, 0
+
+    from_dataclass = calibration_bounds({"elbow_flex": _Entry()}, "elbow_flex")
+    from_dict = calibration_bounds(
+        {"elbow_flex": {"range_min": 898, "range_max": 3090, "drive_mode": 0}}, "elbow_flex"
+    )
+    assert from_dataclass == from_dict == (898.0, 3090.0, 0)
+
+    # A dict without drive_mode defaults to 0 rather than raising: every motor on
+    # this arm has drive_mode 0, which is why both conventions share a midpoint.
+    assert calibration_bounds(
+        {"gripper": {"range_min": 2045, "range_max": 3486}}, "gripper"
+    ) == (2045.0, 3486.0, 0)

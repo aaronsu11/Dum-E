@@ -22,23 +22,39 @@ Four arm-free discriminators, in order of strength:
      PAR-04's literal assertion decides nothing. The harness prints that as an
      explicit non-discrimination note rather than citing it as evidence.
 
-The hardware half (``units_verdict()`` / ``active_mode_from_raw_tick()``) is
-shipped here but NOT run by this plan: ``--skip-hardware`` opens no serial port
-and needs no arm. Plan 05-06 runs it behind the hardware-attach gate, which is
-what converts the per-joint scale magnitudes from exact arithmetic on verified
-inputs into an actual measurement.
+The hardware half (``units_verdict()`` / ``active_mode_from_raw_tick()``,
+``live_pose_sweep()``, ``compare_pre_and_post_upgrade()``, ``demo_clamp()``) needs
+the arm: ``--skip-hardware`` opens no serial port and runs the four arm-free
+discriminators only. Plan 05-06 ran the hardware half behind the hardware-attach
+gate, which is what converted the per-joint scale magnitudes from exact
+arithmetic on verified inputs into an actual measurement. See the
+``## Live confirmation`` section of ``docs/UNITS-VERDICT.md`` for the values.
+
+TWO CONVENTIONS ARE MEASURED, DELIBERATELY. The bus reports whatever
+``use_degrees`` selects, and Dum-E runs ``use_degrees=True`` (DEGREES) while the
+CHECKPOINT was trained in RANGE_M100_100. Those are answers to two different
+questions, so the sweep probes the bus twice — once at the running configuration
+and once at ``use_degrees=False`` — and decides the CHECKPOINT question from the
+envelope discrimination at the ``initial`` pose plus the ``elbow_flex``
+at-mechanical-limit fingerprint. Motion is only ever commanded in the running
+DEGREES configuration, because the four hardcoded pose vectors are degrees.
 
 Usage:
     uv run python scripts/pose_sweep_units_probe.py --skip-hardware
     uv run python scripts/pose_sweep_units_probe.py --port /dev/ttyACM0
+    uv run python scripts/pose_sweep_units_probe.py --pose-sequence initial,ready,remote
+    uv run python scripts/pose_sweep_units_probe.py --demo-clamp
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # --- Pinned reference constants ---------------------------------------------
@@ -238,6 +254,57 @@ DEFAULT_ROBOT_ID = "my_awesome_follower_arm"
 STATISTICS_RELPATH = Path("checkpoints") / "GR00T-N1.7-3B-SO101" / "statistics.json"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# --- Live-measurement constants (the hardware half) -------------------------
+
+# Provenance: roadmap criterion 2 — "the same joint vector to under 0.5 degrees
+# per joint before and after the upgrade". Because the 0.3.3 and 0.6.1 formulas
+# are byte-identical, the honest expectation is EXACT equality; 0.5 is the
+# criterion's own budget, kept as the assertion so the recorded number is
+# comparable to what the roadmap asked for.
+BEFORE_AFTER_TOL = 0.5
+
+# A measured per-joint scale counts as agreeing with the offline derived table
+# when it matches to 5 decimal places — the precision the derived table is
+# recorded at (DEG_PER_PCT_PINNED). Deliberately NOT loosened: the derived value
+# is exact arithmetic, so a real disagreement would be gross, not marginal.
+MEASURED_SCALE_TOL = 5e-6
+
+# Motion shaping for parking the arm. Upstream `configure_motors` sets
+# Maximum_Acceleration/Acceleration to 254 (as fast as the servo goes), so slow
+# motion has to come from small commanded increments rather than from a register:
+# each interpolation step moves at most this many units, and every step still
+# passes through the SAFE-02 clamp.
+PARK_MAX_STEP = 4.0
+PARK_STEP_DELAY_S = 0.04
+PARK_SETTLE_S = 1.5
+
+# Clamp demonstration. `wrist_roll` is the ONLY joint with more than
+# 2 x DEFAULT_MAX_RELATIVE_TARGET of calibrated travel (+/-167.78 deg against
+# +/-116.53 for the next widest), so it is the only joint on which a delta above
+# the clamp can be requested without the UNCLAMPED target lying past a mechanical
+# stop. That property is what makes the demonstration safe: even a clamp that
+# failed to engage would command a physically reachable pose. 1.5x is a modest
+# multiple — the point is to cross the threshold, not to stress the arm.
+CLAMP_DEMO_JOINT = "wrist_roll"
+CLAMP_DEMO_MULTIPLE = 1.5
+
+# The pose the clamp demonstration is commanded FROM, and the pose the arm is
+# parked at before every disconnect: `initial`, i.e. the target of
+# `SO10xArmController.move_to_initial_pose()`. Operator-designated as this arm's
+# safe testing pose, and it is also the right choice for the disconnect because
+# `disable_torque_on_disconnect` defaults to True upstream, so the arm goes limp
+# when the probe exits and `initial` is a folded pose it can be left in safely.
+CLAMP_DEMO_START_POSE = "initial"
+REST_POSE = "initial"
+
+# Raw numeric output goes here (gitignored), never into a tracked repo path.
+CORPUS_DIRNAME = "corpus"
+
+# Retry count for every live bus read. Upstream defaults `num_retry=0`, which
+# turns one dropped Feetech packet into an apparent value mismatch — and a value
+# mismatch is precisely what this probe measures.
+LIVE_READ_RETRIES = 3
 
 
 # --- Normalization branches, exactly as upstream defines them ----------------
@@ -509,18 +576,12 @@ def units_verdict(bus, calibration) -> dict:
     BOTH lerobot 0.3.3 and 0.6.1, so this identical probe runs on either side of
     the version bump — which is what makes the before/after comparison meaningful.
     """
-    raw = bus.sync_read("Present_Position", normalize=False, num_retry=2)
-    got = bus.sync_read("Present_Position", normalize=True, num_retry=2)
+    raw = bus.sync_read("Present_Position", normalize=False, num_retry=LIVE_READ_RETRIES)
+    got = bus.sync_read("Present_Position", normalize=True, num_retry=LIVE_READ_RETRIES)
 
     verdict = {}
     for motor, tick in raw.items():
-        entry = calibration[motor]
-        lo = getattr(entry, "range_min", None)
-        hi = getattr(entry, "range_max", None)
-        drive_mode = getattr(entry, "drive_mode", 0)
-        if lo is None or hi is None:  # a plain dict, not a calibration dataclass
-            lo, hi = entry["range_min"], entry["range_max"]
-            drive_mode = entry.get("drive_mode", 0)
+        lo, hi, drive_mode = calibration_bounds(calibration, motor)
         matched = active_mode_from_raw_tick(tick, got[motor], lo, hi, drive_mode)
         verdict[motor] = {
             "raw_tick": tick,
@@ -534,6 +595,187 @@ def units_verdict(bus, calibration) -> dict:
             "deg_per_pct": (hi - lo) * 360 / (MAX_RES * 200),
         }
     return verdict
+
+
+# --- Pure helpers for the live half: no hardware, unit-testable in CI --------
+
+
+def tick_for_degrees(degrees: float, lo: float, hi: float) -> float:
+    """Invert :func:`normalize_degrees` — the raw tick a degree value commands.
+
+    Needed as a PRE-FLIGHT SAFETY CHECK, not as a convenience. Upstream's
+    ``_unnormalize`` DEGREES branch is ``int(val * max_res / 360 + mid)`` with no
+    clamp of any kind (``motors_bus.py`` :904-907), so a commanded degree value
+    outside the joint's calibrated span produces an out-of-range tick and drives
+    the servo into a mechanical stop. Every commanded target in this harness is
+    checked through here first.
+    """
+    mid = (lo + hi) / 2
+    return mid + degrees * MAX_RES / 360
+
+
+def within_calibrated_ticks(tick: float, lo: float, hi: float) -> bool:
+    """Is ``tick`` inside the joint's calibrated (i.e. physically recorded) span?"""
+    return lo <= tick <= hi
+
+
+def measured_deg_per_pct(reported_degrees: float, computed_percent: float) -> float | None:
+    """The per-joint degrees-to-percent factor MEASURED from one raw tick read.
+
+    Reading the same register once with normalization off and once with it on
+    gives both sides of the seam from a single physical pose: the bus reports the
+    DEGREES value, and the RANGE_M100_100 value is recomputed from the same tick.
+    Their ratio IS the scale factor — a measurement, not arithmetic on the
+    calibration file, which is what discharges research assumption A2.
+
+    Returns ``None`` when the percent reading is at or near zero (the joint is at
+    its calibrated midpoint), where the ratio is numerically meaningless. A
+    ``None`` is reported as "not measurable at this pose", never silently skipped:
+    the sweep visits several poses precisely so every joint is measurable at one
+    of them.
+    """
+    if abs(computed_percent) < 1e-6:
+        return None
+    return reported_degrees / computed_percent
+
+
+def envelope_row(joint: str, degrees_value: float, percent_value: float, group: str = "state") -> dict:
+    """Per-joint envelope membership under BOTH candidate conventions.
+
+    ``discriminates`` is the load-bearing field: when it is False the joint's
+    reading is inside (or outside) the envelope under both conventions and
+    therefore decides nothing — PAR-04's documented silent-pass hazard. Only rows
+    where it is True are admissible as evidence of the checkpoint's convention.
+    """
+    groups = {"state": CHECKPOINT_STATE_STATS, "action": CHECKPOINT_ACTION_STATS}
+    if group not in groups:
+        raise ValueError(f"Unknown group: {group!r}; expected one of {sorted(groups)}")
+    if joint not in ARM_JOINTS:
+        raise ValueError(f"Envelope rows cover the arm joints {ARM_JOINTS}; got {joint!r}")
+    stats = groups[group]["single_arm"]
+    index = ARM_JOINTS.index(joint)
+    q01, q99 = stats["q01"][index], stats["q99"][index]
+    inside_deg = bool(q01 <= degrees_value <= q99)
+    inside_pct = bool(q01 <= percent_value <= q99)
+    return {
+        "joint": joint,
+        "q01": q01,
+        "q99": q99,
+        "as_degrees": degrees_value,
+        "degrees_inside": inside_deg,
+        "as_percent": percent_value,
+        "percent_inside": inside_pct,
+        "discriminates": inside_deg != inside_pct,
+    }
+
+
+def clamp_demo_targets(present: float, clamp: float, multiple: float = CLAMP_DEMO_MULTIPLE) -> tuple[float, float]:
+    """``(requested, expected_clipped)`` for the oversized-delta demonstration.
+
+    The requested delta is ``multiple * clamp`` so it is unambiguously above the
+    threshold; upstream clips the delta to exactly ``clamp``, so the expected
+    clipped target is ``present + clamp`` with the same sign.
+    """
+    if not (multiple > 1.0):
+        raise ValueError(
+            f"The demonstration delta must EXCEED the clamp or nothing is proven; "
+            f"got multiple={multiple!r}"
+        )
+    if not (clamp > 0.0) or not math.isfinite(clamp):
+        raise ValueError(f"clamp must be a positive finite float; got {clamp!r}")
+    return present + clamp * multiple, present + clamp
+
+
+def interpolate_steps(
+    present: list[float], target: list[float], max_step: float = PARK_MAX_STEP
+) -> list[list[float]]:
+    """Break one large pose change into small increments, ending exactly on target.
+
+    Upstream sets the servos' acceleration registers to their maximum during
+    ``configure()``, so "move slowly" cannot be expressed as a register value —
+    it has to be expressed as small commanded increments. Every increment still
+    passes through the SAFE-02 clamp; this only ensures none of them needs to.
+    """
+    if len(present) != len(target):
+        raise ValueError(f"Vector length mismatch: {len(present)} != {len(target)}")
+    if not (max_step > 0.0):
+        raise ValueError(f"max_step must be positive; got {max_step!r}")
+    span = max((abs(t - p) for p, t in zip(present, target)), default=0.0)
+    count = max(1, math.ceil(span / max_step))
+    return [
+        [p + (t - p) * (index / count) for p, t in zip(present, target)]
+        for index in range(1, count + 1)
+    ]
+
+
+def assert_pose_reachable(vector: list[float]) -> None:
+    """Refuse a commanded arm vector whose DEGREES target lands past a stop.
+
+    Applies to the five arm joints only: the gripper is ``RANGE_0_100``, whose
+    ``_unnormalize`` branch IS clamped upstream, so it cannot be driven out of
+    range by an out-of-band value.
+    """
+    offenders = []
+    for value, joint in zip(vector[:5], ARM_JOINTS):
+        cal = CALIBRATION_TICK_RANGES[joint]
+        lo, hi = float(cal["range_min"]), float(cal["range_max"])
+        tick = tick_for_degrees(value, lo, hi)
+        if not within_calibrated_ticks(tick, lo, hi):
+            offenders.append(f"{joint}={value:.3f}deg -> tick {tick:.1f} outside [{lo:.0f}, {hi:.0f}]")
+    if offenders:
+        raise ValueError(
+            "Refusing to command a pose that would drive a joint past its "
+            f"calibrated span (the DEGREES unnormalize branch has no clamp): "
+            f"{'; '.join(offenders)}"
+        )
+
+
+def compare_pre_and_post_upgrade(
+    raw_ticks: dict, reported: dict, calibration: dict, use_degrees: bool
+) -> dict:
+    """Per-joint |pre-upgrade computed value - post-upgrade reported value|.
+
+    The pre-upgrade value is recomputed from the SAME raw ticks with the 0.3.3
+    formula. That is exact rather than approximate: plan 05-03 proved the two
+    versions' ``_normalize`` bodies byte-identical by sweeping every raw tick
+    across each joint's calibrated span, so this is a genuine before-and-after
+    comparison taken from one physical pose and one tick read — strictly less
+    noisy than two separate live runs, which would add servo read noise and
+    re-parking error on top of any real delta. See the corrected-mechanism note
+    in ``docs/UNITS-VERDICT.md``.
+    """
+    result = {}
+    for motor, tick in raw_ticks.items():
+        lo, hi, drive_mode = calibration_bounds(calibration, motor)
+        mode = norm_mode_for(motor, use_degrees)
+        pre = normalize_v033(tick, lo, hi, drive_mode, mode)
+        post = normalize_v061(tick, lo, hi, drive_mode, mode)
+        result[motor] = {
+            "raw_tick": tick,
+            "norm_mode": mode,
+            "pre_upgrade_v033": pre,
+            "post_upgrade_v061": post,
+            "bus_reported": reported[motor],
+            "formula_delta": post - pre,
+            "diff": abs(pre - reported[motor]),
+        }
+    return result
+
+
+def calibration_bounds(calibration: dict, motor: str) -> tuple[float, float, int]:
+    """``(range_min, range_max, drive_mode)`` from a dataclass OR a plain dict.
+
+    Live code hands us ``MotorCalibration`` dataclasses; the hermetic tests hand
+    us plain dicts. Both are supported so the same functions are exercised in CI.
+    """
+    entry = calibration[motor]
+    lo = getattr(entry, "range_min", None)
+    hi = getattr(entry, "range_max", None)
+    drive_mode = getattr(entry, "drive_mode", None)
+    if lo is None or hi is None:
+        lo, hi = entry["range_min"], entry["range_max"]
+        drive_mode = entry.get("drive_mode", 0)
+    return float(lo), float(hi), int(drive_mode or 0)
 
 
 # --- Local data artifacts: resolved, never hardcoded ------------------------
@@ -654,6 +896,553 @@ def check_pinned_constants_against_local_artifacts(
         "(aaronsu11/so101_fruit meta/episodes_stats.jsonl) and is not checked offline"
     )
     return ok, notes
+
+
+# --- The live session: read-only first, then commanded motion ----------------
+#
+# Ordering is a safety property, not a style choice. Every tick read, the PID
+# read-back and the calibration checksum happen BEFORE the first command that
+# moves a joint, so a bus or calibration fault surfaces while the arm is
+# stationary.
+
+
+# Dum-E's state-vector key order, matching `SO10xArmController._state_keys`.
+STATE_KEYS = [f"{joint}.pos" for joint in JOINT_NAMES]
+
+
+def _repo_on_path() -> None:
+    """Put the repo root on ``sys.path`` so ``embodiment.*`` imports resolve.
+
+    Running this file as a script puts ``scripts/`` on ``sys.path[0]``, not the
+    repo root, so the controller import fails without this. Discovered by running
+    the hardware half for the first time (plan 05-06).
+    """
+    root = str(REPO_ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+def resolve_live_controller_settings(args: argparse.Namespace) -> dict:
+    """Serial port, robot identity and camera indices for the live session.
+
+    Resolution order per field: the command-line flag, then the Dum-E YAML config
+    (``DUME_CONFIG`` or ``my-dum-e.yaml`` at the repo root), then the value baked
+    into this module. ``config.example.yaml`` is deliberately NOT consulted: it is
+    a template, and its camera indices are not this host's devices — a template
+    value must never silently become a device selection.
+
+    The camera indices matter even though this probe never looks at an image:
+    ``SO10xArmController`` always constructs two cameras and ``connect()``
+    connects them, so a wrong index fails the whole connect. On the host this was
+    first run against, the two real capture nodes are 0 and 2 — indices 1 and 3
+    are V4L2 metadata nodes that cannot be opened at all.
+    """
+    config: dict = {}
+    explicit = os.environ.get("DUME_CONFIG")
+    candidate = Path(explicit).expanduser() if explicit else REPO_ROOT / "my-dum-e.yaml"
+    if candidate.is_file():
+        import yaml  # lazy: the arm-free path needs no YAML parser
+
+        loaded = yaml.safe_load(candidate.read_text(encoding="utf-8")) or {}
+        block = loaded.get("controller")
+        config = block if isinstance(block, dict) else {}
+
+    def pick(flag, key, fallback):
+        if flag is not None:
+            return flag
+        if key in config and config[key] is not None:
+            return config[key]
+        return fallback
+
+    return {
+        "config_file": str(candidate) if config else None,
+        "robot_type": pick(args.robot_type, "robot_type", DEFAULT_ROBOT_TYPE),
+        "robot_id": pick(args.robot_id, "robot_id", DEFAULT_ROBOT_ID),
+        "robot_port": pick(args.port, "robot_port", None),
+        "wrist_cam_idx": int(pick(args.wrist_cam_idx, "wrist_cam_idx", 0)),
+        "front_cam_idx": int(pick(args.front_cam_idx, "front_cam_idx", 1)),
+    }
+
+
+def prearm_goal_to_present(bus) -> dict:
+    """Write ``Goal_Position <- Present_Position`` while torque is still OFF.
+
+    THIS IS A SAFETY PRECONDITION FOR CONNECTING, discovered by reading the live
+    registers before touching anything (plan 05-06). Upstream's ``configure()``
+    runs inside ``bus.torque_disabled()``, whose exit calls ``enable_torque()``,
+    and ``enable_torque()`` writes ``Torque_Enable`` and ``Lock`` only — it does
+    NOT synchronise ``Goal_Position`` to the present position
+    (``feetech.py`` :302-305). On this arm, with torque off after a power cycle,
+    every motor's ``Goal_Position`` register reads **0**: connecting without
+    pre-arming would therefore command all six joints to raw tick 0 the instant
+    torque came back, a slam of up to 3090 ticks on ``elbow_flex``.
+
+    Pre-arming with torque disabled cannot itself move the arm, and it makes the
+    torque-enable a hold rather than a move. The dangerous path is never
+    exercised, so this function does not prove the slam would happen — it
+    prevents it.
+
+    Returns a record of what was found and written. Skips (and says so) when
+    torque is already enabled, where ``Goal_Position`` is live and overwriting it
+    would be the very command this exists to avoid.
+    """
+    bus.connect()
+    try:
+        torque = bus.sync_read("Torque_Enable", normalize=False, num_retry=LIVE_READ_RETRIES)
+        present = bus.sync_read("Present_Position", normalize=False, num_retry=LIVE_READ_RETRIES)
+        goal_before = bus.sync_read("Goal_Position", normalize=False, num_retry=LIVE_READ_RETRIES)
+        record = {
+            "torque_enable_before": dict(torque),
+            "present_ticks": dict(present),
+            "goal_ticks_before": dict(goal_before),
+            "worst_pending_jump_ticks": max(
+                (abs(goal_before[m] - present[m]) for m in present), default=0
+            ),
+        }
+        if any(value for value in torque.values()):
+            record.update(prearmed=False, reason="torque already enabled — Goal_Position is live")
+            return record
+        for motor, tick in present.items():
+            bus.write("Goal_Position", motor, int(tick), normalize=False, num_retry=LIVE_READ_RETRIES)
+        goal_after = bus.sync_read("Goal_Position", normalize=False, num_retry=LIVE_READ_RETRIES)
+        mismatched = {
+            motor: (present[motor], goal_after[motor])
+            for motor in present
+            if abs(goal_after[motor] - present[motor]) > 1
+        }
+        if mismatched:
+            raise RuntimeError(
+                "Goal_Position pre-arm did not take, so enabling torque would "
+                f"command a jump. Refusing to connect. present vs goal: {mismatched}"
+            )
+        record.update(prearmed=True, reason="written and verified", goal_ticks_after=dict(goal_after))
+        return record
+    finally:
+        # disable_torque=False: leave the torque state EXACTLY as found.
+        bus.disconnect(False)
+
+
+def open_controller(args: argparse.Namespace, *, use_degrees=None):
+    """Construct, pre-arm and connect the controller. Returns ``(controller, info)``.
+
+    ``connect()`` performs the calibration-file assertion and the PID read-back,
+    so ``info`` carries both as the live evidence LR-04 and D-05 ask for.
+    """
+    _repo_on_path()
+    from embodiment.so_arm10x.controller import SO10xArmController
+
+    settings = resolve_live_controller_settings(args)
+    if not settings["robot_port"]:
+        raise ValueError(
+            "No serial port: pass --port, set SO_ARM_PORT, or name robot_port in "
+            "the controller block of my-dum-e.yaml"
+        )
+    kwargs = dict(
+        robot_type=settings["robot_type"],
+        robot_port=settings["robot_port"],
+        robot_id=settings["robot_id"],
+        wrist_cam_idx=settings["wrist_cam_idx"],
+        front_cam_idx=settings["front_cam_idx"],
+    )
+    if use_degrees is not None:
+        kwargs["use_degrees"] = use_degrees
+    controller = SO10xArmController(**kwargs)
+
+    prearm = prearm_goal_to_present(controller.robot.bus)
+    controller.connect()
+
+    calibration_path, calibration_sha256 = controller._assert_calibration_loaded()
+    pid_readback = controller._assert_pid_landed()
+    info = {
+        "settings": settings,
+        "prearm": prearm,
+        "calibration_path": str(calibration_path),
+        "calibration_path_redacted": _redact_home(calibration_path),
+        "calibration_sha256": calibration_sha256,
+        "pid_readback": pid_readback,
+        "use_degrees": bool(getattr(controller.config, "use_degrees", True)),
+        "max_relative_target": getattr(controller.config, "max_relative_target", None),
+    }
+    return controller, info
+
+
+def _redact_home(path) -> str:
+    """``~``-relative form of a path, so no absolute home directory is committed."""
+    text = str(path)
+    home = str(Path.home())
+    return "~" + text[len(home) :] if text.startswith(home) else text
+
+
+def close_controller(controller, *, keep_torque: bool = False) -> None:
+    """Disconnect, optionally leaving torque enabled so the arm holds position."""
+    if keep_torque:
+        controller.config.disable_torque_on_disconnect = False
+    controller.disconnect()
+
+
+def read_joint_vector(controller) -> list[float]:
+    """The 6-joint vector straight off the bus — no camera read, no observation."""
+    got = controller.robot.bus.sync_read(
+        "Present_Position", normalize=True, num_retry=LIVE_READ_RETRIES
+    )
+    return [float(got[joint]) for joint in JOINT_NAMES]
+
+
+def park_slowly(controller, target: list[float], *, label: str = "") -> list[tuple]:
+    """Move to ``target`` in small increments. Returns any clamp reports observed.
+
+    Refuses outright if the target is not physically reachable, then interpolates
+    so no single commanded step approaches the clamp. Any clamp firing HERE is a
+    finding, not an expectation: the demonstration in :func:`demo_clamp` is where
+    the clamp is supposed to engage.
+    """
+    _repo_on_path()
+    from embodiment.so_arm10x.controller import diff_clamped_joints
+
+    assert_pose_reachable(target)
+    present = read_joint_vector(controller)
+    clamped: list[tuple] = []
+    for step_vector in interpolate_steps(present, list(target), PARK_MAX_STEP):
+        action = {key: float(value) for key, value in zip(STATE_KEYS, step_vector)}
+        sent = controller.set_target_state(action)
+        clamped.extend(diff_clamped_joints(action, sent))
+        time.sleep(PARK_STEP_DELAY_S)
+    time.sleep(PARK_SETTLE_S)
+    if clamped and label:
+        print(_red(f"       NOTE: the clamp fired while parking at {label!r}: {clamped}"))
+    return clamped
+
+
+def measure_pose(controller, pose_name: str, commanded: list[float] | None) -> dict:
+    """Read the same registers twice — raw then normalized — and derive everything.
+
+    Produces, per joint: the raw tick, the value the upgraded bus reports, all
+    three recomputed candidates, which candidate actually matched (the active-mode
+    PROOF), the pre-upgrade computed value and its difference from the reported
+    one, and the measured degrees-to-percent factor. Plus the envelope membership
+    of the five arm joints under both candidate conventions.
+    """
+    bus = controller.robot.bus
+    calibration = bus.calibration
+    use_degrees = bool(getattr(controller.config, "use_degrees", True))
+
+    raw = bus.sync_read("Present_Position", normalize=False, num_retry=LIVE_READ_RETRIES)
+    reported = bus.sync_read("Present_Position", normalize=True, num_retry=LIVE_READ_RETRIES)
+
+    # The two-sided measurement: flip the bus's own norm modes in place and read
+    # the SAME physical pose again through the SAME upstream `_normalize`. No
+    # disconnect, no torque cycle, no motion between the reads — which is what
+    # makes the ratio of the two readings a hardware measurement of the seam
+    # rather than arithmetic on the calibration file. Restored in `finally`.
+    from lerobot.motors import MotorNormMode
+
+    original_modes = {name: motor.norm_mode for name, motor in bus.motors.items()}
+    try:
+        for name, motor in bus.motors.items():
+            if name != "gripper":
+                motor.norm_mode = MotorNormMode.RANGE_M100_100
+        reported_percent = bus.sync_read(
+            "Present_Position", normalize=True, num_retry=LIVE_READ_RETRIES
+        )
+    finally:
+        for name, motor in bus.motors.items():
+            motor.norm_mode = original_modes[name]
+    restored = {name: bus.motors[name].norm_mode for name in bus.motors}
+    if restored != original_modes:
+        raise RuntimeError(
+            f"Bus normalization modes were not restored: {restored} != {original_modes}"
+        )
+
+    before_after = compare_pre_and_post_upgrade(raw, reported, calibration, use_degrees)
+
+    joints: dict[str, dict] = {}
+    for motor, tick in raw.items():
+        lo, hi, drive_mode = calibration_bounds(calibration, motor)
+        candidates = {
+            "RANGE_M100_100": normalize_m100_100(tick, lo, hi, drive_mode),
+            "RANGE_0_100": normalize_0_100(tick, lo, hi, drive_mode),
+            "DEGREES": normalize_degrees(tick, lo, hi),
+        }
+        matched = active_mode_from_raw_tick(tick, reported[motor], lo, hi, drive_mode)
+        joints[motor] = {
+            "raw_tick": tick,
+            "reported_running_config": reported[motor],
+            "reported_percent_config": reported_percent[motor],
+            "candidates": candidates,
+            "matched_candidates": matched,
+            "active_mode": matched[0] if len(matched) == 1 else matched,
+            "at_calibrated_limit": bool(tick <= lo or tick >= hi),
+            "derived_deg_per_pct": (hi - lo) * 360 / (MAX_RES * 200),
+            "measured_deg_per_pct_one_sided": measured_deg_per_pct(
+                reported[motor], candidates["RANGE_M100_100"]
+            ),
+            "measured_deg_per_pct_two_sided": (
+                None
+                if motor == "gripper"
+                else measured_deg_per_pct(reported[motor], reported_percent[motor])
+            ),
+            **{
+                key: value
+                for key, value in before_after[motor].items()
+                if key in ("pre_upgrade_v033", "post_upgrade_v061", "formula_delta", "diff")
+            },
+        }
+
+    envelope = [
+        envelope_row(
+            joint,
+            degrees_value=joints[joint]["reported_running_config"]
+            if use_degrees
+            else joints[joint]["candidates"]["DEGREES"],
+            percent_value=joints[joint]["reported_percent_config"],
+        )
+        for joint in ARM_JOINTS
+    ]
+
+    return {
+        "pose": pose_name,
+        "commanded_degrees": commanded,
+        "use_degrees": use_degrees,
+        "joints": joints,
+        "before_after_diff": {motor: row["diff"] for motor, row in before_after.items()},
+        "envelope_initial_convention_check": envelope,
+    }
+
+
+def live_pose_sweep(args: argparse.Namespace, pose_names: list[str]) -> dict:
+    """Park at each fixed pose in turn and take the full measurement at each.
+
+    Read-only first: the connect performed by :func:`open_controller` does the
+    calibration assertion and the PID read-back, and the first measurement is
+    taken at the pose the arm was already in, all before any commanded motion.
+    """
+    unknown = [name for name in pose_names if name not in DUME_POSES]
+    if unknown:
+        raise ValueError(f"Unknown pose(s) {unknown}; known: {sorted(DUME_POSES)}")
+
+    controller, info = open_controller(args)
+    poses: list[dict] = []
+    parking_clamps: dict[str, list] = {}
+    reset_to_initial: dict = {}
+    try:
+        as_found = measure_pose(controller, "as-found (no motion commanded)", None)
+        for name in pose_names:
+            target = list(DUME_POSES[name])
+            print(f"       parking at {name!r} = {target} ...")
+            parking_clamps[name] = [list(entry) for entry in park_slowly(controller, target, label=name)]
+            poses.append(measure_pose(controller, name, target))
+        reset_to_initial = observe_reset_to_initial(controller)
+    finally:
+        close_controller(controller)
+
+    return {
+        "kind": "pose_sweep",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "connect": info,
+        "pid_readback": info["pid_readback"],
+        "calibration_path": info["calibration_path_redacted"],
+        "calibration_sha256": info["calibration_sha256"],
+        "as_found": as_found,
+        "poses": poses,
+        "parking_clamps": parking_clamps,
+        "reset_to_initial": reset_to_initial,
+        "reset_to_initial_worst_case_deltas": reset_to_initial_deltas(pose_names),
+    }
+
+
+def reset_to_initial_deltas(pose_names: list[str]) -> dict:
+    """Per-joint single-step delta a reset-to-initial would command from each pose.
+
+    Plan 05-05 flagged the reset-to-initial-pose from an extreme policy pose as the
+    likeliest LEGITIMATE clamp trigger, with a worst-case ``elbow_flex`` delta near
+    190 against a clamp of 160. ``move_to_initial_pose()`` issues ONE unsmoothed
+    command, so the delta it presents is the full pose difference — this records
+    that difference for each pose actually visited, so Phase 7 can compare a real
+    clamp warning against a number rather than against a recollection.
+    """
+    initial = DUME_POSES["initial"]
+    rows = {}
+    for name in pose_names:
+        pose = DUME_POSES[name]
+        rows[name] = {
+            joint: abs(initial[index] - pose[index]) for index, joint in enumerate(JOINT_NAMES)
+        }
+        rows[name]["max"] = max(rows[name].values())
+    return rows
+
+
+def observe_reset_to_initial(controller) -> dict:
+    """Call the production ``move_to_initial_pose()`` and record what it did.
+
+    Deliberately the real helper rather than an interpolated park: this is the
+    single-command reset the production pick loop performs, so it is the honest
+    place to observe whether a nominal reset trips the SAFE-02 clamp. It is also
+    the safe pose to leave the arm in before the torque drops at disconnect.
+
+    The clamp signal is read off Dum-E's own loguru stream, which is the surface
+    SAFE-02 requires it on — not off a return value the helper discards.
+    """
+    _repo_on_path()
+    from loguru import logger
+
+    from embodiment.so_arm10x.controller import CLAMP_WARNING_TEXT
+
+    before = read_joint_vector(controller)
+    target = list(DUME_POSES["initial"])
+    assert_pose_reachable(target)
+    captured: list[str] = []
+    sink_id = logger.add(lambda message: captured.append(message.record["message"]), level="WARNING")
+    try:
+        print("       resetting with the production move_to_initial_pose() ...")
+        controller.move_to_initial_pose()
+    finally:
+        logger.remove(sink_id)
+    time.sleep(PARK_SETTLE_S)
+    settled = read_joint_vector(controller)
+    commanded_delta = {
+        joint: target[index] - before[index] for index, joint in enumerate(JOINT_NAMES)
+    }
+    return {
+        "before": before,
+        "commanded": target,
+        "settled": settled,
+        "commanded_delta": commanded_delta,
+        "worst_commanded_delta": max(abs(value) for value in commanded_delta.values()),
+        "clamp_warnings": [line for line in captured if CLAMP_WARNING_TEXT in line],
+        "clamp_fired": any(CLAMP_WARNING_TEXT in line for line in captured),
+    }
+
+
+def demo_clamp(args: argparse.Namespace) -> dict:
+    """Command ONE joint a per-step delta above the clamp, and prove it clipped.
+
+    Three independent assertions, two of them from data rather than from a log:
+    the returned action differs from the requested one on that joint; the returned
+    delta equals the clamp within upstream's own divergence threshold; and the
+    warning reached Dum-E's loguru stream. Whether upstream's bridged root-logger
+    warning also arrived is recorded either way.
+
+    Safety: the joint is chosen so that even the UNCLAMPED requested target is
+    physically reachable (see :data:`CLAMP_DEMO_JOINT`), and both the requested
+    and the expected clipped target are checked against the calibrated tick span
+    before anything is sent.
+    """
+    _repo_on_path()
+    from loguru import logger
+
+    from embodiment.so_arm10x.controller import (
+        CLAMP_DIVERGENCE_THRESHOLD,
+        CLAMP_WARNING_TEXT,
+        diff_clamped_joints,
+    )
+    from utils import install_stdlib_to_loguru_bridge
+
+    # The bridge is what carries upstream's own root-logger warning into loguru;
+    # installing it here is what lets a single sink see BOTH emitters.
+    install_stdlib_to_loguru_bridge()
+    captured: list[str] = []
+    sink_id = logger.add(lambda message: captured.append(message.record["message"]), level="WARNING")
+
+    controller, info = open_controller(args)
+    try:
+        clamp = controller.config.max_relative_target
+        if not isinstance(clamp, float):
+            raise ValueError(
+                f"The clamp must be a live float for this demonstration; got {clamp!r}"
+            )
+        print(f"       parking at {CLAMP_DEMO_START_POSE!r} (the designated safe testing pose) ...")
+        park_slowly(controller, list(DUME_POSES[CLAMP_DEMO_START_POSE]), label=CLAMP_DEMO_START_POSE)
+
+        present_vector = read_joint_vector(controller)
+        index = JOINT_NAMES.index(CLAMP_DEMO_JOINT)
+        present = present_vector[index]
+        requested_value, expected_clipped = clamp_demo_targets(present, clamp)
+
+        cal = CALIBRATION_TICK_RANGES[CLAMP_DEMO_JOINT]
+        lo, hi = float(cal["range_min"]), float(cal["range_max"])
+        for label, value in (("requested", requested_value), ("clipped", expected_clipped)):
+            tick = tick_for_degrees(value, lo, hi)
+            if not within_calibrated_ticks(tick, lo, hi):
+                raise ValueError(
+                    f"Refusing the demonstration: the {label} target {value:.3f} on "
+                    f"{CLAMP_DEMO_JOINT} maps to tick {tick:.1f}, outside the calibrated "
+                    f"span [{lo:.0f}, {hi:.0f}]. Even an unclamped command must stay "
+                    f"physically reachable."
+                )
+
+        requested = {key: float(value) for key, value in zip(STATE_KEYS, present_vector)}
+        requested[f"{CLAMP_DEMO_JOINT}.pos"] = requested_value
+        print(
+            f"       commanding {CLAMP_DEMO_JOINT}: present={present:.3f} "
+            f"requested={requested_value:.3f} (delta {clamp * CLAMP_DEMO_MULTIPLE:.1f} "
+            f"= {CLAMP_DEMO_MULTIPLE}x the clamp of {clamp}) ..."
+        )
+        captured.clear()
+        sent = controller.set_target_state(requested)
+        time.sleep(PARK_SETTLE_S)
+        settled = read_joint_vector(controller)
+
+        clamped = diff_clamped_joints(requested, sent)
+        sent_value = sent[f"{CLAMP_DEMO_JOINT}.pos"]
+        dume_warnings = [
+            line
+            for line in captured
+            if CLAMP_WARNING_TEXT in line and "max_relative_target=" in line
+        ]
+        upstream_warnings = [
+            line
+            for line in captured
+            if CLAMP_WARNING_TEXT in line and "original goal_pos" in line
+        ]
+
+        record = {
+            "kind": "clamp_demo",
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "connect": info,
+            "pid_readback": info["pid_readback"],
+            "calibration_path": info["calibration_path_redacted"],
+            "calibration_sha256": info["calibration_sha256"],
+            "clamp": clamp,
+            "multiple": CLAMP_DEMO_MULTIPLE,
+            "joint": CLAMP_DEMO_JOINT,
+            "start_pose": CLAMP_DEMO_START_POSE,
+            "present": present,
+            "requested": requested_value,
+            "expected_clipped": expected_clipped,
+            "returned": sent_value,
+            "returned_delta": sent_value - present,
+            "settled": settled[index],
+            "divergence_threshold": CLAMP_DIVERGENCE_THRESHOLD,
+            "returned_differs_from_requested": abs(sent_value - requested_value)
+            > CLAMP_DIVERGENCE_THRESHOLD,
+            "returned_delta_equals_clamp": abs(abs(sent_value - present) - clamp)
+            <= CLAMP_DIVERGENCE_THRESHOLD,
+            "clamped_joints": [list(entry) for entry in clamped],
+            "dume_loguru_warning": dume_warnings[0] if dume_warnings else None,
+            "upstream_bridged_warning": upstream_warnings[0] if upstream_warnings else None,
+            "all_captured_warnings": list(captured),
+        }
+
+        print(f"       returning to the rest pose {REST_POSE!r} ...")
+        park_slowly(controller, list(DUME_POSES[REST_POSE]), label=REST_POSE)
+        return record
+    finally:
+        close_controller(controller)
+        logger.remove(sink_id)
+
+
+def write_corpus_results(payload: dict) -> Path:
+    """Write raw numeric output under the gitignored corpus directory.
+
+    Never into a tracked repo path: the committed record is the live confirmation
+    section of ``docs/UNITS-VERDICT.md``, which carries the values a reader needs.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    directory = REPO_ROOT / CORPUS_DIRNAME / f"pose_sweep_{stamp}"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "results.json"
+    target.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return target
 
 
 # --- Numbered-check harness -------------------------------------------------
@@ -788,8 +1577,11 @@ def check_pinned_constants(index: str, args: argparse.Namespace) -> bool:
     ok, notes = check_pinned_constants_against_local_artifacts(
         statistics_path=args.statistics,
         calibration_path=args.calibration,
-        robot_type=args.robot_type,
-        robot_id=args.robot_id,
+        # `--robot-type` / `--robot-id` default to None so the YAML config can
+        # supply them for the LIVE session; the offline drift check needs the
+        # module fallbacks when neither is given.
+        robot_type=args.robot_type or DEFAULT_ROBOT_TYPE,
+        robot_id=args.robot_id or DEFAULT_ROBOT_ID,
     )
     for note in notes:
         print(f"       {note}")
@@ -806,36 +1598,32 @@ def check_pinned_constants(index: str, args: argparse.Namespace) -> bool:
 
 
 def check_hardware_raw_tick(index: str, args: argparse.Namespace) -> bool:
-    """The arm-required half. Never reached under --skip-hardware.
+    """The arm-required half, read-only. Never reached under --skip-hardware.
 
     Reports whichever normalization mode the constructed controller is ACTUALLY
     running — it does not presuppose one, which is the whole point of the probe.
+    Commands no motion: the connect pre-arms the goal registers so the
+    torque-enable is a hold (see :func:`prearm_goal_to_present`).
     """
-    print(f"\n[{index}] raw-tick round-trip probe — REQUIRES THE ARM ...")
-    if not args.port:
-        print(_red("  FAIL: --port is required for the hardware probe"))
-        return False
+    print(f"\n[{index}] raw-tick round-trip probe — REQUIRES THE ARM (read-only) ...")
     try:
-        # Imported here so --skip-hardware opens no serial port and pulls in no
-        # part of the lerobot robot stack at all.
-        from embodiment.so_arm10x.controller import SO10xArmController
+        controller, info = open_controller(args)
     except Exception as exc:  # noqa: BLE001
-        print(_red(f"  FAIL: cannot import the controller: {type(exc).__name__}: {exc}"))
+        print(_red(f"  FAIL: cannot open the arm: {type(exc).__name__}: {exc}"))
         return False
-    controller = SO10xArmController(
-        robot_type=args.robot_type, robot_port=args.port, robot_id=args.robot_id
-    )
     try:
-        controller.connect()
         result = units_verdict(controller.robot.bus, controller.robot.bus.calibration)
     except Exception as exc:  # noqa: BLE001
         print(_red(f"  FAIL: probe raised {type(exc).__name__}: {exc}"))
         return False
     finally:
         try:
-            controller.disconnect()
+            close_controller(controller)
         except Exception:  # noqa: BLE001
             pass
+    print(f"       calibration {info['calibration_path_redacted']}")
+    print(f"       sha256      {info['calibration_sha256']}")
+    print(f"       use_degrees={info['use_degrees']} max_relative_target={info['max_relative_target']}")
     for motor, row in result.items():
         print(
             f"       {motor:<14} tick={row['raw_tick']} reported={row['reported']} "
@@ -853,6 +1641,250 @@ def check_hardware_raw_tick(index: str, args: argparse.Namespace) -> bool:
     return True
 
 
+def _summarize_live_sweep(results: dict) -> dict:
+    """Derive the verdict fields from the measured per-pose records.
+
+    Kept separate from the printing so the derivation is testable without an arm.
+
+    TWO DIFFERENT QUESTIONS, ANSWERED SEPARATELY AND ON PURPOSE:
+
+    * ``active_mode.running_config`` — which mode THE BUS is producing. Fixed by
+      ``use_degrees``, which Dum-E deliberately keeps at ``True``. This is a fact
+      about the configuration, not about the checkpoint.
+    * ``checkpoint_convention_verdict`` — which convention THE CHECKPOINT was
+      trained in. Decided only by rows that DISCRIMINATE: the ``initial`` pose's
+      envelope membership, and ``elbow_flex`` sitting at its mechanical limit
+      where percent reads exactly +/-100.0 (the value the checkpoint records) and
+      degrees cannot.
+    """
+    arm_modes_running: set = set()
+    arm_modes_percent: set = set()
+    ambiguous: list[str] = []
+    scale_disagreements: list[str] = []
+    before_after_failures: list[str] = []
+    discriminating: list[dict] = []
+    limit_fingerprints: list[dict] = []
+
+    for pose in results["poses"]:
+        for motor, row in pose["joints"].items():
+            if not isinstance(row["active_mode"], str):
+                ambiguous.append(f"{pose['pose']}.{motor}={row['matched_candidates']}")
+            elif motor in ARM_JOINTS:
+                arm_modes_running.add(row["active_mode"])
+            if motor in ARM_JOINTS:
+                if (
+                    abs(row["candidates"]["RANGE_M100_100"] - row["reported_percent_config"])
+                    < MODE_MATCH_TOL
+                ):
+                    arm_modes_percent.add("RANGE_M100_100")
+                else:
+                    arm_modes_percent.add(f"UNMATCHED@{pose['pose']}.{motor}")
+                measured = row["measured_deg_per_pct_two_sided"]
+                if measured is not None and abs(measured - row["derived_deg_per_pct"]) > MEASURED_SCALE_TOL:
+                    scale_disagreements.append(
+                        f"{pose['pose']}.{motor}: measured {measured:.6f} != derived "
+                        f"{row['derived_deg_per_pct']:.6f}"
+                    )
+                if row["at_calibrated_limit"]:
+                    limit_fingerprints.append(
+                        {
+                            "pose": pose["pose"],
+                            "joint": motor,
+                            "raw_tick": row["raw_tick"],
+                            "as_degrees": row["candidates"]["DEGREES"],
+                            "as_percent": row["candidates"]["RANGE_M100_100"],
+                        }
+                    )
+        for motor, diff in pose["before_after_diff"].items():
+            if not abs(diff) < BEFORE_AFTER_TOL:
+                before_after_failures.append(f"{pose['pose']}.{motor}={diff}")
+        if pose["pose"] == "initial":
+            discriminating = [
+                row for row in pose["envelope_initial_convention_check"] if row["discriminates"]
+            ]
+
+    percent_wins = bool(discriminating) and all(
+        row["percent_inside"] and not row["degrees_inside"] for row in discriminating
+    )
+    degrees_wins = bool(discriminating) and all(
+        row["degrees_inside"] and not row["percent_inside"] for row in discriminating
+    )
+    verdict = "RANGE_M100_100" if percent_wins else ("DEGREES" if degrees_wins else "INDETERMINATE")
+
+    return {
+        "active_mode": {
+            "running_config_use_degrees_true": (
+                sorted(arm_modes_running)[0] if len(arm_modes_running) == 1 else sorted(arm_modes_running)
+            ),
+            "percent_config_use_degrees_false": (
+                sorted(arm_modes_percent)[0] if len(arm_modes_percent) == 1 else sorted(arm_modes_percent)
+            ),
+        },
+        "active_mode_running": (
+            sorted(arm_modes_running)[0] if len(arm_modes_running) == 1 else sorted(arm_modes_running)
+        ),
+        "ambiguous_joints": ambiguous,
+        "scale_disagreements": scale_disagreements,
+        "before_after_failures": before_after_failures,
+        "initial_pose_discriminating_rows": discriminating,
+        "calibrated_limit_fingerprints": limit_fingerprints,
+        "checkpoint_convention_verdict": verdict,
+        "checkpoint_convention_agreement": "CONFIRM" if verdict == "RANGE_M100_100" else "CONTRADICT",
+        "offline_verdict": "RANGE_M100_100",
+    }
+
+
+def check_live_pose_sweep(index: str, args: argparse.Namespace, pose_names: list[str]) -> bool:
+    """Park at 3+ fixed poses and settle the units question on hardware."""
+    print(f"\n[{index}] live pose sweep — COMMANDS MOTION on {len(pose_names)} poses ...")
+    _repo_on_path()
+    from embodiment.so_arm10x.controller import DUME_PID
+
+    try:
+        results = live_pose_sweep(args, pose_names)
+    except Exception as exc:  # noqa: BLE001
+        print(_red(f"  FAIL: the sweep raised {type(exc).__name__}: {exc}"))
+        return False
+
+    summary = _summarize_live_sweep(results)
+    results.update(summary)
+    path = write_corpus_results(results)
+
+    print(f"       calibration {results['calibration_path']}")
+    print(f"       sha256      {results['calibration_sha256']}")
+    print(f"       raw output  {path.relative_to(REPO_ROOT)}")
+    print(
+        f"       pre-arm: {results['connect']['prearm']['reason']}; worst pending jump was "
+        f"{results['connect']['prearm']['worst_pending_jump_ticks']} ticks"
+    )
+    for pose in results["poses"]:
+        print(f"       pose {pose['pose']!r}:")
+        for motor in JOINT_NAMES:
+            row = pose["joints"][motor]
+            measured = row["measured_deg_per_pct_two_sided"]
+            print(
+                f"         {motor:<14} tick={row['raw_tick']:>4} "
+                f"reported={row['reported_running_config']:>9.4f} "
+                f"pct={row['reported_percent_config']:>9.4f} "
+                f"pre={row['pre_upgrade_v033']:>9.4f} diff={row['diff']:.2e} "
+                f"mode={row['active_mode']:<14} "
+                f"scale={'n/a' if measured is None else f'{measured:.5f}'}"
+            )
+
+    ok = True
+    if len(results["poses"]) < 3:
+        print(_red(f"  FAIL: only {len(results['poses'])} poses swept (need >= 3)"))
+        ok = False
+    if summary["ambiguous_joints"]:
+        print(_red(f"  FAIL: ambiguous active mode (0 or >1 candidate matched): {summary['ambiguous_joints']}"))
+        ok = False
+    if summary["before_after_failures"]:
+        print(_red(f"  FAIL: before/after difference reached {BEFORE_AFTER_TOL}: {summary['before_after_failures']}"))
+        ok = False
+    if summary["scale_disagreements"]:
+        print(_red(f"  FAIL: measured scale disagrees with the derived table: {summary['scale_disagreements']}"))
+        ok = False
+    if results["pid_readback"] != {motor: dict(DUME_PID) for motor in results["pid_readback"]}:
+        print(_red(f"  FAIL: PID read-back is not the Dum-E preset: {results['pid_readback']}"))
+        ok = False
+    if not summary["initial_pose_discriminating_rows"]:
+        print(_red("  FAIL: the initial pose produced no discriminating joint — the live "
+                   "measurement cannot decide the checkpoint's convention"))
+        ok = False
+    if summary["checkpoint_convention_agreement"] != "CONFIRM":
+        print(
+            _red(
+                f"  FAIL: the live measurement says the checkpoint convention is "
+                f"{summary['checkpoint_convention_verdict']}, CONTRADICTING the offline "
+                f"verdict RANGE_M100_100. Record the contradiction with both provenances "
+                f"and STOP — do not widen a tolerance and do not reconcile the two."
+            )
+        )
+        ok = False
+
+    print("       initial-pose envelope discrimination (the rows that decide):")
+    for row in summary["initial_pose_discriminating_rows"]:
+        print(
+            f"         {row['joint']:<14} q01={row['q01']:.4f} q99={row['q99']:.4f} | "
+            f"{row['as_degrees']:>9.4f} deg {'in ' if row['degrees_inside'] else 'OUT'} | "
+            f"{row['as_percent']:>9.4f} %   {'in ' if row['percent_inside'] else 'OUT'}"
+        )
+    for row in summary["calibrated_limit_fingerprints"]:
+        print(
+            f"       at-limit fingerprint: {row['joint']} at tick {row['raw_tick']} reads "
+            f"{row['as_degrees']:.4f} deg / {row['as_percent']:.4f} % — the checkpoint records "
+            f"100.0, which only the percent convention can produce"
+        )
+    print(
+        f"       active mode: running config -> {summary['active_mode']['running_config_use_degrees_true']}; "
+        f"percent config -> {summary['active_mode']['percent_config_use_degrees_false']}"
+    )
+    if ok:
+        print(
+            _green(
+                f"  PASS: exactly one candidate matched every joint at every pose; the "
+                f"before/after difference is under {BEFORE_AFTER_TOL} everywhere; the "
+                f"measured scale reproduces the derived table; PID reads back as the preset; "
+                f"and the checkpoint convention measures as {summary['checkpoint_convention_verdict']}, "
+                f"{summary['checkpoint_convention_agreement']}ing the offline verdict"
+            )
+        )
+    return ok
+
+
+def check_clamp_demo(index: str, args: argparse.Namespace) -> bool:
+    """Command an oversized per-step delta and prove the clamp clipped it."""
+    print(f"\n[{index}] clamp demonstration — COMMANDS MOTION on one joint ...")
+    try:
+        record = demo_clamp(args)
+    except Exception as exc:  # noqa: BLE001
+        print(_red(f"  FAIL: the demonstration raised {type(exc).__name__}: {exc}"))
+        return False
+
+    path = write_corpus_results(record)
+    print(f"       raw output  {path.relative_to(REPO_ROOT)}")
+    print(
+        f"       {record['joint']}: present={record['present']:.4f} "
+        f"requested={record['requested']:.4f} returned={record['returned']:.4f} "
+        f"settled={record['settled']:.4f}"
+    )
+    print(
+        f"       clamp={record['clamp']} returned_delta={record['returned_delta']:.4f} "
+        f"expected_clipped={record['expected_clipped']:.4f}"
+    )
+    print(f"       Dum-E loguru warning : {record['dume_loguru_warning']}")
+    print(f"       upstream bridged     : {record['upstream_bridged_warning']}")
+
+    ok = True
+    if not record["returned_differs_from_requested"]:
+        print(_red("  FAIL: the returned action equalled the requested action — the clamp did "
+                   "not engage, so it is not configured on the live path"))
+        ok = False
+    if not record["returned_delta_equals_clamp"]:
+        print(_red(f"  FAIL: the returned delta {record['returned_delta']:.4f} does not equal the "
+                   f"clamp {record['clamp']} within {record['divergence_threshold']}"))
+        ok = False
+    if not record["clamped_joints"]:
+        print(_red("  FAIL: diff_clamped_joints reported no clamped joint"))
+        ok = False
+    if not record["dume_loguru_warning"]:
+        print(_red("  FAIL: no clamp warning was captured on Dum-E's loguru stream — the clamp "
+                   "fired but is still not surfaced, which is the swallowed-warning failure "
+                   "SAFE-02 targets"))
+        ok = False
+    if not record["upstream_bridged_warning"]:
+        print("       NOTE: upstream's own root-logger warning did NOT arrive through the "
+              "bridge; Dum-E's own warning did, so the signal is not lost. Recorded either way.")
+    if ok:
+        print(
+            _green(
+                f"  PASS: a {record['multiple']}x-clamp delta on {record['joint']} was clipped to "
+                f"exactly the clamp on real hardware, and the warning reached Dum-E's own stream"
+            )
+        )
+    return ok
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -861,8 +1893,39 @@ def main() -> int:
         help="Run only the arm-free discriminators (no serial port is opened).",
     )
     parser.add_argument("--port", default=os.getenv("SO_ARM_PORT"))
-    parser.add_argument("--robot-id", default=DEFAULT_ROBOT_ID)
-    parser.add_argument("--robot-type", default=DEFAULT_ROBOT_TYPE)
+    # These four default to None so the Dum-E YAML config can supply them; see
+    # `resolve_live_controller_settings`. Their module-level fallbacks are only
+    # reached when neither a flag nor a config file names them.
+    parser.add_argument("--robot-id", default=None)
+    parser.add_argument("--robot-type", default=None)
+    parser.add_argument(
+        "--wrist-cam-idx",
+        type=int,
+        default=None,
+        help="OpenCV index of the wrist camera (else the config file, else 0).",
+    )
+    parser.add_argument(
+        "--front-cam-idx",
+        type=int,
+        default=None,
+        help="OpenCV index of the front camera (else the config file, else 1).",
+    )
+    parser.add_argument(
+        "--pose-sequence",
+        default=None,
+        help=(
+            "Comma-separated fixed poses for the LIVE sweep, e.g. 'initial,ready,remote'. "
+            "REQUIRES THE ARM and COMMANDS MOTION."
+        ),
+    )
+    parser.add_argument(
+        "--demo-clamp",
+        action="store_true",
+        help=(
+            "Command one deliberately oversized per-step joint delta and prove the "
+            "SAFE-02 clamp clipped it. REQUIRES THE ARM and COMMANDS MOTION."
+        ),
+    )
     parser.add_argument(
         "--statistics",
         default=None,
@@ -881,7 +1944,16 @@ def main() -> int:
     args = parser.parse_args()
 
     poses = [p.strip() for p in args.poses.split(",") if p.strip()]
-    total = 5 if args.skip_hardware else 6
+    sweep_poses = (
+        [p.strip() for p in args.pose_sequence.split(",") if p.strip()]
+        if args.pose_sequence
+        else []
+    )
+    # A live flag implies hardware; --skip-hardware wins outright so the offline
+    # gate can never be turned into a motion command by a stray flag.
+    if args.skip_hardware:
+        sweep_poses, args.demo_clamp = [], False
+    total = 5 + (0 if args.skip_hardware else 1) + bool(sweep_poses) + bool(args.demo_clamp)
 
     print("=" * 72)
     print(" Normalization-units probe (PAR-04 / PAR-06) — verdict: RANGE_M100_100")
@@ -895,14 +1967,25 @@ def main() -> int:
         f"4/{total}", poses
     )
     results["pinned_constants"] = check_pinned_constants(f"5/{total}", args)
+    next_index = 6
     if not args.skip_hardware:
-        results["hardware_raw_tick"] = check_hardware_raw_tick(f"6/{total}", args)
+        results["hardware_raw_tick"] = check_hardware_raw_tick(f"{next_index}/{total}", args)
+        next_index += 1
     else:
         print(
-            "\n[not run] raw-tick round-trip probe — deferred to plan 05-06 behind "
-            "the hardware-attach gate (--skip-hardware). The per-joint scale above "
-            "stays a HYPOTHESIS until that probe measures it."
+            "\n[not run] raw-tick round-trip probe, live pose sweep and clamp "
+            "demonstration — all three need the arm (--skip-hardware). The per-joint "
+            "scale above is a MEASUREMENT as of plan 05-06; see the '## Live "
+            "confirmation' section of docs/UNITS-VERDICT.md for the numbers."
         )
+    if sweep_poses:
+        results["live_pose_sweep"] = check_live_pose_sweep(
+            f"{next_index}/{total}", args, sweep_poses
+        )
+        next_index += 1
+    if args.demo_clamp:
+        results["clamp_demo"] = check_clamp_demo(f"{next_index}/{total}", args)
+        next_index += 1
 
     print("\n" + "=" * 72)
     passed = sum(1 for ok in results.values() if ok)

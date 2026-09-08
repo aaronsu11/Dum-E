@@ -226,6 +226,11 @@ def test_connect_asserts_calibration_before_reading_any_observation(
         raise AssertionError("connect() must not read an observation")
 
     stub = SimpleNamespace(
+        # The Goal_Position pre-arm runs ahead of `robot.connect()` so the
+        # torque-enable inside it becomes a hold rather than a slam. It is
+        # stubbed here only so `connect()` is callable; its own behaviour is
+        # covered in tests/test_controller_safety.py.
+        _prearm_goal_to_present=lambda: calls.append("prearm"),
         robot=SimpleNamespace(
             connect=lambda calibrate=True: calls.append("robot.connect"),
             get_observation=_fail_on_observation,
@@ -240,5 +245,6 @@ def test_connect_asserts_calibration_before_reading_any_observation(
     SO10xArmController.connect(stub, calibrate=False)
 
     assert "get_observation" not in calls
+    assert calls.index("prearm") < calls.index("robot.connect")
     assert calls.index("robot.connect") < calls.index("assert_calibration")
     assert calls.index("assert_calibration") < calls.index("pid_readback")

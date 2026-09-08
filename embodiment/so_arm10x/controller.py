@@ -422,6 +422,16 @@ DUME_PID: Dict[str, int] = {
 # lowers retries cannot silently disable this one.
 _PID_READ_MIN_RETRIES = 2
 
+# Same floor, same reason, for the connect-time `Goal_Position` pre-arm: a
+# dropped packet there would read as a failed pre-arm and refuse the connect.
+_PREARM_READ_MIN_RETRIES = 2
+
+# Tick slack when confirming the pre-arm took. The Feetech position register can
+# report a neighbouring tick between two reads of a stationary joint, so an exact
+# equality check would fail on healthy hardware; anything larger than this is a
+# write that genuinely did not land.
+_PREARM_TICK_TOLERANCE = 1
+
 
 # The six motor names on an SO-10x follower. `send_action` strips the `.pos`
 # suffix before clamping, so a per-motor clamp mapping is keyed on these.
@@ -824,6 +834,10 @@ class SO10xArmController(IRobotController):
         return list(self._state_keys)
 
     def connect(self, calibrate: bool = True) -> None:
+        # Pre-arm Goal_Position FIRST, while torque is still off. `robot.connect()`
+        # below re-enables torque, and a stale `Goal_Position` of 0 would become a
+        # commanded slam at that instant, so this cannot be reordered after it.
+        self._prearm_goal_to_present()
         self.robot.connect(calibrate=calibrate)
         # Assert the calibration FILE loaded before anything reads an observation.
         # `connect()` succeeding is not evidence: the calibrated flag reads the
@@ -835,6 +849,98 @@ class SO10xArmController(IRobotController):
         # `configure()` during the connect above. What remains is proving it
         # landed (D-02) — and refusing to operate the arm if it did not (D-01).
         self._assert_pid_landed()
+
+    def _prearm_goal_to_present(self) -> Dict[str, Any]:
+        """Write ``Goal_Position <- Present_Position`` while torque is still OFF.
+
+        A SAFETY PRECONDITION FOR CONNECTING. Upstream's ``configure()`` runs
+        inside ``bus.torque_disabled()``, whose ``finally`` calls
+        ``enable_torque()``, and ``enable_torque()`` writes ``Torque_Enable`` and
+        ``Lock`` only — it does NOT synchronise ``Goal_Position`` to the present
+        position. Measured on this arm with torque off after a power cycle, every
+        motor's ``Goal_Position`` register reads **0**, so connecting without
+        pre-arming commands all six joints to raw tick 0 the instant torque comes
+        back: a jump of up to ~3090 ticks on ``elbow_flex``.
+
+        Pre-arming with torque disabled cannot itself move the arm — it makes the
+        subsequent torque-enable a *hold* rather than a *move*. The dangerous path
+        is never exercised, so this does not prove the slam would happen; it
+        prevents it.
+
+        Reads and writes raw ticks (``normalize=False``): the calibration mapping
+        is not necessarily loaded this early, and ticks are what the comparison
+        needs. Every access carries a retry count so one dropped Feetech packet
+        surfaces as a retry rather than as a phantom mismatch that would refuse to
+        connect a healthy arm.
+
+        Returns a record of what was found and written. Skips — and says so —
+        when torque is already enabled, because there ``Goal_Position`` is live
+        and overwriting it would be the very command this exists to avoid.
+
+        Raises:
+            RuntimeError: the pre-arm write did not read back, so enabling torque
+                would still command a jump. Fails closed rather than connecting.
+        """
+        bus = self.robot.bus
+        num_retry = max(
+            _PREARM_READ_MIN_RETRIES,
+            int(getattr(self.config, "num_read_retries", 0) or 0),
+        )
+        bus.connect()
+        try:
+            torque = bus.sync_read("Torque_Enable", normalize=False, num_retry=num_retry)
+            present = bus.sync_read("Present_Position", normalize=False, num_retry=num_retry)
+            goal_before = bus.sync_read("Goal_Position", normalize=False, num_retry=num_retry)
+            record: Dict[str, Any] = {
+                "torque_enable_before": dict(torque),
+                "present_ticks": dict(present),
+                "goal_ticks_before": dict(goal_before),
+                "worst_pending_jump_ticks": max(
+                    (abs(goal_before[m] - present[m]) for m in present), default=0
+                ),
+            }
+            if any(value for value in torque.values()):
+                record.update(
+                    prearmed=False,
+                    reason="torque already enabled — Goal_Position is live",
+                )
+                logger.info(
+                    "Goal_Position pre-arm skipped: torque already enabled, goal is live"
+                )
+                return record
+
+            for motor, tick in present.items():
+                bus.write(
+                    "Goal_Position", motor, int(tick), normalize=False, num_retry=num_retry
+                )
+            goal_after = bus.sync_read("Goal_Position", normalize=False, num_retry=num_retry)
+            mismatched = {
+                motor: (present[motor], goal_after[motor])
+                for motor in present
+                if abs(goal_after[motor] - present[motor]) > _PREARM_TICK_TOLERANCE
+            }
+            if mismatched:
+                raise RuntimeError(
+                    "Goal_Position pre-arm did not take, so enabling torque would "
+                    f"command a jump. Refusing to connect. present vs goal: {mismatched}"
+                )
+            record.update(
+                prearmed=True,
+                reason="written and verified",
+                goal_ticks_after=dict(goal_after),
+            )
+            logger.info(
+                "Goal_Position pre-armed to present position on {} motors "
+                "(neutralised a worst-case {} tick jump at torque-enable)",
+                len(present),
+                record["worst_pending_jump_ticks"],
+            )
+            return record
+        finally:
+            # disable_torque=False: leave the torque state EXACTLY as found. The
+            # default (True) would make this guard mutate the state it exists to
+            # reason about, and would drop torque under load on a powered arm.
+            bus.disconnect(False)
 
     def _assert_calibration_loaded(self) -> Tuple[Path, str]:
         """Confirm the calibration file loaded, logging its path and checksum.

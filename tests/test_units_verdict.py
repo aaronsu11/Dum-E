@@ -1,4 +1,4 @@
-"""Hermetic normalization-units gate for PAR-04 / PAR-06 (roadmap criteria 2, 2a).
+"""Hermetic normalization-units gate for the joint-value convention.
 
 Settles, offline and mechanically, which ``MotorNormMode`` the GR00T checkpoint
 was trained in. The verdict is ``RANGE_M100_100`` (equivalently
@@ -7,8 +7,8 @@ plus-or-minus 100.0 clip fingerprint, the ``elbow_flex`` degrees falsification,
 and the ``wrist_roll`` dataset cross-check. See ``docs/UNITS-VERDICT.md`` for
 the resolution these tests defend.
 
-**PAR-04's designated mechanism is proven non-discriminating here, not reused.**
-PAR-04 specifies "assert the observed ready-pose state falls inside the
+**The originally designated mechanism is proven non-discriminating here, not
+reused.** It specified "assert the observed ready-pose state falls inside the
 checkpoint's ``state`` q01/q99 envelope". That assertion returns PASS under BOTH
 candidate conventions on all five arm joints, so it decides nothing.
 ``test_ready_pose_envelope_passes_under_both_conventions_and_is_not_a_discriminator``
@@ -195,13 +195,13 @@ def test_wrist_roll_percent_conversion_lands_inside_dataset_band():
         assert pose[index] == -90.0
 
 
-# --- PAR-04's own mechanism: proven non-discriminating, not reused -----------
+# --- the originally designated mechanism: non-discriminating, not reused -----
 
 
 def test_ready_pose_envelope_passes_under_both_conventions_and_is_not_a_discriminator():
     """The ready pose is inside the envelope under BOTH conventions, on all five joints.
 
-    This test exists to record a NEGATIVE. PAR-04's literal assertion returns
+    This test exists to record a NEGATIVE. The ready-pose envelope assertion returns
     PASS regardless of which convention is true, so it can never be cited as
     the units verdict's evidence. Documenting the silent-pass hazard is the
     point; if this test ever starts failing, the envelope or the poses moved and
@@ -214,11 +214,11 @@ def test_ready_pose_envelope_passes_under_both_conventions_and_is_not_a_discrimi
     inside_as_percent = envelope_contains(as_percent)
 
     assert inside_as_degrees == [True] * 5, (
-        f"ready pose read as degrees: {inside_as_degrees} — PAR-04's assertion "
+        f"ready pose read as degrees: {inside_as_degrees} — the envelope assertion "
         f"is expected to PASS here"
     )
     assert inside_as_percent == [True] * 5, (
-        f"ready pose read as percent: {inside_as_percent} — PAR-04's assertion "
+        f"ready pose read as percent: {inside_as_percent} — the envelope assertion "
         f"is expected to PASS here too, which is exactly the problem"
     )
     assert inside_as_degrees == inside_as_percent, (
@@ -641,7 +641,7 @@ def test_measured_deg_per_pct_recovers_the_derived_table_from_one_tick():
 
 
 def test_envelope_row_discriminates_at_initial_and_does_not_at_ready():
-    """The row-level restatement of PAR-04's silent-pass hazard.
+    """The row-level restatement of the ready-pose silent-pass hazard.
 
     ``initial``'s ``shoulder_lift`` is the one joint whose envelope membership
     differs between the conventions; every ``ready`` joint reads the same under

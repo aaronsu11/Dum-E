@@ -241,7 +241,7 @@ class TestSpawnPipecatServer:
     @mock.patch("subprocess.Popen")
     def test_spawn_pipecat_server_shell_env_overrides_config(self, mock_popen):
         """UAT gap (test 2): an inherited DUME_VOICE_* shell env var must win over
-        the my-dum-e.yaml config default. The README D-06 smoke-test gate tells
+        the my-dum-e.yaml config default. The README smoke-test gate tells
         operators to run `DUME_VOICE_LANGUAGE=zh python dum_e.py ...`; the launcher
         previously overwrote that with the yaml default ('en'), so the zh preset was
         never selected. Env-wins precedence is required for all three voice vars."""
@@ -530,7 +530,7 @@ class TestSpawnAgentWorker:
 
     @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_forwards_policy_backend_from_config(self, mock_popen):
-        """BACK-02: controller.policy_backend is forwarded as DUME_POLICY_BACKEND.
+        """controller.policy_backend is forwarded as DUME_POLICY_BACKEND.
 
         The agent worker is the process that reaches
         policy.factory.make_policy_backend(), so the YAML selection has to arrive
@@ -556,7 +556,7 @@ class TestSpawnAgentWorker:
 
         The example config selects the backend that works today, so the launcher
         default matches it rather than leaving the worker to hit the code-level
-        'lerobot' default (which raises until Phase 6).
+        'lerobot' default (which raises, being unimplemented).
         """
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
@@ -602,7 +602,7 @@ class TestSpawnAgentWorker:
 
     @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_forwards_use_degrees_from_config(self, mock_popen):
-        """LR-03/D-03: controller.use_degrees is forwarded as DUME_USE_DEGREES.
+        """controller.use_degrees is forwarded as DUME_USE_DEGREES.
 
         The joint-value convention was a constructor default before this, so it
         could only be changed by editing code — and lerobot 0.6.x independently
@@ -639,7 +639,7 @@ class TestSpawnAgentWorker:
     ):
         """A YAML `false` spelling must become a real False, not a truthy string.
 
-        This is the operative edge for LR-03. Env vars are always strings, and
+        This is the operative edge for the units convention. Env vars are always strings, and
         every non-empty string is truthy in Python — so `if os.getenv(...)` would
         read "false" as True and silently select the degrees convention. The
         launcher forwards a recognised spelling and the controller coerces it
@@ -676,7 +676,7 @@ class TestSpawnAgentWorker:
     def test_spawn_agent_worker_forwards_max_relative_target_from_config(
         self, mock_popen
     ):
-        """SAFE-02: controller.max_relative_target is forwarded as a float string.
+        """controller.max_relative_target is forwarded as a float string.
 
         The clamp must reach the config as a float — an int raises TypeError
         inside the clamp helper at the exact moment the clamp would have engaged —

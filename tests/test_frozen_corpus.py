@@ -1,4 +1,4 @@
-"""Keyless tests for the frozen v1.0 corpus capture + verification harness (LR-05).
+"""Keyless tests for the frozen v1.0 corpus capture + verification harness.
 
 Every test here is CI-runnable with NO policy server, NO GPU, NO network and NO
 SO101 hardware. The corpus fixtures are SYNTHETIC — correct shapes, fabricated
@@ -15,7 +15,7 @@ Surfaces covered:
   ``Gr00tRobotInferenceClient``'s live assembly, including the pinned
   ``annotation.human.task_description`` language key. This is the guard against
   the capture path and the live path silently drifting apart.
-- The D-07 seed verdict classification, including the different-seed control that
+- The seed-reproducibility verdict classification, including the different-seed control that
   stops a deterministic-but-seed-ignoring server reading as ``honored``.
 - The capture script imports no ``lerobot`` module (it must survive the 0.6.1
   bump that removes its readers).
@@ -171,7 +171,7 @@ def test_verifier_rejects_record_with_wrong_shapes(synthetic_corpus: Path):
 
 
 def test_verifier_rejects_missing_seed_verdict(synthetic_corpus: Path):
-    """A corpus with no D-07 verdict (or a bogus literal) fails."""
+    """A corpus with no seed verdict (or a bogus literal) fails."""
     manifest = _load_manifest(synthetic_corpus)
     manifest["seed_verdict"] = "probably-fine"
     _save_manifest(synthetic_corpus, manifest)
@@ -290,7 +290,7 @@ def test_assemble_observation_raises_without_instruction():
         capture.assemble_observation(_flat_observation(), "")
 
 
-# --- D-07 verdict classification (no server) ---------------------------------
+# --- seed-reproducibility verdict classification (no server) -----------------
 
 
 class _StubClient:
@@ -333,8 +333,8 @@ class _StubClient:
 def test_seed_verdict_requires_different_seed_control(mode, expected):
     """A deterministic server that IGNORES the seed must not read as ``honored``.
 
-    That false positive is what would send Phase 7 down the wrong comparison path,
-    so it is the single most important property of the D-07 check.
+    That false positive is what would send the parity gate down the wrong
+    comparison path, so it is the single most important property of the check.
     """
     verdict, evidence = capture.validate_seed_reproducibility(
         _StubClient(mode), observation={}, seed=42

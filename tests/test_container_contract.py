@@ -11,7 +11,7 @@ Surfaces covered:
 - Wire contract: the :5555 ``MsgSerializer`` contract is preserved across a real
   socket (get_action 2-tuple with single_arm (1,16,5) / gripper (1,16,1) float32;
   ping non-error; {"error": ...} reply -> RuntimeError).
-- Dependency isolation (SAFE-04): the client's declared ``lerobot`` extras stay
+- Dependency isolation: the client's declared ``lerobot`` extras stay
   within an allowlist with ``feetech`` required, the pin stays exact, no
   server-only GPU or model package is a DIRECT dependency, the resolved closure
   from ``uv.lock`` carries no server-only package, and ``requires-python`` stays
@@ -24,10 +24,10 @@ Recorded as a decision so a later reader does not read the absent workflow as an
 oversight. The reasoning: this is one developer on one machine with the arm
 attached to it, so CI's value (which scales with contributors and machines) is
 small here; the guard runs in the suite before every commit; the word "CI" in
-SAFE-04's text names this contract-test file rather than a hosted service; and
-the realistic GPU-dependency leak arrives with the ``lerobot[groot]`` extra,
-where a local ``pytest`` run catches it. SAFE-04 is therefore satisfied at the
-pytest level.
+the requirement's own text names this contract-test file rather than a hosted
+service; and the realistic GPU-dependency leak arrives with the
+``lerobot[groot]`` extra, where a local ``pytest`` run catches it. The
+requirement is therefore satisfied at the pytest level.
 
 What this guard deliberately does NOT assert: that ``torch`` or the nvidia CUDA
 wheels are absent from the RESOLVED environment. ``torch`` is an unconditional
@@ -203,12 +203,12 @@ def test_real_socket_error_reply_raises_runtimeerror():
         thread.join(timeout=2.0)
 
 
-# --- Dependency isolation guard (SAFE-04) -----------------------------------
+# --- Dependency isolation guard ---------------------------------------------
 
 # An ALLOWLIST, not a denylist: an extra that is not named here fails by
-# default, so a new heavyweight extra cannot slip in unnoticed. Phase 8 widens
-# this set to include lerobot's async extra — that widening must be a deliberate
-# edit here, not a surprise failure.
+# default, so a new heavyweight extra cannot slip in unnoticed. A later phase
+# widens this set to include lerobot's async extra — that widening must be a
+# deliberate edit here, not a surprise failure.
 LEROBOT_EXTRAS_ALLOWLIST = frozenset({"feetech"})
 
 # Server-only GPU and model packages that must never be DIRECT client
@@ -239,7 +239,7 @@ NVIDIA_CUDA_PREFIX = "nvidia-cuda"
 # for a permanently red assertion is to gut the whole guard. Do not add them
 # here to make the guard look stricter.
 #
-# diffusers was ADDED HERE, in plan 05-04, by the same commit that bumps lerobot
+# diffusers was ADDED HERE by the same commit that bumps lerobot
 # from 0.3.3 to 0.6.1 — because that bump is what makes the assertion satisfiable.
 # diffusers 0.38.0 was a member of the resolved closure under the incumbent 0.3.3
 # pin and is not a base dependency of 0.6.1 (it lives only in the groot extra), so
@@ -407,8 +407,8 @@ def test_client_lerobot_extras_within_allowlist():
 def test_client_lerobot_pin_is_exact():
     """The lerobot requirement uses an exact == pin with a concrete version.
 
-    Wire payloads are version-coupled from Phase 6 onward, so an exact pin is the
-    precondition for the Phase 6 lockstep test.
+    Wire payloads are version-coupled once the LeRobot policy backend is wired,
+    so an exact pin is the precondition for the client/server lockstep test.
     """
     _extras, spec = parse_lerobot_requirement(client_dependencies())
     assert spec.startswith("=="), f"lerobot pin must be exact, got {spec!r}"
@@ -550,7 +550,7 @@ def test_guard_detects_forbidden_package_in_resolved_lock():
     assert "torchvision" not in FORBIDDEN_RESOLVED_PACKAGES
     assert not any(p.startswith("nvidia-") for p in FORBIDDEN_RESOLVED_PACKAGES)
 
-    # diffusers IS in the set as of plan 05-04, added by the same commit that
+    # diffusers IS in the set, added by the same commit that
     # bumped lerobot to 0.6.1 and thereby made the assertion satisfiable. Before
     # that commit this entry was red; that is the point of it.
     assert "diffusers" in FORBIDDEN_RESOLVED_PACKAGES

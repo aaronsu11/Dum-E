@@ -1,10 +1,10 @@
-"""Calibration-file assertion at connect (D-05, plan 05-04 Task 2).
+"""Calibration-file assertion at connect.
 
 lerobot 0.6.1 consolidated ``so101_follower`` into ``so_follower``, and
 ``Robot.__init__`` derives its calibration directory from the robot class's own
 ``name``. The rename therefore moves the lookup from
-``<root>/robots/so101_follower/`` to ``<root>/robots/so_follower/``. CONTEXT.md
-D-05 locked *copying* the calibration file to the new path (pinning
+``<root>/robots/so101_follower/`` to ``<root>/robots/so_follower/``. The locked
+resolution *copies* the calibration file to the new path (pinning
 ``config.calibration_dir`` was offered and declined), and accepted the resulting
 two-copies-can-drift tradeoff on the condition that ``connect()`` logs the loaded
 path plus a content checksum so a wrong or missing file is visible.

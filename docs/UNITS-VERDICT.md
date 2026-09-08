@@ -210,7 +210,8 @@ and old stats, remove the deprecated aggregate stats file, update the codebase v
 transform of any kind — not for dataset files, and not for live robot readings.** The
 designated derivation therefore has nothing to derive from, and this resolution uses the
 **documented empirical fallback** instead: the three arguments in §2, executed entirely
-offline. That escalation is explicitly authorized by the phase's own decision record (D-11).
+offline. PAR-06 itself authorizes that escalation when its primary method turns out to have no
+content, so this is the documented fallback rather than a substitution.
 
 ---
 

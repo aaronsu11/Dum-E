@@ -1,6 +1,6 @@
-"""Hermetic gate for the live pick-baseline runner (LR-06 / BACK-06).
+"""Hermetic gate for the live pick-baseline runner.
 
-The runner in ``scripts/run_pick_baseline.py`` produces the number Phase 7's
+The runner in ``scripts/run_pick_baseline.py`` produces the number the checkpoint
 parity gate is measured against, so the parts of it that decide *what the record
 says* are tested here rather than discovered during a ten-attempt live run. Three
 properties get the most attention, because each one, if broken, would silently
@@ -12,9 +12,10 @@ corrupt the baseline instead of failing loudly:
 2. **The success judgment cannot be machine-supplied.** No default answer, no
    bulk answer, no flag that supplies one, and a closed stdin raises instead of
    assuming. A fabricated success is worse than a missing baseline.
-3. **A motion-free preflight cannot masquerade as a scored run.** Preflight
-   evidence is written under a different directory prefix *and* a different
-   filename, so the newest-``run.json`` selection the standing record uses can
+3. **Nothing but a completed scored series can masquerade as one.** Preflight and
+   voided/aborted evidence are each written under a different directory prefix
+   *and* a different filename, and a scored record with no attempts is refused
+   outright — so the newest-``run.json`` selection the standing record uses can
    never pick up a run with zero scored attempts.
 
 Every test is hermetic: no serial port, no camera, no policy server, no Docker.
@@ -466,7 +467,8 @@ def test_run_payload_carries_the_keys_the_record_verifier_reads():
 
 
 def test_run_payload_states_the_smoke_check_caveat_in_as_many_words():
-    """D-10's load-bearing consequence must travel with the number itself."""
+    """The scene-variation caveat's load-bearing consequence must travel with the
+    number itself."""
     payload = runner.build_run_payload(
         _args(),
         mode="scored",

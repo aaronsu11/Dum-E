@@ -1,19 +1,19 @@
 """Controller safety instruments: the PID read-back and the motion clamp.
 
-Plan 05-05 makes three things explicit that Phase 5 otherwise leaves at their
-defaults. This module covers the two that are safety instruments:
+Three settings that would otherwise sit at their upstream defaults are made
+explicit. This module covers the two that are safety instruments:
 
-* **The PID preset (LR-04 / D-01 / D-02).** At lerobot 0.6.1 the three
+* **The PID preset.** At lerobot 0.6.1 the three
   coefficients are *config fields*, and upstream ``SOFollower.configure()`` —
   which ``connect()`` already calls — writes them on the first pass. So the
   preset becomes declarative and Dum-E's job shrinks to *evidence*: read the
   coefficients back from every motor and refuse to connect on a mismatch or on a
-  read failure. A clean write is not evidence the value landed (D-02), and
-  operating the arm at unknown stiffness would surface in Phase 7 looking like
-  checkpoint drift rather than the configuration error it is (D-01).
-* **The motion clamp (SAFE-02).** ``max_relative_target`` plumbing already
-  exists upstream and in Dum-E; SAFE-02 is "set a real value and surface the
-  warning", not "build the clamp". Two traps make that non-trivial. An ``int``
+  read failure. A clean write is not evidence the value landed, and operating the
+  arm at unknown stiffness would surface in a later parity comparison looking
+  like checkpoint drift rather than the configuration error it is.
+* **The motion clamp.** ``max_relative_target`` plumbing already exists upstream
+  and in Dum-E; the remaining job is "set a real value and surface the warning",
+  not "build the clamp". Two traps make that non-trivial. An ``int``
   clamp does **not** fail on ordinary actions — it raises ``TypeError`` inside
   ``ensure_safe_goal_position`` at the exact moment the clamp would have engaged.
   And upstream's warning goes to the stdlib **root** logger (hence stderr via
@@ -171,7 +171,7 @@ def clamp_controller(robot: StubRobot) -> SO10xArmController:
 def capture_loguru(level: str = "WARNING") -> Iterator[List[str]]:
     """Collect loguru MESSAGES through a real sink, not by inspecting source text.
 
-    Capturing the sink is the whole point: SAFE-02's claim is that the clamp is
+    Capturing the sink is the whole point: the claim under test is that the clamp is
     *surfaced on Dum-E's own stream*, and only a sink proves that. Grepping the
     source would pass even if the message never reached loguru.
 
@@ -205,7 +205,7 @@ def stdlib_bridge_installed() -> Iterator[None]:
 
 
 # ---------------------------------------------------------------------------
-# The motion clamp: a real float, on by default, and surfaced (SAFE-02)
+# The motion clamp: a real float, on by default, and surfaced
 # ---------------------------------------------------------------------------
 
 
@@ -215,7 +215,7 @@ def test_default_clamp_is_a_float_not_an_int():
     Three separate failure modes are excluded here. ``None`` disables the clamp
     entirely, which is what Dum-E shipped with. An ``int`` is the worse trap (see
     the next test). And a value *below* the checkpoint's own trained relative
-    motion would fire on nominal operation, which Phase 7 requires to be
+    motion would fire on nominal operation, which the parity gate requires to be
     warning-free and would read as a parity bug rather than as a mis-set clamp.
     """
     clamp = ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
@@ -414,7 +414,7 @@ def test_clamp_resolves_from_environment_and_is_on_by_default(monkeypatch):
     """``None`` means "resolve", not "disable" — the clamp is on by default.
 
     The production call site passes neither the clamp nor the units parameter, so
-    an unset default that meant "off" would leave SAFE-02 unsatisfied in exactly
+    an unset default that meant "off" would leave the clamp disabled in exactly
     the configuration that ships. Disabling is therefore explicit and spelled out
     in the environment.
     """
@@ -442,7 +442,7 @@ def test_stdlib_root_warning_is_bridged_to_loguru():
     stderr ``StreamHandler`` — while Dum-E's loguru sink writes to stdout. Two
     disjoint streams, and the repo had no bridge at all, so upstream's own clamp
     warning was emitted and architecturally invisible. Setting the clamp without
-    this bridge does not satisfy SAFE-02.
+    this bridge does not surface it.
     """
     root = logging.getLogger()
 
@@ -510,7 +510,7 @@ def test_skill_loop_consumes_set_target_state_return_value(monkeypatch):
     """The pick loop uses the returned action instead of discarding it.
 
     ``set_target_state``'s return IS the clamp signal; a caller that throws it
-    away reduces SAFE-02 to a log line nobody correlates with a task. The
+    away reduces the clamp signal to a log line nobody correlates with a task. The
     assertion is behavioural rather than source-level: with a controller that
     reports a clipped action, the loop must surface it.
     """
@@ -547,7 +547,7 @@ def test_skill_loop_consumes_set_target_state_return_value(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# PID: declarative, then read back and asserted (LR-04 / D-01 / D-02)
+# PID: declarative, then read back and asserted
 # ---------------------------------------------------------------------------
 
 
@@ -587,8 +587,7 @@ def test_pid_config_fields_carry_dume_preset(monkeypatch):
 def test_pid_readback_returns_and_logs_the_per_motor_mapping():
     """On success the read-back returns every motor's three coefficients.
 
-    D-02 asks for the observed values to be logged as evidence a later phase can
-    cite — "the stiffness the arm actually ran at", not "the value that was
+    The observed values are logged as evidence a later phase can cite — "the stiffness the arm actually ran at", not "the value that was
     requested". Returning the mapping is what makes that citable.
     """
     bus = StubBus()
@@ -643,10 +642,11 @@ def test_pid_readback_aggregates_every_mismatch_into_one_error():
 def test_pid_readback_raises_and_chains_on_read_failure():
     """A read that raises re-raises with the cause attached — never swallowed.
 
-    This replaces the bare ``except Exception: pass`` recorded as existing debt
-    in ``.planning/codebase/CONCERNS.md``. CONTEXT.md D-01 forbids softening it
-    to a warning even to get past a bus problem, so the assertion is on both the
-    raise and the chained cause: an error that loses its cause is nearly as hard
+    This replaces a bare ``except Exception: pass`` around the former
+    torque-disabled stiffness write loop, which made a failed write
+    indistinguishable from a successful one. Do NOT soften it to a warning even to
+    get past a bus problem, so the assertion is on both the raise and the chained
+    cause: an error that loses its cause is nearly as hard
     to diagnose as one that never fired.
     """
     original = OSError("simulated Feetech bus timeout")
@@ -666,7 +666,7 @@ def test_pid_readback_uses_unnormalized_reads_with_retry():
     the calibration mapping, which is defined for position registers and
     meaningless for coefficient registers. ``num_retry=0`` (also upstream's
     default) turns a single dropped packet on the Feetech bus into a value
-    mismatch, which under D-01 refuses to connect a perfectly healthy arm.
+    mismatch, which refuses to connect a perfectly healthy arm.
     """
     bus = StubBus()
     SO10xArmController._assert_pid_landed(pid_controller(bus))
@@ -713,9 +713,10 @@ def test_connect_asserts_pid_landed_after_the_calibration_assertion():
 # present position. So a bare `connect()` commands all six joints to raw tick 0
 # the instant torque returns: a slam of up to ~3090 ticks on `elbow_flex`.
 #
-# 05-06 guarded its own probe and left production `connect()` exposed. These
-# tests move the guard into production, where every caller gets it -- including
-# plan 05-07's live re-baseline, which drives this exact path.
+# The pre-arm was first discovered and guarded inside the units probe, which left
+# production `connect()` exposed. These tests pin the guard in production, where
+# every caller gets it -- including the live re-baseline, which drives this exact
+# path.
 #
 # Pre-arming with torque disabled cannot itself move the arm; it converts the
 # torque-enable from a move into a hold. These tests therefore prove the guard
@@ -832,7 +833,7 @@ def test_prearm_skips_when_torque_is_already_enabled():
 def test_prearm_raises_when_the_write_did_not_take():
     """A write that silently fails must refuse the connect, not proceed hopefully.
 
-    This is the D-02 lesson applied to the pre-arm: a clean write call is not
+    This is the PID read-back lesson applied to the pre-arm: a clean write call is not
     evidence the register changed, so the guard reads back and fails closed.
     """
     bus = PrearmStubBus(

@@ -998,69 +998,21 @@ def resolve_live_controller_settings(args: argparse.Namespace) -> dict:
     }
 
 
-def prearm_goal_to_present(bus) -> dict:
-    """Write ``Goal_Position <- Present_Position`` while torque is still OFF.
-
-    THIS IS A SAFETY PRECONDITION FOR CONNECTING, discovered by reading the live
-    registers before touching anything (plan 05-06). Upstream's ``configure()``
-    runs inside ``bus.torque_disabled()``, whose exit calls ``enable_torque()``,
-    and ``enable_torque()`` writes ``Torque_Enable`` and ``Lock`` only — it does
-    NOT synchronise ``Goal_Position`` to the present position
-    (``feetech.py`` :302-305). On this arm, with torque off after a power cycle,
-    every motor's ``Goal_Position`` register reads **0**: connecting without
-    pre-arming would therefore command all six joints to raw tick 0 the instant
-    torque came back, a slam of up to 3090 ticks on ``elbow_flex``.
-
-    Pre-arming with torque disabled cannot itself move the arm, and it makes the
-    torque-enable a hold rather than a move. The dangerous path is never
-    exercised, so this function does not prove the slam would happen — it
-    prevents it.
-
-    Returns a record of what was found and written. Skips (and says so) when
-    torque is already enabled, where ``Goal_Position`` is live and overwriting it
-    would be the very command this exists to avoid.
-    """
-    bus.connect()
-    try:
-        torque = bus.sync_read("Torque_Enable", normalize=False, num_retry=LIVE_READ_RETRIES)
-        present = bus.sync_read("Present_Position", normalize=False, num_retry=LIVE_READ_RETRIES)
-        goal_before = bus.sync_read("Goal_Position", normalize=False, num_retry=LIVE_READ_RETRIES)
-        record = {
-            "torque_enable_before": dict(torque),
-            "present_ticks": dict(present),
-            "goal_ticks_before": dict(goal_before),
-            "worst_pending_jump_ticks": max(
-                (abs(goal_before[m] - present[m]) for m in present), default=0
-            ),
-        }
-        if any(value for value in torque.values()):
-            record.update(prearmed=False, reason="torque already enabled — Goal_Position is live")
-            return record
-        for motor, tick in present.items():
-            bus.write("Goal_Position", motor, int(tick), normalize=False, num_retry=LIVE_READ_RETRIES)
-        goal_after = bus.sync_read("Goal_Position", normalize=False, num_retry=LIVE_READ_RETRIES)
-        mismatched = {
-            motor: (present[motor], goal_after[motor])
-            for motor in present
-            if abs(goal_after[motor] - present[motor]) > 1
-        }
-        if mismatched:
-            raise RuntimeError(
-                "Goal_Position pre-arm did not take, so enabling torque would "
-                f"command a jump. Refusing to connect. present vs goal: {mismatched}"
-            )
-        record.update(prearmed=True, reason="written and verified", goal_ticks_after=dict(goal_after))
-        return record
-    finally:
-        # disable_torque=False: leave the torque state EXACTLY as found.
-        bus.disconnect(False)
-
-
 def open_controller(args: argparse.Namespace, *, use_degrees=None):
-    """Construct, pre-arm and connect the controller. Returns ``(controller, info)``.
+    """Construct and connect the controller. Returns ``(controller, info)``.
 
-    ``connect()`` performs the calibration-file assertion and the PID read-back,
-    so ``info`` carries both as the live evidence LR-04 and D-05 ask for.
+    ``connect()`` owns the whole connect-time safety sequence: it writes
+    ``Goal_Position <- Present_Position`` while torque is still OFF (so the
+    torque-enable upstream's ``configure()`` performs on exit becomes a *hold*
+    rather than a slam toward raw tick 0), then asserts the calibration file and
+    reads the PID preset back. ``info`` carries all three as live evidence.
+
+    This function deliberately does NOT pre-arm the bus itself. It used to carry a
+    near-verbatim copy of the controller's ``_prearm_goal_to_present()`` and run
+    both, which meant the pre-arm ran twice per connect and a tuned tolerance or
+    skip condition would only change one of the two copies. The controller is the
+    single owner; ``connect()`` records what it found on
+    ``controller.last_prearm_record``, which is what this reports.
     """
     _repo_on_path()
     from embodiment.so_arm10x.controller import SO10xArmController
@@ -1082,14 +1034,13 @@ def open_controller(args: argparse.Namespace, *, use_degrees=None):
         kwargs["use_degrees"] = use_degrees
     controller = SO10xArmController(**kwargs)
 
-    prearm = prearm_goal_to_present(controller.robot.bus)
     controller.connect()
 
     calibration_path, calibration_sha256 = controller._assert_calibration_loaded()
     pid_readback = controller._assert_pid_landed()
     info = {
         "settings": settings,
-        "prearm": prearm,
+        "prearm": controller.last_prearm_record,
         "calibration_path": str(calibration_path),
         "calibration_path_redacted": _redact_home(calibration_path),
         "calibration_sha256": calibration_sha256,
@@ -1646,7 +1597,7 @@ def check_hardware_raw_tick(index: str, args: argparse.Namespace) -> bool:
     Reports whichever normalization mode the constructed controller is ACTUALLY
     running — it does not presuppose one, which is the whole point of the probe.
     Commands no motion: the connect pre-arms the goal registers so the
-    torque-enable is a hold (see :func:`prearm_goal_to_present`).
+    torque-enable is a hold (see ``SO10xArmController._prearm_goal_to_present``).
     """
     print(f"\n[{index}] raw-tick round-trip probe — REQUIRES THE ARM (read-only) ...")
     try:

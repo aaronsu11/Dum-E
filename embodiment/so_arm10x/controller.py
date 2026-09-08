@@ -746,6 +746,11 @@ class SO10xArmController(IRobotController):
         # Store robot_id for the id property
         self._robot_id = robot_id
 
+        # What the connect-time `Goal_Position` pre-arm found and wrote, so a
+        # caller can report it instead of re-implementing the pre-arm. `None`
+        # until `connect()` runs.
+        self.last_prearm_record: Optional[Dict[str, Any]] = None
+
         cameras = {
             "wrist": OpenCVCameraConfig(
                 index_or_path=wrist_cam_idx, fps=30, width=640, height=480
@@ -837,7 +842,12 @@ class SO10xArmController(IRobotController):
         # Pre-arm Goal_Position FIRST, while torque is still off. `robot.connect()`
         # below re-enables torque, and a stale `Goal_Position` of 0 would become a
         # commanded slam at that instant, so this cannot be reordered after it.
-        self._prearm_goal_to_present()
+        # Retained on the instance so a caller can report what the pre-arm found
+        # (the worst pending jump it neutralised, or why it skipped) without
+        # re-implementing it. `scripts/pose_sweep_units_probe.py` used to carry a
+        # near-verbatim second copy for exactly that reason, which meant a tuned
+        # tolerance or skip condition would only change one of them.
+        self.last_prearm_record = self._prearm_goal_to_present()
         self.robot.connect(calibrate=calibrate)
         # Assert the calibration FILE loaded before anything reads an observation.
         # `connect()` succeeding is not evidence: the calibrated flag reads the

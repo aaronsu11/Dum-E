@@ -202,9 +202,16 @@ CHECKPOINT_ACTION_STATS = {
 }
 
 # Provenance: the LeRobot follower calibration JSON under the
-# HF_LEROBOT_CALIBRATION root (robots/<robot_type>/<robot_id>.json). Raw encoder
-# ticks. Every motor has drive_mode 0, which is why both candidate normalization
-# modes share the same midpoint and the delta carries no sign flip.
+# HF_LEROBOT_CALIBRATION root — `robots/<robot class name>/<robot_id>.json`, i.e.
+# the file `resolve_calibration_path()` derives, as it stood when this verdict was
+# reasoned from it. Raw encoder ticks. Every motor has drive_mode 0, which is why
+# both candidate normalization modes share the same midpoint and the delta carries
+# no sign flip.
+#
+# These are a SNAPSHOT, not a live read. `check_pinned_constants_against_local_
+# artifacts()` compares them against the file on disk and FAILS on any difference,
+# because a recalibration invalidates the derived scale table rather than merely
+# shifting it — the verdict has to be re-derived, not re-asserted.
 CALIBRATION_TICK_RANGES = {
     "shoulder_pan": {"id": 1, "drive_mode": 0, "range_min": 792, "range_max": 3443},
     "shoulder_lift": {"id": 2, "drive_mode": 0, "range_min": 851, "range_max": 3211},
@@ -245,10 +252,22 @@ DEG_PER_PCT_PINNED = [1.16527, 1.03736, 0.96352, 1.00791, 1.6778]
 
 ARM_JOINTS = JOINT_NAMES[:5]
 
-# Default LeRobot robot identity used to derive the calibration path. Both are
-# overridable on the command line; neither is ever an absolute path.
+# Default LeRobot robot identity. Both are overridable on the command line;
+# neither is ever an absolute path.
+#
+# DEFAULT_ROBOT_TYPE is Dum-E's OWN robot_type string, used to construct the
+# controller. It is NOT the directory the calibration lives under — see
+# LEROBOT_ROBOT_CLASS_NAME.
 DEFAULT_ROBOT_TYPE = "so101_follower"
 DEFAULT_ROBOT_ID = "my_awesome_follower_arm"
+
+# The robot CLASS's `name`, which is the segment lerobot derives the calibration
+# directory from. 0.6.1 consolidated both follower classes into `SOFollower`,
+# whose `name` is "so_follower", so the directory moved even though `robot_type`
+# did not. Using DEFAULT_ROBOT_TYPE here reads the stale pre-0.6.x copy that the
+# bus no longer loads, which is a drift check that cannot fail. Pass
+# `--calibration` to override the derivation entirely.
+LEROBOT_ROBOT_CLASS_NAME = "so_follower"
 
 # Repo-relative location of the (gitignored) checkpoint statistics.
 STATISTICS_RELPATH = Path("checkpoints") / "GR00T-N1.7-3B-SO101" / "statistics.json"
@@ -781,27 +800,32 @@ def calibration_bounds(calibration: dict, motor: str) -> tuple[float, float, int
 # --- Local data artifacts: resolved, never hardcoded ------------------------
 
 
-def _hf_lerobot_home() -> Path:
-    """The LeRobot cache root, from the documented env vars with upstream defaults."""
-    explicit = os.environ.get("HF_LEROBOT_HOME")
-    if explicit:
-        return Path(explicit).expanduser()
-    hf_cache = os.environ.get("HF_HOME")
-    base = Path(hf_cache).expanduser() if hf_cache else Path.home() / ".cache" / "huggingface"
-    return base / "lerobot"
-
-
 def resolve_calibration_path(
     explicit: str | None = None,
-    robot_type: str = DEFAULT_ROBOT_TYPE,
+    robot_name: str = LEROBOT_ROBOT_CLASS_NAME,
     robot_id: str = DEFAULT_ROBOT_ID,
 ) -> Path:
-    """Locate the follower calibration JSON. Never a hardcoded absolute path."""
+    """Locate the calibration JSON ``lerobot`` ACTUALLY loads. Never hardcoded.
+
+    Delegates to ``controller.resolve_calibration_file()`` rather than rebuilding
+    the path here. Two independent resolvers is how this drifted: this one used to
+    compose the directory from Dum-E's ``robot_type`` (``"so101_follower"``), while
+    the bus reads the directory named after the robot CLASS's ``name``
+    (``"so_follower"``) — so the drift check compared the pinned constants against
+    the stale pre-0.6.x copy and reported "no drift" while every joint had moved.
+    The controller's resolver is the single source of truth for that derivation,
+    and it also handles the ``HF_LEROBOT_CALIBRATION`` / ``HF_LEROBOT_HOME`` /
+    ``HF_HOME`` search order.
+
+    The import is lazy so the arm-free discriminators still run without paying for
+    the LeRobot stack unless a calibration path actually has to be derived.
+    """
     if explicit:
         return Path(explicit).expanduser()
-    env_root = os.environ.get("HF_LEROBOT_CALIBRATION")
-    root = Path(env_root).expanduser() if env_root else _hf_lerobot_home() / "calibration"
-    return root / "robots" / robot_type / f"{robot_id}.json"
+    _repo_on_path()
+    from embodiment.so_arm10x.controller import resolve_calibration_file
+
+    return resolve_calibration_file(robot_name, robot_id)
 
 
 def resolve_statistics_path(explicit: str | None = None) -> Path:
@@ -827,7 +851,7 @@ def resolve_statistics_path(explicit: str | None = None) -> Path:
 def check_pinned_constants_against_local_artifacts(
     statistics_path: str | None = None,
     calibration_path: str | None = None,
-    robot_type: str = DEFAULT_ROBOT_TYPE,
+    robot_name: str = LEROBOT_ROBOT_CLASS_NAME,
     robot_id: str = DEFAULT_ROBOT_ID,
 ) -> tuple[bool, list[str]]:
     """Compare the pinned constants against the real local data artifacts.
@@ -866,7 +890,7 @@ def check_pinned_constants_against_local_artifacts(
             f"set --statistics or DUME_CHECKPOINT_STATISTICS to check for drift"
         )
 
-    cal_file = resolve_calibration_path(calibration_path, robot_type, robot_id)
+    cal_file = resolve_calibration_path(calibration_path, robot_name, robot_id)
     if cal_file.is_file():
         recorded_cal = json.loads(cal_file.read_text(encoding="utf-8"))
         drifted = False
@@ -1577,10 +1601,15 @@ def check_pinned_constants(index: str, args: argparse.Namespace) -> bool:
     ok, notes = check_pinned_constants_against_local_artifacts(
         statistics_path=args.statistics,
         calibration_path=args.calibration,
-        # `--robot-type` / `--robot-id` default to None so the YAML config can
-        # supply them for the LIVE session; the offline drift check needs the
-        # module fallbacks when neither is given.
-        robot_type=args.robot_type or DEFAULT_ROBOT_TYPE,
+        # `--robot-id` defaults to None so the YAML config can supply it for the
+        # LIVE session; the offline drift check needs the module fallback when
+        # neither is given.
+        #
+        # `--robot-type` is deliberately NOT threaded in here: the calibration
+        # directory is named after the robot CLASS, not after Dum-E's
+        # `robot_type`, so passing `robot_type` is exactly the substitution that
+        # made this check read a file the bus does not load. `--calibration` is
+        # the escape hatch when the derivation is wrong.
         robot_id=args.robot_id or DEFAULT_ROBOT_ID,
     )
     for note in notes:

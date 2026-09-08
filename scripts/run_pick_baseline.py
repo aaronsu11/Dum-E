@@ -104,7 +104,15 @@ DEFAULT_BACKEND = "groot-native"
 
 #: PickSkill's checkpoint-matching defaults, restated so the recorded run says
 #: which horizon produced the score.
-DEFAULT_ACTIONS_TO_EXECUTE = 10
+#:
+#: `actions_to_execute` is the obs -> policy -> action iteration budget, i.e. how
+#: long the arm gets to finish the task. Raised from PickSkill's default of 10
+#: after the validation attempt ran out of iterations mid-task: the arm had
+#: grasped the banana, dropped it, and "stopped before it could retry". The
+#: checkpoint is not fine-tuned for this table, so recovery attempts are expected
+#: and the budget should not be what ends the attempt. The action HORIZON stays at
+#: 16 — that one matches the trained checkpoint and must not be tuned.
+DEFAULT_ACTIONS_TO_EXECUTE = 20
 DEFAULT_ACTION_HORIZON = 16
 
 #: Fallbacks for controller settings, used only when neither a flag nor the live
@@ -1320,7 +1328,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                             break
                         if index < args.attempts:
                             policy.reset()
-                print("\n Parking the arm at its initial pose ...")
+                # Via ready first: the final park runs from wherever the last
+                # attempt ended, which is exactly the arbitrary-pose descent that
+                # can sweep the arm into the table (see PickSkill.run).
+                print("\n Parking the arm (via ready) at its initial pose ...")
+                controller.move_to_ready_pose()
                 controller.move_to_initial_pose()
 
             payload = build_run_payload(

@@ -92,8 +92,10 @@ class PickSkill(Skill):
         Args:
             item: optional item label (used by the agent for its instruction).
             actions_to_execute: number of obs->policy->action iterations.
-            pose: "initial" first moves to the initial+ready pose; "resume"
-                continues from the current pose.
+            pose: "initial" parks via ready -> initial -> ready, so the descent to
+                the low initial pose starts from a known retracted pose rather
+                than an arbitrary one, and the pick still begins at ready;
+                "resume" continues from the current pose.
             language_instruction: instruction to condition the policy on; falls
                 back to the client's stored ``language_instruction``.
             action_horizon: number of actions from each chunk to execute
@@ -103,6 +105,19 @@ class PickSkill(Skill):
             The latest camera images dict from ``get_current_images()``.
         """
         if pose == "initial":
+            # Go via the ready pose FIRST. The initial pose is the low, extended
+            # one (`shoulder_lift` -102, `elbow_flex` 96), and driving to it
+            # straight from wherever the previous attempt ended can sweep the arm
+            # into the table — observed on hardware when returning from an
+            # arbitrary policy pose. The ready pose is retracted, so reaching it
+            # first turns one unbounded move into two bounded ones. This is also
+            # the reset-from-extreme-pose case plan 05-05 predicted would produce
+            # the largest legitimate clamp delta.
+            #
+            # The trailing `move_to_ready_pose()` is retained deliberately: the
+            # pick starts from the READY pose, and changing that would make the
+            # run non-comparable to the v1.0 baseline.
+            self.controller.move_to_ready_pose()
             self.controller.move_to_initial_pose()
             self.controller.move_to_ready_pose()
 

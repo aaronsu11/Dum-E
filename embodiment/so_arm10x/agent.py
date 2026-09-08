@@ -668,7 +668,7 @@ def create_robot_agent(
         wrist_cam_idx=wrist_cam_idx,
         front_cam_idx=front_cam_idx,
     )
-    # Policy backend is SELECTED, never hardcoded (BACK-01/02/03): the factory
+    # Policy backend is SELECTED, never hardcoded: the factory
     # validates DUME_POLICY_BACKEND and raises here — before
     # `SO10xArmController.connect()` (driven by `IRobotController.activate()`)
     # ever touches the serial bus.

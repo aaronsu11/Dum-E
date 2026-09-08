@@ -127,8 +127,8 @@ def _spawn_agent_worker(
         "DUME_POLICY_BACKEND": controller_cfg.get("policy_backend", "groot-native"),
     }
 
-    # LR-03 / D-03 and SAFE-02: the joint-value convention and the per-step motion
-    # clamp are forwarded only when the config actually names them, so their
+    # The joint-value convention and the per-step motion clamp are forwarded
+    # only when the config actually names them, so their
     # defaults live in exactly one place (embodiment/so_arm10x/controller.py) and
     # cannot drift between the launcher and the process that owns the arm.
     #

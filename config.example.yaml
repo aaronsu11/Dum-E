@@ -65,7 +65,7 @@ controller:
   # This key exists so that flip needs no code edit when it is taken.
   use_degrees: true
 
-  # Per-step motion clamp, in the same units as the joint values above (SAFE-02).
+  # Per-step motion clamp, in the same units as the joint values above.
   # Any commanded per-joint delta larger than this is clipped toward the present
   # position and the clamp is logged. Must be a positive FLOAT -- an int raises a
   # TypeError inside the clamp at the exact moment it would have engaged. Set to
@@ -87,7 +87,7 @@ controller:
   # Which inference backend serves the policy. Forwarded to the agent worker as
   # DUME_POLICY_BACKEND; an exported shell value wins over this file.
   #   "groot-native" -> Isaac-GR00T native ZMQ server (works today)
-  #   "lerobot"      -> LeRobot policy backend; RAISES until Phase 6 wires it
+  #   "lerobot"      -> LeRobot policy backend; RAISES, not implemented yet
   # Note the CODE-level default when DUME_POLICY_BACKEND is unset is "lerobot",
   # so this example deliberately selects the backend that currently works.
   policy_backend: "groot-native"

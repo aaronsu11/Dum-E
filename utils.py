@@ -161,7 +161,7 @@ class RobotCallbackHandler:
 class InterceptHandler(logging.Handler):
     """Forward stdlib ``logging`` records into loguru.
 
-    Why this exists (SAFE-02, research Pitfall 9): LeRobot's motion clamp warns
+    Why this exists: LeRobot's motion clamp warns
     via ``lerobot.robots.utils.ensure_safe_goal_position`` -> the *module-level*
     ``logging.warning``, i.e. the stdlib **root** logger. With no handler on root,
     that call auto-invokes ``basicConfig()`` and installs a ``StreamHandler`` on
@@ -271,7 +271,7 @@ def setup_robot_logging(
     # Bridge stdlib logging into loguru BEFORE the per-library level tuning
     # below. The named loggers below are noise suppression; this is the opposite
     # concern — the ROOT logger, which nothing here touches and which is where
-    # LeRobot's motion-clamp warning lands (SAFE-02).
+    # LeRobot's motion-clamp warning lands.
     install_stdlib_to_loguru_bridge()
 
     # Suppress verbose logs from external libraries (always do this)

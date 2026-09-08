@@ -1,11 +1,11 @@
-"""Policy-backend seam tests (BACK-01/02/03/04/06).
+"""Policy-backend seam tests.
 
-Covers the seam introduced in Phase 5:
-- BACK-01: ``IPolicyBackend`` covers every existing policy call site.
-- BACK-02: omitting ``DUME_POLICY_BACKEND`` selects ``lerobot``.
-- BACK-03: an unknown value RAISES (never warn-and-fall-back).
-- BACK-04: ``lerobot`` raises an actionable "arrives in Phase 6" error.
-- BACK-06: ``groot-native`` stays selectable AND functional — proven end to end
+Covers the policy-backend selection seam:
+- ``IPolicyBackend`` covers every existing policy call site.
+- Omitting ``DUME_POLICY_BACKEND`` selects ``lerobot``.
+- An unknown value RAISES (never warn-and-fall-back).
+- ``lerobot`` raises an actionable "not implemented yet" error.
+- ``groot-native`` stays selectable AND functional — proven end to end
   against the real ``scripts/mock_policy_server.py`` over a real loopback ZMQ
   socket, not a mocked transport.
 
@@ -131,7 +131,7 @@ def mock_server():
         thread.join(timeout=2.0)
 
 
-# --- BACK-06: groot-native is selectable AND functional, end to end ----------
+# --- groot-native is selectable AND functional, end to end -------------------
 
 
 def test_groot_native_end_to_end_over_real_socket(mock_server):
@@ -175,11 +175,11 @@ def test_groot_native_end_to_end_over_real_socket(mock_server):
             backend.close()
 
 
-# --- BACK-02/03/04: the selector is FAIL-CLOSED ------------------------------
+# --- the selector is FAIL-CLOSED ---------------------------------------------
 
 
 def test_unknown_backend_raises_with_value_and_allowlist():
-    """BACK-03: an unknown value RAISES; it never warns and falls back.
+    """An unknown value RAISES; it never warns and falls back.
 
     Deliberate divergence from the DUME_DEEPGRAM_BACKEND analog, which warns and
     defaults to 'hosted'. Silently swapping which neural network commands a
@@ -199,7 +199,7 @@ def test_unknown_backend_raises_with_value_and_allowlist():
 
 
 def test_default_backend_is_lerobot():
-    """BACK-02: with DUME_POLICY_BACKEND unset, the selected backend is 'lerobot'.
+    """With DUME_POLICY_BACKEND unset, the selected backend is 'lerobot'.
 
     Observable through the lerobot branch's own raise — proving the CODE-level
     default rather than a config-file default. clear=True guarantees no inherited
@@ -216,10 +216,12 @@ def test_default_backend_is_lerobot():
 
 
 def test_lerobot_backend_raises_actionable_not_implemented():
-    """BACK-04: 'lerobot' is KNOWN but not wired until Phase 6 — raise actionably.
+    """'lerobot' is KNOWN but not wired yet — raise actionably.
 
-    The message must name the variable, the selected value, the phase that lands
-    the backend, and the alternative that works today.
+    The message must name the variable, the selected value, the fact that the
+    backend is not implemented, and the alternative that works today. It is
+    operator-facing, so it says what the state IS rather than citing a roadmap
+    identifier the operator has no access to.
     """
     with mock.patch.dict(
         os.environ, {"DUME_POLICY_BACKEND": "lerobot"}, clear=True
@@ -230,16 +232,16 @@ def test_lerobot_backend_raises_actionable_not_implemented():
     message = str(excinfo.value)
     assert "DUME_POLICY_BACKEND" in message
     assert "lerobot" in message
-    assert "Phase 6" in message
+    assert "not implemented yet" in message
     assert "groot-native" in message
 
 
 def test_factory_module_import_pulls_no_torch_or_lerobot():
-    """Lazy-import discipline (BACK-06): importing the factory stays torch-free.
+    """Lazy-import discipline: importing the factory stays torch-free.
 
     Run in a SUBPROCESS so the assertion is unaffected by whatever the rest of
     the suite already imported. The groot-native path must not pay for the
-    LeRobot/GPU stack that the Phase 6 lerobot branch will pull in.
+    LeRobot/GPU stack that the lerobot branch will pull in once it is wired.
     """
     probe = (
         "import sys; import policy.factory; "
@@ -274,11 +276,11 @@ def test_factory_never_builds_an_import_from_the_env_value():
     assert POLICY_BACKENDS == ("lerobot", "groot-native")
 
 
-# --- BACK-01 edge cases: adjacency / empty / ordering ------------------------
+# --- IPolicyBackend edge cases: adjacency / empty / ordering -----------------
 
 
 def test_language_instruction_is_readonly_property():
-    """BACK-01 adjacency edge: two names that are exactly equal on the ABC do not
+    """Adjacency edge: two names that are exactly equal on the ABC do not
     collide. `language_instruction` is a read-only @property backed by a field,
     so skills.py's parenthesis-free READ works while assignment is rejected —
     mutation goes through set_lang_instruction, which a backend can validate."""
@@ -299,7 +301,7 @@ def test_language_instruction_is_readonly_property():
 
 
 def test_get_action_without_any_instruction_raises(mock_server):
-    """BACK-01 empty edge: no argument instruction AND no stored one -> raise.
+    """Empty edge: no argument instruction AND no stored one -> raise.
 
     A null `annotation.human.task_description` on the wire is silent garbage-in
     that would surface downstream as apparent checkpoint drift, so it must never
@@ -339,7 +341,7 @@ def test_get_action_without_any_instruction_raises(mock_server):
 
 
 def test_close_is_idempotent_and_session_closes_on_exception():
-    """BACK-01 ordering edge: close() twice must not raise, and session() must
+    """Ordering edge: close() twice must not raise, and session() must
     close even when its body raises — otherwise a double close in a `finally`
     would mask the original exception, and an aborted episode would leak the
     socket into the next one."""

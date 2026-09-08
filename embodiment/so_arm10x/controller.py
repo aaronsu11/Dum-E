@@ -264,7 +264,7 @@ def view_img(img, overlay_img=None):
 
 
 # ============================================================================
-# Calibration-file resolution and the connect-time assertion (D-05)
+# Calibration-file resolution and the connect-time assertion
 # ============================================================================
 
 
@@ -362,7 +362,7 @@ def assert_calibration_loaded(
       tamper protection and must not be presented as such. Its one job is to make
       a wrong-file copy visible, which is the failure mode the loud missing-file
       error does not cover, and which is the accepted tradeoff of copying the
-      calibration rather than pinning its directory (CONTEXT.md D-05).
+      calibration rather than pinning its directory.
     """
     if expected_path is not None:
         path = Path(expected_path)
@@ -391,7 +391,7 @@ def assert_calibration_loaded(
 
 
 # ============================================================================
-# Safety and stiffness presets (LR-04 / D-01 / D-02)
+# Safety and stiffness presets
 # ============================================================================
 
 
@@ -408,7 +408,7 @@ def assert_calibration_loaded(
 # upstream lands it on the first pass. Dum-E's remaining job is EVIDENCE, not
 # writing: `_assert_pid_landed()` reads the coefficients back from every motor
 # and refuses to connect on a mismatch. A clean write is not evidence the value
-# landed (CONTEXT.md D-02), and a Feetech bus can drop or corrupt a packet.
+# landed, and a Feetech bus can drop or corrupt a packet.
 DUME_PID: Dict[str, int] = {
     "P_Coefficient": 10,
     "I_Coefficient": 0,
@@ -417,8 +417,7 @@ DUME_PID: Dict[str, int] = {
 
 # Minimum retry count for a coefficient read-back. Upstream's `read` defaults to
 # `num_retry=0`, which turns one dropped packet on the Feetech bus into a value
-# mismatch — and under D-01 a mismatch refuses to connect a perfectly healthy
-# arm. The floor is applied over `config.num_read_retries` so a config that
+# mismatch — and a mismatch refuses to connect a perfectly healthy arm. The floor is applied over `config.num_read_retries` so a config that
 # lowers retries cannot silently disable this one.
 _PID_READ_MIN_RETRIES = 2
 
@@ -446,7 +445,7 @@ _MOTOR_NAMES: Tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# The joint-value convention (LR-03 / D-03)
+# The joint-value convention
 # ---------------------------------------------------------------------------
 #
 # `use_degrees` decides whether the motor bus reports and accepts joint values as
@@ -522,7 +521,7 @@ def resolve_use_degrees(value: "bool | str | None" = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# The per-step motion clamp (SAFE-02)
+# The per-step motion clamp
 # ---------------------------------------------------------------------------
 #
 # PROVENANCE OF THIS VALUE — derived arithmetic on recorded statistics, NOT a
@@ -545,15 +544,15 @@ def resolve_use_degrees(value: "bool | str | None" = None) -> bool:
 # intervals — sees a delta approaching the full cumulative offset. Sizing on the
 # increment would therefore clamp nominal, correctly-tracked motion.
 #
-# Why not smaller: Phase 7 requires ZERO clamp warnings during nominal
-# operation, so a clamp below the policy's own trained per-step motion would
+# Why not smaller: the checkpoint-parity gate requires ZERO clamp warnings
+# during nominal operation, so a clamp below the policy's own trained per-step motion would
 # fire constantly and be read as a parity bug rather than as a mis-set clamp.
 # Why not larger: one far above the arm's own travel would never catch a
 # runaway. 160.0 sits above the checkpoint's motion and below twice any joint's
 # calibrated span.
 #
-# THIS IS AN ASSUMPTION, not a measurement. Plan 05-06's live clamp
-# demonstration and Phase 7's zero-warning requirement are what validate it. If
+# THIS IS AN ASSUMPTION, not a measurement. The live clamp demonstration and the
+# parity gate's zero-warning requirement are what validate it. If
 # nominal operation trips the clamp, the value must be RE-DERIVED — the clamp
 # must not be removed and the warning must not be suppressed.
 DEFAULT_MAX_RELATIVE_TARGET: float = 160.0
@@ -572,8 +571,8 @@ CLAMP_WARNING_TEXT = "Relative goal position magnitude had to be clamped to be s
 # Environment spellings that explicitly DISABLE the clamp. Disabling has to be
 # spelled out, because `None` on the constructor parameter means "resolve from
 # the environment then the default" — the clamp is on by default, which is the
-# point of SAFE-02 given that the production call site passes neither this
-# parameter nor the units one.
+# point, given that the production call site passes neither this parameter nor
+# the units one.
 _CLAMP_DISABLED_SPELLINGS = frozenset({"none", "null", "off", "disabled", "false"})
 
 
@@ -720,7 +719,7 @@ class SO10xArmController(IRobotController):
                     "Robot serial port is required. Set `port` or env `SO_ARM_PORT`."
                 )
 
-        # SAFE-02: `None` here means "resolve", not "disable" — mirroring the
+        # `None` here means "resolve", not "disable" — mirroring the
         # serial-port fallback just above. The clamp is therefore ON by default,
         # which matters because the production call site passes neither this
         # parameter nor the units one. Validation happens before the value
@@ -728,13 +727,13 @@ class SO10xArmController(IRobotController):
         # moment the clamp engages.
         max_relative_target = resolve_max_relative_target(max_relative_target)
 
-        # LR-03 / D-03: same fallback shape. The environment string is coerced
+        # Same fallback shape for the units convention. The environment string is coerced
         # explicitly rather than trusted for truthiness.
         use_degrees = resolve_use_degrees(use_degrees)
 
-        # D-03 requires the EFFECTIVE value to be visible in the log, so the
-        # running convention and the active clamp can be read off a session
-        # without reconstructing the config precedence chain.
+        # The EFFECTIVE value has to be visible in the log, so the running
+        # convention and the active clamp can be read off a session without
+        # reconstructing the config precedence chain.
         logger.info(
             "Controller units/safety config: use_degrees={} max_relative_target={} "
             "(recorded units verdict is percent mode — see docs/UNITS-VERDICT.md; "
@@ -784,7 +783,7 @@ class SO10xArmController(IRobotController):
                 cameras=cameras,
                 use_degrees=use_degrees,
                 max_relative_target=max_relative_target,
-                # LR-04: declarative. Upstream `configure()` writes these during
+                # Declarative. Upstream `configure()` writes these during
                 # `connect()`, so the preset lands on the first pass — no
                 # post-connect register overwrite, no second torque-disabled
                 # cycle. Verified by `_assert_pid_landed()`.
@@ -802,7 +801,7 @@ class SO10xArmController(IRobotController):
                 cameras=cameras,
                 use_degrees=use_degrees,
                 max_relative_target=max_relative_target,
-                # LR-04, same as the SO-101 branch: an SO-100 arm is not
+                # Same as the SO-101 branch: an SO-100 arm is not
                 # entitled to the library defaults either.
                 position_p_coefficient=DUME_PID["P_Coefficient"],
                 position_i_coefficient=DUME_PID["I_Coefficient"],
@@ -857,7 +856,7 @@ class SO10xArmController(IRobotController):
         self._assert_calibration_loaded()
         # The Dum-E PID preset is declared on the config and written by upstream
         # `configure()` during the connect above. What remains is proving it
-        # landed (D-02) — and refusing to operate the arm if it did not (D-01).
+        # landed — and refusing to operate the arm if it did not.
         self._assert_pid_landed()
 
     def _prearm_goal_to_present(self) -> Dict[str, Any]:
@@ -993,7 +992,7 @@ class SO10xArmController(IRobotController):
         Returns:
             ``{motor: {register: observed value}}`` for all six motors — logged
             at INFO so a later phase can cite the stiffness the arm *actually*
-            ran at rather than the value that was requested (D-02).
+            ran at rather than the value that was requested.
 
         Raises:
             RuntimeError: a coefficient read failed. The underlying exception is
@@ -1001,20 +1000,20 @@ class SO10xArmController(IRobotController):
             ValueError: one or more read-back values do not match the preset.
                 Every mismatch is aggregated into a single message.
 
-        This method REPLACES the former ``set_so10x_robot_preset()``, whose
-        torque-disabled write loop wrapped in ``except Exception: pass`` is the
-        debt recorded in ``.planning/codebase/CONCERNS.md``. Two changes, both
-        deliberate:
+        This method REPLACES the former ``set_so10x_robot_preset()``, which was a
+        torque-disabled write loop wrapped in ``except Exception: pass`` — so a
+        failed stiffness write was indistinguishable from a successful one. Two
+        changes, both deliberate:
 
         * **It only reads.** At 0.6.1 the write is upstream's responsibility (the
           three coefficients are config fields that ``configure()`` writes), so
           re-writing them here would be a redundant second torque-disabled cycle.
-          That also dissolves D-01's recorded risk that a renamed *write* API
-          would hard-stop the phase.
-        * **It raises.** CONTEXT.md D-01 forbids softening this to a warning or a
-          best-effort skip to get past a bus problem: operating the arm at
-          unknown stiffness is the failure this exists to prevent, and a silent
-          stiffness change would present in Phase 7 as apparent checkpoint drift.
+          That also removes the risk that a renamed *write* API would break this
+          path outright.
+        * **It raises.** Do NOT soften this to a warning or a best-effort skip to
+          get past a bus problem: operating the arm at unknown stiffness is the
+          failure this exists to prevent, and a silent stiffness change would
+          present in a later parity comparison as apparent checkpoint drift.
 
         Two register-access specifics are load-bearing. ``normalize=False``,
         because normalization is defined for *position* registers through the
@@ -1041,7 +1040,7 @@ class SO10xArmController(IRobotController):
                         f"Could not read {register} from motor {motor!r} to verify "
                         f"the Dum-E PID preset {DUME_PID}: the arm will NOT be "
                         f"operated at unknown stiffness. Fix the motor bus rather "
-                        f"than softening this check (CONTEXT.md D-01)."
+                        f"than softening this check."
                     ) from exc
                 observed[motor][register] = actual
                 if actual != expected:
@@ -1098,7 +1097,7 @@ class SO10xArmController(IRobotController):
     def _report_clamped_joints(
         self, requested: Dict[str, float], sent: Dict[str, float]
     ) -> Tuple[Tuple[str, float, float], ...]:
-        """Re-emit any clamp divergence on Dum-E's own loguru stream (SAFE-02).
+        """Re-emit any clamp divergence on Dum-E's own loguru stream.
 
         Upstream already warns when it clamps — but through the module-level
         ``logging.warning``, i.e. the stdlib ROOT logger, which auto-installs a

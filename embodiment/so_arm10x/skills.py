@@ -113,7 +113,7 @@ class PickSkill(Skill):
             self.controller.move_to_initial_pose()
             self.controller.move_to_ready_pose()
 
-        # SAFE-02: the clamp signal, accumulated across the whole pick.
+        # The per-step motion-clamp signal, accumulated across the whole pick.
         clamped_steps = 0
         clamped_joints: Set[str] = set()
 
@@ -130,7 +130,7 @@ class PickSkill(Skill):
                 # BIND the return value — do not call for effect only. It is the
                 # action the robot reports it ACTUALLY sent, so divergence from
                 # the request is the per-step motion clamp having engaged. A
-                # caller that discards it reduces SAFE-02 to a log line nobody
+                # caller that discards it reduces the clamp signal to a log line nobody
                 # correlates with a task.
                 sent = self.controller.set_target_state(action_dict)
                 for joint, _requested, _clipped in diff_clamped_joints(

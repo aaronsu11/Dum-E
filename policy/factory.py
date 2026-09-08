@@ -1,4 +1,4 @@
-"""Policy-backend selector (BACK-02/03/04/06).
+"""Policy-backend selector.
 
 One entry point — ``make_policy_backend()`` — turns the ``DUME_POLICY_BACKEND``
 environment variable into a concrete :class:`shared.IPolicyBackend`. This is the
@@ -25,7 +25,9 @@ POLICY_BACKEND_ENV_VAR = "DUME_POLICY_BACKEND"
 #: The allowlist. Anything not in here is rejected — never defaulted.
 POLICY_BACKENDS = ("lerobot", "groot-native")
 
-#: Code-level default when the environment variable is unset (BACK-02).
+#: Code-level default when the environment variable is unset. Deliberately the
+#: target backend rather than the one that works today, so an unset variable
+#: raises the "not wired" error below instead of silently selecting a fallback.
 DEFAULT_POLICY_BACKEND = "lerobot"
 
 
@@ -51,7 +53,7 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
         # warns and falls back to its default on an unknown value. Do NOT
         # "restore parity" here: silently swapping which neural network drives a
         # physical arm is worse than a crash, so a typo must stop the process
-        # rather than quietly select a different policy (BACK-03).
+        # rather than quietly select a different policy.
         raise ValueError(
             f"{POLICY_BACKEND_ENV_VAR}={backend!r} is not a known policy backend; "
             f"allowed values are {', '.join(POLICY_BACKENDS)}. "
@@ -60,21 +62,20 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
         )
 
     if backend == "lerobot":
-        # Known but NOT wired this phase. Raise with the variable, the selected
-        # value, when it lands, and what works today — never a silent swap to a
-        # different backend (BACK-04). Reached by the unset default too, since
-        # DEFAULT_POLICY_BACKEND is 'lerobot' (BACK-02).
+        # Known but NOT wired yet. Raise with the variable, the selected value and
+        # what works today — never a silent swap to a different backend. Reached by
+        # the unset default too, since DEFAULT_POLICY_BACKEND is 'lerobot'.
         raise ValueError(
             f"{POLICY_BACKEND_ENV_VAR}={backend!r} requires the LeRobot policy "
-            "backend, which is not wired yet — it lands in Phase 6. "
+            "backend, which is not implemented yet in this release. "
             f"Set {POLICY_BACKEND_ENV_VAR}=groot-native to use the currently "
             "functional Isaac-GR00T native backend."
         )
 
     if backend == "groot-native":
         # Lazy-import inside the branch: the 'lerobot' branch will pull the
-        # LeRobot policy stack (torch/GPU, and gRPC for async inference) in
-        # Phase 6, and this torch-free path must not pay for it. The GR00T
+        # LeRobot policy stack (torch/GPU, and gRPC for async inference) once it is
+        # wired, and this torch-free path must not pay for it. The GR00T
         # transport (policy/gr00t/service.py) depends only on msgpack/numpy/zmq.
         from embodiment.so_arm10x.controller import Gr00tRobotInferenceClient
 

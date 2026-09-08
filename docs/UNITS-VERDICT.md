@@ -284,9 +284,38 @@ alongside this record.
    recorded and the checkpoint fine-tuned against a different calibration with a wider
    `elbow_flex` span, `100.0` degrees could become reachable and §2.2 weakens. **The clip
    fingerprint (§2.1) does not depend on this**, so the verdict survives with two of three
-   arguments intact. `check_pinned_constants_against_local_artifacts()` reports drift between
-   the pinned constants and the local artifacts as a failure, so a recalibration or a
-   checkpoint swap surfaces instead of silently invalidating the scale table.
+   arguments intact.
+
+   `check_pinned_constants_against_local_artifacts()` compares the pinned constants against
+   the local artifacts and reports any difference as a **failure**, so a recalibration or a
+   checkpoint swap surfaces instead of silently invalidating the scale table. **It is currently
+   FAILING, correctly, and that is the honest state of this limit rather than a defect.** The
+   arm was recalibrated after §9's measurements were taken (§9.1), so every joint's tick range
+   now differs from the pinned table, and the check says so on every run:
+
+   ```
+   [5/5] pinned-constants drift against local data artifacts ...
+          DRIFT calibration elbow_flex.range_max: pinned 3090 != recorded 3100
+          ... (all six joints)
+     FAIL: a resolved artifact drifted from the pinned constants — the units verdict
+           must be RE-DERIVED before proceeding
+   ```
+
+   **What that failure does and does not mean.** It means §4.2's / §9.5's per-joint scale table
+   and §7's conversion table are keyed to a calibration no longer on disk, and must be
+   re-derived before either is used to command anything. It does **not** weaken the verdict
+   itself: §2.1's clip fingerprint is a property of the checkpoint statistics alone, and those
+   are checked in the same run and still match. The failure also now blocks the probe's whole
+   arm half — the pre-motion reachability guard is computed from the live `bus.calibration`, but
+   the scale table it would be measured against is not, so nothing derived from the pinned
+   constants may be measured or commanded until they are re-derived.
+
+   **Historical note on why the guard was worth fixing.** Until this was corrected, the check
+   built the calibration path from Dum-E's `robot_type` (`so101_follower`) while `lerobot`
+   0.6.1 derives that directory from the robot CLASS's name (`so_follower`). It therefore read
+   the stale pre-0.6.x copy, which had not changed, and reported "no drift" through the entire
+   recalibration. The guard was present, green and inert. It now resolves the path through
+   `controller.resolve_calibration_file()` — the same derivation the bus uses.
 2. ~~**The per-joint scale factors are exact arithmetic on verified inputs, not measured on
    hardware.**~~ **DISCHARGED — see §9.5.** The raw-tick round-trip probe measured all five
    factors on the live bus, at three independent poses, and reproduced the derived table of §4.2
@@ -342,10 +371,27 @@ than inference. This is a comparison taken a better way, **not** a criterion qui
 | Harness | `scripts/pose_sweep_units_probe.py --pose-sequence initial,ready,remote` and `--demo-clamp` |
 | Client stack | `lerobot` 0.6.1, `torch` 2.7.1 + CUDA 12.6 |
 | Calibration file | `~/.cache/huggingface/lerobot/calibration/robots/so_follower/my_awesome_follower_arm.json` |
-| Calibration `checksum` (sha256) | `5bd471fbbb4e1be0c6ede80472d365b527bc0808befdd67f123148ed49e3dc50` |
+| Calibration `checksum` (sha256) at time of run | `5bd471fbbb4e1be0c6ede80472d365b527bc0808befdd67f123148ed49e3dc50` — **superseded, see below** |
 | Effective controller config | `use_degrees=True`, `max_relative_target=160.0` |
 | Poses swept | `initial`, `ready`, `remote` (3), plus an as-found reading taken before any motion |
 | Raw numeric output | the gitignored `corpus/pose_sweep_<timestamp>/results.json`; this section is the committed record |
+
+**The arm was recalibrated by the operator on 2026-09-07, after this run.** The path above is
+correct — it is the file `lerobot` 0.6.1 loads — but **re-hashing it today will NOT reproduce
+`5bd471fb…`**. The same path now hashes to
+`ef68ae670b75d88f57260866653a484f224b1c31fdd8ff1d8e3cf2a1270b6f5b`, and all six joints' tick
+ranges moved; concretely, `elbow_flex.range_max` went from **3090 to 3100**. `5bd471fb…` is now
+the checksum of the *sibling* pre-0.6.x `so101_follower` copy, which was not recalibrated —
+so a reader who re-hashes and finds a different value is looking at a recalibration, not at
+tampering.
+
+Every measurement in this section is **correct as taken** and remains valid as a historical
+record, but it is **not reproducible against the current calibration file**. §5.1 of
+`docs/GROOT-NATIVE-BASELINE.md` records the same split from the other side (that baseline was
+taken against the *later* calibration) and states which citations it affects — most notably
+§9.7's `elbow_flex` at-limit fingerprint, whose raw tick 3090 is no longer that joint's
+calibrated maximum. Anyone re-deriving a number from this section must use the calibration in
+force at the time, not the file on disk now.
 
 ### 9.2 What was read before anything moved
 
@@ -368,10 +414,13 @@ read-only-first ordering is not ceremony.** With torque disabled, every motor re
 calls `enable_torque()`, and `enable_torque()` writes `Torque_Enable` and `Lock` only — it does
 **not** synchronise `Goal_Position` to the present position. Connecting without intervention
 would therefore have commanded all six joints to raw tick 0 the instant torque returned, a jump
-of up to 3090 ticks on `elbow_flex`. The harness now writes `Goal_Position <- Present_Position`
-while torque is still off (`prearm_goal_to_present()`), which cannot itself move the arm and
-turns the torque-enable into a hold. **The dangerous path was never exercised, so this is a
-hazard prevented, not a hazard demonstrated.**
+of up to 3090 ticks on `elbow_flex`. The controller's `connect()` now writes
+`Goal_Position <- Present_Position` while torque is still off
+(`SO10xArmController._prearm_goal_to_present()`), which cannot itself move the arm and turns the
+torque-enable into a hold. **The dangerous path was never exercised, so this is a hazard
+prevented, not a hazard demonstrated.** The pre-arm was originally discovered and implemented in
+this harness; it now lives on the controller only, so every entry point that connects the arm
+inherits it and there is one copy of the tolerance and the skip condition.
 
 ### 9.3 `active_mode`: two different questions, answered separately
 
@@ -564,9 +613,11 @@ for the parity phase. No clamp fired at any point during the interpolated pose s
   `check_pinned_constants_against_local_artifacts()`, and the arm-required
   `units_verdict()` / `active_mode_from_raw_tick()` / `live_pose_sweep()` /
   `compare_pre_and_post_upgrade()` / `measured_deg_per_pct()` / `envelope_row()` /
-  `demo_clamp()`, plus the safety guards `prearm_goal_to_present()` and
-  `assert_pose_reachable()` / `tick_for_degrees()`.
-- **Gate:** `tests/test_units_verdict.py` — sixteen hermetic tests, none of which may skip.
+  `demo_clamp()`, plus the safety guard `assert_pose_reachable()` / `tick_for_degrees()`, which
+  validates against the live `bus.calibration` rather than the pinned table.
+- **Safety guard on the controller:** `SO10xArmController._prearm_goal_to_present()`, run by
+  `connect()` before `robot.connect()` re-enables torque.
+- **Gate:** `tests/test_units_verdict.py` — hermetic tests, none of which may skip.
 - **Upstream:** `lerobot.motors.motors_bus.MotorsBus._normalize` and
   `lerobot.motors.motors_bus.MotorNormMode` (identical in 0.3.3 and 0.6.1);
   `lerobot.robots.so_follower` (the gripper's hardcoded `RANGE_0_100`);

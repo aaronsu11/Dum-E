@@ -144,6 +144,14 @@ SYNTHETIC_FRAME_WIDTH = 640
 #: can never inflate the number the parity gate reads.
 CLAMP_SELFTEST_MARKER = "[CLAMP COUNTER SELF-TEST — synthetic, no motion was commanded]"
 
+#: Field carried ONLY by the controller's per-step clamp report
+#: (`SO10xArmController._report_clamped_joints`). All three emitters embed
+#: upstream's clamp sentence, so the sentence alone counts one clamped command up
+#: to three times; this is what narrows the count to one emitter. Upstream's own
+#: message carries `original goal_pos` instead, and PickSkill's roll-up carries
+#: neither. Same discriminator `pose_sweep_units_probe.demo_clamp()` uses.
+CONTROLLER_CLAMP_MARKER = "max_relative_target="
+
 #: Substrings that identify an exception as "the stack changed under the run"
 #: rather than "this attempt missed". Either voids the attempt series.
 VOIDING_EXCEPTION_MARKERS = (
@@ -224,14 +232,45 @@ class NonInteractiveError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def count_clamp_warnings(messages: List[str], clamp_text: Optional[str] = None) -> int:
-    """Count genuine clamp warnings in ``messages``.
+def _resolve_clamp_text(clamp_text: Optional[str]) -> str:
+    """The clamp sentence, defaulting to the controller's single source of truth."""
+    if clamp_text is not None:
+        return clamp_text
+    _repo_on_path()
+    from embodiment.so_arm10x.controller import CLAMP_WARNING_TEXT
 
-    A message counts when it carries upstream's clamp sentence and is NOT the
-    counter's own self-test probe. All three emitters share that sentence — the
-    upstream root-logger warning bridged into loguru, the controller's per-step
-    re-emission, and ``PickSkill``'s per-pick roll-up — which is what makes a
-    single sink sufficient (plan 05-05).
+    return CLAMP_WARNING_TEXT
+
+
+def is_clamp_warning(message: str, clamp_text: str) -> bool:
+    """Whether ``message`` is a genuine (non-synthetic) clamp warning from ANY emitter."""
+    return clamp_text in message and CLAMP_SELFTEST_MARKER not in message
+
+
+def count_clamp_warnings(messages: List[str], clamp_text: Optional[str] = None) -> int:
+    """Count CLAMPED COMMANDS — one per clamped command, not one per emitter.
+
+    All three emitters embed upstream's clamp sentence by design, which is what
+    makes a single sink sufficient to SEE every one of them. It also means one
+    clamped joint on one step produces three counted messages if the sentence
+    alone is the discriminator: upstream's bridged root-logger warning, the
+    controller's per-step re-emission, and ``PickSkill``'s per-pick roll-up. The
+    recorded ``clamp_warnings`` and ``total_clamp_warnings`` were therefore
+    inflated roughly threefold, and the parity gate's "zero clamp warnings"
+    criterion reads them as a count of clamped commands.
+
+    So exactly ONE emitter is counted: the controller's per-step report, which
+    fires once per ``set_target_state`` whose returned action diverged from the
+    request. It is identified by the ``max_relative_target=`` field only that
+    emitter carries — the same discriminator ``pose_sweep_units_probe.demo_clamp()``
+    uses to tell the two live emitters apart. Choosing the controller's report
+    rather than upstream's is deliberate: it is Dum-E's own primary detector,
+    derived from ``send_action``'s return value rather than from a log, and it
+    survives the stdlib bridge not being installed.
+
+    ``count_clamp_warning_messages_all_emitters`` keeps the raw multi-emitter
+    count for evidence, so nothing is lost — it is just no longer the number the
+    gate reads.
 
     Args:
         messages: rendered log messages seen by the counting sink.
@@ -241,19 +280,27 @@ def count_clamp_warnings(messages: List[str], clamp_text: Optional[str] = None) 
             without the LeRobot stack.
 
     Returns:
-        The number of non-synthetic clamp warnings.
+        The number of clamped commands reported by the controller.
     """
-    if clamp_text is None:
-        _repo_on_path()
-        from embodiment.so_arm10x.controller import CLAMP_WARNING_TEXT
-
-        clamp_text = CLAMP_WARNING_TEXT
-
+    resolved = _resolve_clamp_text(clamp_text)
     return sum(
         1
         for message in messages
-        if clamp_text in message and CLAMP_SELFTEST_MARKER not in message
+        if is_clamp_warning(message, resolved) and CONTROLLER_CLAMP_MARKER in message
     )
+
+
+def count_clamp_warning_messages_all_emitters(
+    messages: List[str], clamp_text: Optional[str] = None
+) -> int:
+    """Every non-synthetic clamp message, from every emitter. Evidence, not a gate.
+
+    Deliberately separate from :func:`count_clamp_warnings`: this number is a
+    count of LOG LINES, and reading it as a count of clamped commands is the
+    conflation that inflated the recorded totals.
+    """
+    resolved = _resolve_clamp_text(clamp_text)
+    return sum(1 for message in messages if is_clamp_warning(message, resolved))
 
 
 class ClampWarningCounter:
@@ -305,14 +352,28 @@ class ClampWarningCounter:
         self.messages.clear()
 
     def attempt_count(self) -> int:
+        """Clamped COMMANDS in this window — the number the parity gate reads.
+
+        One clamped command, not one log line: see :func:`count_clamp_warnings`.
+        """
         return count_clamp_warnings(self.messages, self.clamp_text)
 
+    def attempt_emitter_message_count(self) -> int:
+        """Clamp log LINES in this window, across all emitters. Evidence only."""
+        return count_clamp_warning_messages_all_emitters(self.messages, self.clamp_text)
+
     def attempt_messages(self) -> List[str]:
+        """Every non-synthetic clamp message in this window, from every emitter.
+
+        Kept whole on purpose: the raw stream is the evidence a later reader needs
+        to see which emitters fired, even though only the controller's per-step
+        report is counted.
+        """
         clamp_text = self.clamp_text or ""
         return [
             message
             for message in self.messages
-            if clamp_text in message and CLAMP_SELFTEST_MARKER not in message
+            if is_clamp_warning(message, clamp_text)
         ]
 
     def self_test(self) -> Dict[str, Any]:
@@ -335,7 +396,14 @@ class ClampWarningCounter:
             CLAMP_SELFTEST_MARKER in message
             for message in self.messages[before_synthetic:]
         )
-        counted = count_clamp_warnings(self.messages, self.clamp_text)
+        # Deliberately the ALL-EMITTERS count, not `count_clamp_warnings`. The
+        # probe carries no `max_relative_target=` field, so the narrower count
+        # would return 0 whether or not the synthetic marker were honoured — the
+        # assertion would pass for the wrong reason. Against the broad count, a 0
+        # here proves the marker exclusion is what keeps the probe out.
+        counted = count_clamp_warning_messages_all_emitters(
+            self.messages, self.clamp_text
+        )
         self.messages.clear()
         return {
             "ok": bool(saw_probe) and counted == 0,
@@ -708,6 +776,10 @@ def run_attempt(
         started_at=started,
         ended_at=_now(),
         clamp_warning_messages=counter.attempt_messages(),
+        # The raw log-line count across all three emitters, recorded alongside
+        # `clamp_warnings` (which counts clamped COMMANDS). Keeping both makes the
+        # distinction explicit in the evidence rather than implicit in a helper.
+        clamp_warning_messages_all_emitters=counter.attempt_emitter_message_count(),
         actions_to_execute=args.actions_to_execute,
         action_horizon=args.action_horizon,
         operator_note=note,

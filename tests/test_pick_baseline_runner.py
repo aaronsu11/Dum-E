@@ -63,14 +63,52 @@ def test_clamp_text_used_by_the_counter_is_the_controllers_own_sentence():
 # ---------------------------------------------------------------------------
 
 
-def test_count_clamp_warnings_counts_every_emitters_wording():
+def test_count_clamp_warnings_counts_one_clamp_event_once():
+    """The gate's number must be clamped COMMANDS, not clamp log lines.
+
+    These three messages describe ONE clamped command on one step: the controller's
+    per-step report, ``PickSkill``'s per-pick roll-up, and upstream's bridged
+    root-logger warning. All three embed the clamp sentence by design — that is
+    what lets a single sink see every emitter — so counting the sentence counted
+    the event three times, and the parity gate's "zero clamp warnings" criterion
+    reads this number as a count of clamped commands.
+    """
     messages = [
         f"{CLAMP_TEXT} max_relative_target=160.0 clamped 1 joint(s): wrist_roll ...",
         f"{CLAMP_TEXT} 3 commanded joint target(s) were clamped during this pick ...",
         f"{CLAMP_TEXT} original goal_pos ...",
         "some unrelated warning",
     ]
-    assert runner.count_clamp_warnings(messages, CLAMP_TEXT) == 3
+    assert runner.count_clamp_warnings(messages, CLAMP_TEXT) == 1
+    # The raw multi-emitter stream is still available as evidence — it is just no
+    # longer the number the gate reads.
+    assert runner.count_clamp_warning_messages_all_emitters(messages, CLAMP_TEXT) == 3
+
+
+def test_count_clamp_warnings_scales_with_clamped_commands_not_with_emitters():
+    """Two clamped commands must read as two, however many emitters spoke."""
+    per_step = f"{CLAMP_TEXT} max_relative_target=160.0 clamped 1 joint(s): wrist_roll ..."
+    messages = [
+        per_step,
+        f"{CLAMP_TEXT} original goal_pos ...",
+        per_step,
+        f"{CLAMP_TEXT} original goal_pos ...",
+        f"{CLAMP_TEXT} 2 commanded joint target(s) were clamped during this pick ...",
+    ]
+    assert runner.count_clamp_warnings(messages, CLAMP_TEXT) == 2
+    assert runner.count_clamp_warning_messages_all_emitters(messages, CLAMP_TEXT) == 5
+
+
+def test_the_controller_clamp_marker_is_the_wording_the_controller_emits():
+    """The discriminator must match a field only the controller's report carries.
+
+    A private copy that drifted from the controller's format string would silently
+    count zero clamped commands while the run looked clean.
+    """
+    from embodiment.so_arm10x import controller as controller_module
+
+    source = Path(controller_module.__file__).read_text(encoding="utf-8")
+    assert runner.CONTROLLER_CLAMP_MARKER in source
 
 
 def test_count_clamp_warnings_excludes_the_synthetic_self_test_probe():

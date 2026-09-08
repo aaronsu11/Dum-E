@@ -689,6 +689,7 @@ def test_connect_asserts_pid_landed_after_the_calibration_assertion():
     """
     calls: List[str] = []
     stub = SimpleNamespace(
+        _prearm_goal_to_present=lambda: calls.append("prearm"),
         robot=SimpleNamespace(connect=lambda calibrate=True: calls.append("robot.connect")),
         _assert_calibration_loaded=lambda: calls.append("calibration"),
         _assert_pid_landed=lambda: calls.append("pid"),
@@ -696,4 +697,213 @@ def test_connect_asserts_pid_landed_after_the_calibration_assertion():
 
     SO10xArmController.connect(stub, calibrate=False)
 
-    assert calls == ["robot.connect", "calibration", "pid"]
+    # The Goal_Position pre-arm leads: it must run while torque is still off,
+    # before `robot.connect()` re-enables it (see the pre-arm section below).
+    assert calls == ["prearm", "robot.connect", "calibration", "pid"]
+
+
+# ---------------------------------------------------------------------------
+# The Goal_Position pre-arm (the connect-time slam guard).
+#
+# Plan 05-06 found this by reading the live registers before commanding
+# anything: with torque OFF after a power cycle, every motor on this arm reports
+# `Goal_Position = 0`. Upstream's `configure()` runs inside `bus.torque_disabled()`,
+# whose `finally` calls `enable_torque()`, and `enable_torque()` writes
+# `Torque_Enable` and `Lock` ONLY -- it never synchronises `Goal_Position` to the
+# present position. So a bare `connect()` commands all six joints to raw tick 0
+# the instant torque returns: a slam of up to ~3090 ticks on `elbow_flex`.
+#
+# 05-06 guarded its own probe and left production `connect()` exposed. These
+# tests move the guard into production, where every caller gets it -- including
+# plan 05-07's live re-baseline, which drives this exact path.
+#
+# Pre-arming with torque disabled cannot itself move the arm; it converts the
+# torque-enable from a move into a hold. These tests therefore prove the guard
+# is WIRED and ORDERED correctly, never that the slam happens.
+# ---------------------------------------------------------------------------
+
+
+class PrearmStubBus:
+    """Stand-in for ``MotorsBus`` covering the pre-arm's register traffic.
+
+    ``sync_read``/``write`` record their keyword arguments because ``normalize``
+    and ``num_retry`` are load-bearing and invisible in the return value:
+    normalization must be OFF (the whole point is raw encoder ticks, and the
+    calibration mapping may not even be loaded yet at pre-arm time), and one
+    dropped Feetech packet must surface as a retry rather than as a phantom
+    mismatch that refuses to connect a healthy arm.
+    """
+
+    def __init__(
+        self,
+        present: Optional[Dict[str, int]] = None,
+        goal: Optional[Dict[str, int]] = None,
+        torque: Optional[Dict[str, int]] = None,
+        writes_take: bool = True,
+    ) -> None:
+        self.motors = list(MOTOR_NAMES)
+        self._present = dict(present or {m: 1000 for m in MOTOR_NAMES})
+        self._goal = dict(goal or {m: 0 for m in MOTOR_NAMES})
+        self._torque = dict(torque or {m: 0 for m in MOTOR_NAMES})
+        self._writes_take = writes_take
+        self.sync_read_calls: List[Dict[str, Any]] = []
+        self.writes: List[Dict[str, Any]] = []
+        self.connected = False
+        self.disconnect_args: List[Any] = []
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def disconnect(self, disable_torque: bool = True) -> None:
+        self.connected = False
+        self.disconnect_args.append(disable_torque)
+
+    def sync_read(self, data_name: str, *, normalize: bool = True, num_retry: int = 0):
+        self.sync_read_calls.append(
+            {"data_name": data_name, "normalize": normalize, "num_retry": num_retry}
+        )
+        table = {
+            "Torque_Enable": self._torque,
+            "Present_Position": self._present,
+            "Goal_Position": self._goal,
+        }[data_name]
+        return dict(table)
+
+    def write(self, data_name: str, motor: str, value: int, *, normalize: bool = True, num_retry: int = 0):
+        self.writes.append(
+            {
+                "data_name": data_name,
+                "motor": motor,
+                "value": value,
+                "normalize": normalize,
+                "num_retry": num_retry,
+            }
+        )
+        if self._writes_take and data_name == "Goal_Position":
+            self._goal[motor] = int(value)
+
+
+def prearm_controller(bus: PrearmStubBus) -> SO10xArmController:
+    """An ``SO10xArmController`` shell wired to ``bus``, built without hardware."""
+    controller = SO10xArmController.__new__(SO10xArmController)
+    controller.robot = SimpleNamespace(bus=bus)
+    controller.config = SimpleNamespace(num_read_retries=2)
+    return controller
+
+
+def test_prearm_writes_present_position_into_goal_when_torque_is_off():
+    """The core guard: Goal_Position becomes Present_Position before torque returns.
+
+    The stub starts in exactly the state 05-06 measured on real hardware --
+    torque off, every `Goal_Position` at 0, the arm physically parked at tick
+    1000. Without the pre-arm, enabling torque would command a -1000 tick jump on
+    every joint.
+    """
+    bus = PrearmStubBus(present={m: 1000 for m in MOTOR_NAMES}, goal={m: 0 for m in MOTOR_NAMES})
+    controller = prearm_controller(bus)
+
+    record = controller._prearm_goal_to_present()
+
+    assert record["prearmed"] is True
+    written = {w["motor"]: w["value"] for w in bus.writes if w["data_name"] == "Goal_Position"}
+    assert written == {m: 1000 for m in MOTOR_NAMES}
+    # The pending jump the guard just neutralised is reported, so a caller can log
+    # how close it came rather than only that it succeeded.
+    assert record["worst_pending_jump_ticks"] == 1000
+
+
+def test_prearm_skips_when_torque_is_already_enabled():
+    """With torque on, Goal_Position is LIVE -- overwriting it is the very command to avoid.
+
+    Writing `Present_Position` into a live `Goal_Position` on an arm already
+    holding position is a no-op at best; on a moving arm it would countermand an
+    in-flight goal. The guard must detect this and decline.
+    """
+    bus = PrearmStubBus(torque={m: 1 for m in MOTOR_NAMES})
+    controller = prearm_controller(bus)
+
+    record = controller._prearm_goal_to_present()
+
+    assert record["prearmed"] is False
+    assert "torque already enabled" in record["reason"]
+    assert [w for w in bus.writes if w["data_name"] == "Goal_Position"] == []
+
+
+def test_prearm_raises_when_the_write_did_not_take():
+    """A write that silently fails must refuse the connect, not proceed hopefully.
+
+    This is the D-02 lesson applied to the pre-arm: a clean write call is not
+    evidence the register changed, so the guard reads back and fails closed.
+    """
+    bus = PrearmStubBus(
+        present={m: 1000 for m in MOTOR_NAMES}, goal={m: 0 for m in MOTOR_NAMES}, writes_take=False
+    )
+    controller = prearm_controller(bus)
+
+    with pytest.raises(RuntimeError, match="pre-arm did not take"):
+        controller._prearm_goal_to_present()
+
+
+def test_prearm_reads_raw_ticks_with_retries():
+    """Normalization OFF and a non-zero retry count on every read."""
+    bus = PrearmStubBus()
+    controller = prearm_controller(bus)
+
+    controller._prearm_goal_to_present()
+
+    assert bus.sync_read_calls, "the pre-arm must read the bus"
+    for call in bus.sync_read_calls:
+        assert call["normalize"] is False, f"{call['data_name']} must be read as raw ticks"
+        assert call["num_retry"] >= 2, f"{call['data_name']} must tolerate a dropped packet"
+    for write in bus.writes:
+        assert write["normalize"] is False
+        assert write["num_retry"] >= 2
+
+
+def test_prearm_leaves_torque_state_exactly_as_found():
+    """`disconnect(False)` -- the guard must not itself change the torque state.
+
+    Passing the default `disable_torque=True` would make the guard mutate the
+    very state it exists to reason about, and on an arm that was already powered
+    it would drop torque under load.
+    """
+    bus = PrearmStubBus()
+    controller = prearm_controller(bus)
+
+    controller._prearm_goal_to_present()
+
+    assert bus.disconnect_args == [False]
+    assert bus.connected is False
+
+
+def test_prearm_disconnects_even_when_the_readback_fails():
+    """The bus must not be left open when the guard raises."""
+    bus = PrearmStubBus(
+        present={m: 1000 for m in MOTOR_NAMES}, goal={m: 0 for m in MOTOR_NAMES}, writes_take=False
+    )
+    controller = prearm_controller(bus)
+
+    with pytest.raises(RuntimeError):
+        controller._prearm_goal_to_present()
+
+    assert bus.connected is False
+    assert bus.disconnect_args == [False]
+
+
+def test_connect_prearms_before_robot_connect():
+    """Ordering is the whole guard: pre-arm must precede the torque-enabling connect.
+
+    Running it afterwards would be strictly useless -- the slam happens inside
+    `robot.connect()`, so a pre-arm that follows it arrives after the damage.
+    """
+    calls: List[str] = []
+    stub = SimpleNamespace(
+        _prearm_goal_to_present=lambda: calls.append("prearm"),
+        robot=SimpleNamespace(connect=lambda calibrate=True: calls.append("robot.connect")),
+        _assert_calibration_loaded=lambda: calls.append("calibration"),
+        _assert_pid_landed=lambda: calls.append("pid"),
+    )
+
+    SO10xArmController.connect(stub, calibrate=False)
+
+    assert calls == ["prearm", "robot.connect", "calibration", "pid"]

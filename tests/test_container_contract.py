@@ -11,11 +11,20 @@ Surfaces covered:
 - Wire contract: the :5555 ``MsgSerializer`` contract is preserved across a real
   socket (get_action 2-tuple with single_arm (1,16,5) / gripper (1,16,1) float32;
   ping non-error; {"error": ...} reply -> RuntimeError).
+- BOTH backend legs: the same three rules — a real socket round trip returns a
+  correctly-shaped chunk, ``ping()`` is truthy against a live mock, and a
+  server-side error reply raises ``RuntimeError`` — are asserted on the
+  ``groot-native`` ZMQ leg AND the ``lerobot`` gRPC leg, parametrized over
+  ``BACKEND_LEGS`` rather than duplicated, because the two legs' return SHAPES
+  differ by design while the RULE is shared.
 - Dependency isolation: the client's declared ``lerobot`` extras stay
   within an allowlist with ``feetech`` required, the pin stays exact, no
   server-only GPU or model package is a DIRECT dependency, the resolved closure
   from ``uv.lock`` carries no server-only package, and ``requires-python`` stays
-  ``>=3.12`` (the client is Py3.12; the server is Py3.10 inside the container).
+  ``>=3.12``. The client is Py3.12. The two policy servers differ and the
+  distinction matters: the Isaac-GR00T container is Py3.10, while the newer
+  ``lerobot-policy`` container is Py3.12 because ``lerobot==0.6.1`` declares
+  ``Requires-Python: >=3.12``.
   Six negative tests drive the helpers with synthetic input to prove the guard
   actually fails when a violation is injected.
 
@@ -45,8 +54,12 @@ import sys
 import threading
 import time
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
+from unittest import mock
 
+import numpy as np
 import pytest
 import zmq
 
@@ -57,11 +70,14 @@ from policy.gr00t.service import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Make scripts/ importable so we can reuse the standalone mock server.
+# Make scripts/ importable so we can reuse the standalone mock servers.
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT))
 
+from mock_grpc_policy_server import start_mock as start_grpc_mock  # noqa: E402
 from mock_policy_server import serve_mock  # noqa: E402
+
+from policy.lerobot import features  # noqa: E402
 
 
 # --- Real-socket harness ----------------------------------------------------
@@ -106,39 +122,22 @@ def _wait_for_port(port: int, host: str = "127.0.0.1", timeout: float = 5.0) -> 
     raise TimeoutError(f"mock server never came up on {host}:{port}")
 
 
-@pytest.fixture
-def mock_server():
-    """Run scripts/mock_policy_server.serve_mock on an ephemeral loopback port.
-
-    Yields the port. The server runs in a daemon thread bound to 127.0.0.1 so it
-    cannot leak beyond the test host; the thread is a daemon so a stray loop
-    cannot wedge interpreter shutdown. A "kill" endpoint cleanly stops the loop.
-    """
-    port = _free_port()
-    thread = threading.Thread(
-        target=serve_mock, kwargs={"port": port, "host": "127.0.0.1"}, daemon=True
-    )
-    thread.start()
-    _wait_for_port(port)
+def _kill_zmq_mock(port: int) -> None:
+    """Stop scripts/mock_policy_server's serve loop via the contract's "kill" endpoint."""
+    ctx = zmq.Context()
+    killer = ctx.socket(zmq.REQ)
+    killer.setsockopt(zmq.LINGER, 0)
+    killer.setsockopt(zmq.RCVTIMEO, 1000)
+    killer.setsockopt(zmq.SNDTIMEO, 1000)
+    killer.connect(f"tcp://127.0.0.1:{port}")
     try:
-        yield port
+        killer.send(MsgSerializer.to_bytes({"endpoint": "kill"}))
+        killer.recv()
+    except zmq.error.ZMQError:
+        pass
     finally:
-        # Cleanly stop the serve loop via the contract's "kill" endpoint.
-        ctx = zmq.Context()
-        killer = ctx.socket(zmq.REQ)
-        killer.setsockopt(zmq.LINGER, 0)
-        killer.setsockopt(zmq.RCVTIMEO, 1000)
-        killer.setsockopt(zmq.SNDTIMEO, 1000)
-        killer.connect(f"tcp://127.0.0.1:{port}")
-        try:
-            killer.send(MsgSerializer.to_bytes({"endpoint": "kill"}))
-            killer.recv()
-        except zmq.error.ZMQError:
-            pass
-        finally:
-            killer.close(linger=0)
-            ctx.term()
-        thread.join(timeout=2.0)
+        killer.close(linger=0)
+        ctx.term()
 
 
 def _client(port: int) -> ExternalRobotInferenceClient:
@@ -148,59 +147,331 @@ def _client(port: int) -> ExternalRobotInferenceClient:
     )
 
 
-# --- Wire contract survives a real socket -----------------------------------
+# --- The two backend legs ----------------------------------------------------
+#
+# The same three RULES hold on both backends over a real loopback socket: a round
+# trip returns a correctly-shaped chunk, ping() is truthy against a live mock, and
+# a server-side error reply raises RuntimeError. The ASSERTION BODIES cannot be
+# shared, because the two legs' return shapes differ BY DESIGN:
+#
+#   groot-native : the ZMQ transport returns an (action_chunk, info) tuple of
+#                  modality arrays {single_arm: (1,16,5), gripper: (1,16,1)}
+#   lerobot      : the backend returns list[dict["<joint>.pos", float]], len 16
+#
+# So the parametrization carries a THIRD element, ``assert_chunk``, holding each
+# leg's own shape assertion. Forcing one body onto both legs would either weaken
+# the incumbent groot-native assertions or fabricate a shape the lerobot leg does
+# not produce. The groot-native assertions below are the incumbent contract,
+# copied unchanged.
 
 
-def test_real_socket_get_action_returns_action_info_tuple(mock_server):
-    """A real client get_action over real TCP returns the (action_chunk, info) tuple.
+class _ZmqLegMock:
+    """The groot-native leg's mock: a daemon-threaded zmq.REP server."""
 
-    Proves the msgpack/numpy bytes (single_arm (1,16,5) / gripper (1,16,1) f32)
-    survive the actual socket round trip — the container boundary.
-    """
-    client = _client(mock_server)
-    try:
-        result = client.get_action({"state": {}})
-        assert isinstance(result, tuple) and len(result) == 2
-        action_chunk, info = result
-        assert set(action_chunk.keys()) == {"single_arm", "gripper"}
-        assert action_chunk["single_arm"].shape == (1, 16, 5)
-        assert action_chunk["gripper"].shape == (1, 16, 1)
-        assert action_chunk["single_arm"].dtype.name == "float32"
-        assert action_chunk["gripper"].dtype.name == "float32"
-        assert isinstance(info, dict)
-    finally:
-        client.socket.close(linger=0)
-        client.context.term()
+    def __init__(self, port: int) -> None:
+        self._port = port
+        self._thread = threading.Thread(
+            target=serve_mock, kwargs={"port": port, "host": "127.0.0.1"}, daemon=True
+        )
+        self._thread.start()
+        _wait_for_port(port)
+
+    def stop(self) -> None:
+        _kill_zmq_mock(self._port)
+        self._thread.join(timeout=2.0)
 
 
-def test_real_socket_ping_returns_truthy(mock_server):
-    """ping() over a real socket returns a truthy/non-error result."""
-    client = _client(mock_server)
-    try:
-        assert client.ping() is True
-    finally:
-        client.socket.close(linger=0)
-        client.context.term()
+class _GrpcLegMock:
+    """The lerobot leg's mock: a real grpc.Server, stopped by its own handle."""
+
+    def __init__(self, port: int, mode: str = "ok") -> None:
+        self._server = start_grpc_mock(port, "127.0.0.1", mode=mode)
+        _wait_for_port(port)
+
+    def stop(self) -> None:
+        self._server.stop(grace=0)
 
 
-def test_real_socket_error_reply_raises_runtimeerror():
-    """A server replying {"error": "boom"} over a real socket -> RuntimeError("boom")."""
-    port = _free_port()
+class _ZmqLegClient:
+    """A real ExternalRobotInferenceClient over a real ZMQ REQ socket."""
+
+    def __init__(self, port: int) -> None:
+        self._client = _client(port)
+
+    def get_chunk(self) -> Any:
+        return self._client.get_action({"state": {}})
+
+    def ping(self) -> bool:
+        return self._client.ping()
+
+    def close(self) -> None:
+        self._client.socket.close(linger=0)
+        self._client.context.term()
+
+
+class _LerobotLegClient:
+    """The real LeRobotPolicyBackend over a real gRPC channel."""
+
+    def __init__(self, port: int) -> None:
+        from policy.lerobot.backend import LeRobotPolicyBackend
+
+        # Scrub the DUME_LEROBOT_* variables for the duration of construction:
+        # the backend reads them, and an operator's exported value would otherwise
+        # change the handshake this suite asserts on. patch.dict restores them.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for name in (
+                "DUME_LEROBOT_POLICY_PORT",
+                "DUME_LEROBOT_POLICY_TYPE",
+                "DUME_LEROBOT_CHECKPOINT_PATH",
+                "DUME_LEROBOT_ACTIONS_PER_CHUNK",
+                "DUME_LEROBOT_POLICY_DEVICE",
+            ):
+                os.environ.pop(name, None)
+            self._backend = LeRobotPolicyBackend(host="127.0.0.1", port=port)
+        self._backend.set_lang_instruction("pick up the banana")
+
+    def get_chunk(self) -> Any:
+        return self._backend.get_action(_lerobot_observation())
+
+    def ping(self) -> bool:
+        return self._backend.ping()
+
+    def close(self) -> None:
+        self._backend.close()
+
+
+def _lerobot_observation(height: int = 64, width: int = 64) -> dict:
+    """The FLAT observation shape IRobotController.get_observation() produces."""
+    obs: dict = {
+        cam: np.random.randint(0, 255, (height, width, 3), dtype=np.uint8)
+        for cam in features.CAMERA_KEYS
+    }
+    for joint in features.ROBOT_STATE_KEYS:
+        obs[joint] = 0.0
+    return obs
+
+
+def _assert_groot_native_chunk(result: Any) -> None:
+    """The INCUMBENT groot-native assertions, unchanged."""
+    assert isinstance(result, tuple) and len(result) == 2
+    action_chunk, info = result
+    assert set(action_chunk.keys()) == {"single_arm", "gripper"}
+    assert action_chunk["single_arm"].shape == (1, 16, 5)
+    assert action_chunk["gripper"].shape == (1, 16, 1)
+    assert action_chunk["single_arm"].dtype.name == "float32"
+    assert action_chunk["gripper"].dtype.name == "float32"
+    assert isinstance(info, dict)
+
+
+def _assert_lerobot_chunk(result: Any) -> None:
+    """The lerobot leg's normalized contract: 16 dicts of six named floats."""
+    assert isinstance(result, list)
+    assert len(result) == 16
+    expected = list(features.ROBOT_STATE_KEYS)
+    for step in result:
+        # Ordered comparison: a permuted dict with the right keys passes a set
+        # comparison and still commands the wrong joints.
+        assert list(step) == expected
+        assert all(isinstance(value, float) for value in step.values())
+
+
+def _start_zmq_error_server(port: int) -> Any:
+    """A one-shot zmq.REP server replying {"error": "boom"}; returns a stop handle."""
     thread = threading.Thread(
         target=_serve_error, kwargs={"port": port, "message": "boom"}, daemon=True
     )
     thread.start()
     _wait_for_port(port)
+
+    class _Handle:
+        def stop(self) -> None:
+            thread.join(timeout=2.0)
+
+    return _Handle()
+
+
+def _provoke_groot_native_error(port: int) -> None:
+    """Make the call that must raise on the groot-native leg."""
     client = _client(port)
     try:
-        with pytest.raises(RuntimeError, match="boom"):
-            client.call_endpoint(
-                "get_action", {"observation": {}, "options": None}
-            )
+        client.call_endpoint("get_action", {"observation": {}, "options": None})
     finally:
         client.socket.close(linger=0)
         client.context.term()
-        thread.join(timeout=2.0)
+
+
+def _provoke_lerobot_error(port: int) -> None:
+    """Make the call that must raise on the lerobot leg (handshake or chunk)."""
+    client = _LerobotLegClient(port)
+    try:
+        client.get_chunk()
+    finally:
+        client.close()
+
+
+@dataclass(frozen=True)
+class BackendErrorCase:
+    """One server-side error SHAPE for one leg."""
+
+    id: str
+    start: Callable[[int], Any]
+    provoke: Callable[[int], None]
+    match: str
+
+
+@dataclass(frozen=True)
+class BackendLeg:
+    """One backend's real-socket harness plus its own chunk assertion."""
+
+    id: str
+    mock_factory: Callable[[int], Any]
+    client_factory: Callable[[int], Any]
+    assert_chunk: Callable[[Any], None]
+    error_cases: tuple[BackendErrorCase, ...]
+
+
+BACKEND_LEGS = (
+    BackendLeg(
+        id="groot-native",
+        mock_factory=_ZmqLegMock,
+        client_factory=_ZmqLegClient,
+        assert_chunk=_assert_groot_native_chunk,
+        error_cases=(
+            BackendErrorCase(
+                id="error-reply",
+                start=_start_zmq_error_server,
+                provoke=_provoke_groot_native_error,
+                match="boom",
+            ),
+        ),
+    ),
+    BackendLeg(
+        id="lerobot",
+        mock_factory=_GrpcLegMock,
+        client_factory=_LerobotLegClient,
+        assert_chunk=_assert_lerobot_chunk,
+        # TWO error shapes, not one: this wire can fail in two distinct ways that
+        # a single case would conflate. "refuse" is a FAILED_PRECONDITION abort
+        # (the shape a SAFE-01 guard refusal takes, deliberately non-retryable);
+        # "empty" is a SUCCESSFUL RPC carrying zero-length Actions.data, which is
+        # what upstream actually emits when GetActions swallows an exception.
+        error_cases=(
+            BackendErrorCase(
+                id="refused-handshake",
+                start=lambda port: _GrpcLegMock(port, mode="refuse"),
+                provoke=_provoke_lerobot_error,
+                match="SAFE-01/2",
+            ),
+            BackendErrorCase(
+                id="empty-actions",
+                start=lambda port: _GrpcLegMock(port, mode="empty"),
+                provoke=_provoke_lerobot_error,
+                # NOT merely "any RuntimeError": the empty case must be named, or
+                # this assertion would also pass on an EOFError-shaped failure.
+                match="ZERO-LENGTH action chunk",
+            ),
+        ),
+    ),
+)
+
+#: Flattened (leg, case) pairs, DERIVED from BACKEND_LEGS so the parametrize ids
+#: carry each leg's id and a per-shape suffix.
+BACKEND_ERROR_CASES = tuple(
+    (leg, case) for leg in BACKEND_LEGS for case in leg.error_cases
+)
+
+
+# --- Wire contract survives a real socket, on BOTH legs ----------------------
+
+
+@pytest.mark.parametrize("leg", BACKEND_LEGS, ids=lambda leg: leg.id)
+def test_real_socket_get_action_returns_the_leg_contract(leg):
+    """A real client over real TCP returns THIS leg's chunk contract.
+
+    Proves the bytes survive an actual socket round trip — the container
+    boundary — for both backends. The assertion is on the DECODED chunk, never on
+    the call merely returning: the lerobot wire can deliver a SUCCESSFUL RPC
+    carrying zero bytes, which a "did it return" check would pass.
+    """
+    port = _free_port()
+    server = leg.mock_factory(port)
+    try:
+        client = leg.client_factory(port)
+        try:
+            leg.assert_chunk(client.get_chunk())
+        finally:
+            client.close()
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize("leg", BACKEND_LEGS, ids=lambda leg: leg.id)
+def test_real_socket_ping_returns_truthy(leg):
+    """ping() over a real socket returns True against a live mock, on both legs."""
+    port = _free_port()
+    server = leg.mock_factory(port)
+    try:
+        client = leg.client_factory(port)
+        try:
+            assert client.ping() is True
+        finally:
+            client.close()
+    finally:
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    "leg,case", BACKEND_ERROR_CASES, ids=lambda item: getattr(item, "id", "")
+)
+def test_real_socket_error_reply_raises_runtimeerror(leg, case):
+    """A server-side error reply over a real socket raises RuntimeError, on both legs.
+
+    The match is per-shape rather than a bare ``RuntimeError``: on the lerobot leg
+    the two shapes are a non-retryable FAILED_PRECONDITION refusal and a
+    zero-length action payload, and accepting any RuntimeError would let the
+    zero-length guard be replaced by an EOFError without the suite noticing.
+    """
+    port = _free_port()
+    server = case.start(port)
+    try:
+        with pytest.raises(RuntimeError, match=re.escape(case.match)):
+            case.provoke(port)
+    finally:
+        server.stop()
+
+
+def test_both_legs_bind_distinct_ephemeral_ports_in_one_session():
+    """BACK-07 adjacency edge, at the suite level: the two mocks coexist.
+
+    Two mocks that collided on a port would make the parametrized suite above
+    pass or fail depending on test ORDER — the worst kind of green. Both legs are
+    started in one test, both are exercised, one is stopped, and the other is
+    proven to still answer.
+    """
+    ports = {leg.id: _free_port() for leg in BACKEND_LEGS}
+    assert len(set(ports.values())) == len(BACKEND_LEGS), ports
+
+    servers = {leg.id: leg.mock_factory(ports[leg.id]) for leg in BACKEND_LEGS}
+    try:
+        for leg in BACKEND_LEGS:
+            client = leg.client_factory(ports[leg.id])
+            try:
+                leg.assert_chunk(client.get_chunk())
+            finally:
+                client.close()
+
+        # Stop the lerobot leg; the groot-native leg must be untouched.
+        servers["lerobot"].stop()
+        groot = BACKEND_LEGS[0]
+        client = groot.client_factory(ports[groot.id])
+        try:
+            assert client.ping() is True
+            groot.assert_chunk(client.get_chunk())
+        finally:
+            client.close()
+    finally:
+        for server in servers.values():
+            server.stop()
 
 
 # --- Dependency isolation guard ---------------------------------------------
@@ -656,6 +927,14 @@ def test_guard_rejects_requirement_declaring_no_extras():
 
 
 def test_client_requires_python_stays_312():
-    """The client interpreter floor stays >=3.12 (server is Py3.10 in-container)."""
+    """The client interpreter floor stays >=3.12.
+
+    The floor is load-bearing and unchanged. What needed clarifying is WHICH
+    container is which: the Isaac-GR00T inference container is Py3.10, while the
+    newer ``lerobot-policy`` container is Py3.12 because
+    ``lerobot-0.6.1.dist-info/METADATA`` declares ``Requires-Python: >=3.12``. So
+    "the server is Py3.10" is true only of the older of the two, and the client's
+    ``>=3.12`` floor is what lets it import ``lerobot.transport`` at all.
+    """
     text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'requires-python = ">=3.12"' in text

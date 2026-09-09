@@ -7,7 +7,7 @@ dependencies = [
     "fastapi>=0.129.0",
     "fastmcp>=2.14.5",
     "langfuse>=3.14.3",
-    "lerobot[feetech]==0.6.1",
+    "lerobot[async,feetech]==0.6.1",
     "loguru>=0.7.3",
     "matplotlib>=3.10.8",
     "msgpack>=1.0",

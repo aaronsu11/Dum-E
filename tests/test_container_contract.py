@@ -242,10 +242,16 @@ def test_real_socket_error_reply_raises_runtimeerror():
 # ``FORBIDDEN_RESOLVED_PACKAGES``.
 
 # An ALLOWLIST, not a denylist: an extra that is not named here fails by
-# default, so a new heavyweight extra cannot slip in unnoticed. A later phase
-# widens this set to include lerobot's async extra — that widening must be a
-# deliberate edit here, not a surprise failure.
-LEROBOT_EXTRAS_ALLOWLIST = frozenset({"feetech"})
+# default, so a new heavyweight extra cannot slip in unnoticed. Phase 6 (the
+# LeRobot policy container + gRPC backend) IS the "later phase" this comment
+# predicted: it widens the set to include lerobot's ``async`` extra, because
+# ``lerobot.async_inference`` fails closed without ``grpcio``
+# (``lerobot/async_inference/__init__.py`` raises "'grpcio' is required but not
+# installed. Install it with: pip install 'lerobot[async]'"), and the gRPC
+# policy session cannot exist without it. That widening landed as a deliberate
+# edit here in the same commit as the ``pyproject.toml`` change — not as a
+# surprise failure — behind the human-approved supply-chain gate recorded above.
+LEROBOT_EXTRAS_ALLOWLIST = frozenset({"feetech", "async"})
 
 # Server-only GPU and model packages that must never be DIRECT client
 # declarations. This is the ONLY place torch and the nvidia-cuda prefix belong:

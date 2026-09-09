@@ -145,6 +145,21 @@ def _spawn_agent_worker(
             controller_cfg["max_relative_target"]
         )
 
+    # The five LeRobot handshake values (D-11), forwarded on exactly the same
+    # terms: only when the config names the key, so every default lives solely in
+    # policy/lerobot/backend.py and cannot drift between the launcher and the
+    # process that owns inference. The backend int()-coerces the two numeric ones,
+    # so str() here is the whole stringification contract.
+    for config_key, env_key in (
+        ("lerobot_policy_port", "DUME_LEROBOT_POLICY_PORT"),
+        ("lerobot_policy_type", "DUME_LEROBOT_POLICY_TYPE"),
+        ("lerobot_checkpoint_path", "DUME_LEROBOT_CHECKPOINT_PATH"),
+        ("lerobot_actions_per_chunk", "DUME_LEROBOT_ACTIONS_PER_CHUNK"),
+        ("lerobot_policy_device", "DUME_LEROBOT_POLICY_DEVICE"),
+    ):
+        if config_key in controller_cfg:
+            policy_env_defaults[env_key] = str(controller_cfg[config_key])
+
     for env_key, config_value in policy_env_defaults.items():
         # setdefault: only apply the config/default value when the operator has
         # not already exported the variable in the shell environment.
@@ -210,6 +225,20 @@ def _spawn_agent_worker(
         clamp_display,
         agent_args,
     )
+    if policy_backend_display == "lerobot":
+        # D-11: actions_per_chunk must be readable from a log line without
+        # reading code, because 40 is the well-lit wrong value. "backend default"
+        # rather than a restated literal — the authoritative effective value is
+        # logged by the backend itself at construction.
+        logger.info(
+            "LeRobot handshake (effective) port={} policy_type={} "
+            "checkpoint_path={} actions_per_chunk={} device={}",
+            env.get("DUME_LEROBOT_POLICY_PORT", "backend default"),
+            env.get("DUME_LEROBOT_POLICY_TYPE", "backend default"),
+            env.get("DUME_LEROBOT_CHECKPOINT_PATH", "backend default"),
+            env.get("DUME_LEROBOT_ACTIONS_PER_CHUNK", "backend default"),
+            env.get("DUME_LEROBOT_POLICY_DEVICE", "backend default"),
+        )
     return subprocess.Popen(cmd, env=env)
 
 

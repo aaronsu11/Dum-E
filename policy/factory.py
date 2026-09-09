@@ -37,14 +37,14 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
     Args:
         **kwargs: Forwarded verbatim to the selected backend's constructor
             (``host``, ``port``, ``camera_keys``, ``robot_state_keys``,
-            ``show_images``, ``language_instruction`` for ``groot-native``), so
-            every constructor default stays reachable.
+            ``show_images``, ``language_instruction`` — the SAME keyword set for
+            both backends), so every constructor default stays reachable.
 
     Returns:
         A concrete :class:`shared.IPolicyBackend`.
 
     Raises:
-        ValueError: on an unknown value, or on a known-but-unwired backend.
+        ValueError: on an unknown value.
     """
     backend = os.getenv(POLICY_BACKEND_ENV_VAR, DEFAULT_POLICY_BACKEND)
 
@@ -62,21 +62,20 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
         )
 
     if backend == "lerobot":
-        # Known but NOT wired yet. Raise with the variable, the selected value and
-        # what works today — never a silent swap to a different backend. Reached by
-        # the unset default too, since DEFAULT_POLICY_BACKEND is 'lerobot'.
-        raise ValueError(
-            f"{POLICY_BACKEND_ENV_VAR}={backend!r} requires the LeRobot policy "
-            "backend, which is not implemented yet in this release. "
-            f"Set {POLICY_BACKEND_ENV_VAR}=groot-native to use the currently "
-            "functional Isaac-GR00T native backend."
-        )
+        # Lazy-import INSIDE the branch, and this is the branch that proves why the
+        # discipline exists: this import DOES pull the LeRobot policy stack (torch
+        # and grpc, transitively), so at module scope it would make every
+        # groot-native process pay for a stack it never uses. Asserted by
+        # tests/test_policy_backend.py::test_factory_module_import_pulls_no_torch_or_lerobot,
+        # which runs in a subprocess so the rest of the suite cannot mask it.
+        from policy.lerobot.backend import LeRobotPolicyBackend
+
+        return LeRobotPolicyBackend(**kwargs)
 
     if backend == "groot-native":
-        # Lazy-import inside the branch: the 'lerobot' branch will pull the
-        # LeRobot policy stack (torch/GPU, and gRPC for async inference) once it is
-        # wired, and this torch-free path must not pay for it. The GR00T
-        # transport (policy/gr00t/service.py) depends only on msgpack/numpy/zmq.
+        # Lazy-import inside the branch, for the same reason as above: the GR00T
+        # transport (policy/gr00t/service.py) depends only on msgpack/numpy/zmq and
+        # must not be dragged in by a lerobot selection either.
         from embodiment.so_arm10x.controller import Gr00tRobotInferenceClient
 
         return Gr00tRobotInferenceClient(**kwargs)

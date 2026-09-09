@@ -186,10 +186,127 @@ def assert_groot_serving_contract(snapshot: GrootGuardSnapshot) -> None:
     by a short condition name, embeds the OBSERVED value, and closes by saying what the
     guard is refusing to do and why — the ``policy/factory.py:57-62`` idiom.
     """
-    # RED PLACEHOLDER: the five assertion groups land in this plan's GREEN commit. This
-    # body exists only so the behaviour tests are collectable and fail on
-    # "DID NOT RAISE ValueError" — an assertion-level RED on the planned behaviour rather
-    # than an uninformative collection error.
+    # --- SAFE-01/1: the resolved path really is our raw fine-tune -------------
+    if not snapshot.is_raw_checkpoint:
+        raise ValueError(
+            f"SAFE-01/1 base_model_path: is_raw_groot_n1_7_checkpoint("
+            f"{snapshot.base_model_path!r}) is False. The checkpoint bind-mount is missing "
+            f"or wrong, or the path resolved to the hub default "
+            f"{_HUB_DEFAULT_BASE_MODEL!r} (configuration_groot.py:382-383). Refusing to "
+            f"serve base weights in place of the fine-tuned SO101 checkpoint."
+        )
+    if not snapshot.assets_present:
+        raise ValueError(
+            f"SAFE-01/1 checkpoint_assets: assets_present={snapshot.assets_present!r} for "
+            f"{snapshot.base_model_path!r}, so LeRobot resolved no checkpoint sidecars. "
+            f"Every checkpoint-derived setting — percentiles, relative decoding, the stats "
+            f"table and the image geometry — would silently fall back to LeRobot defaults. "
+            f"Refusing to serve a checkpoint whose own configuration is not being read."
+        )
+
+    # --- SAFE-01/2: the horizon is 16 at CONFIG level ------------------------
+    # Deliberately NOT a check on the emitted chunk length: three independent truncations
+    # force 16 regardless of configuration (T=16, T=40 and T=50 all decode to (1,16,6)), so
+    # an emitted 16 proves nothing. See test_chunk_length_sixteen_is_not_horizon_evidence.
+    if snapshot.embodiment_tag != EXPECTED_TAG:
+        raise ValueError(
+            f"SAFE-01/2 embodiment_tag is {snapshot.embodiment_tag!r}, expected "
+            f"{EXPECTED_TAG!r}. This checkpoint carries 9 embodiment tags and only "
+            f"{EXPECTED_TAG!r} has {EXPECTED_HORIZON} delta_indices; the other 8 have 40. "
+            f"Every statistics lookup and the horizon read are keyed by this tag, so a "
+            f"wrong tag silently selects another embodiment's normalization. Refusing to "
+            f"decode actions against the wrong embodiment's statistics."
+        )
+    if snapshot.checkpoint_horizon != EXPECTED_HORIZON:
+        raise ValueError(
+            f"SAFE-01/2 horizon: the checkpoint's delta_indices give "
+            f"{snapshot.checkpoint_horizon}, expected {EXPECTED_HORIZON}. GrootConfig's own "
+            f"default is 40 and the checkpoint's config.json says action_horizon: 40 — both "
+            f"are traps, and neither is the horizon this checkpoint decodes. Refusing to "
+            f"serve a horizon the per-timestep relative statistics do not cover."
+        )
+    if snapshot.configured_actions_per_chunk != snapshot.checkpoint_horizon:
+        raise ValueError(
+            f"SAFE-01/2 configured actions_per_chunk="
+            f"{snapshot.configured_actions_per_chunk} disagrees with the checkpoint's "
+            f"delta_indices ({snapshot.checkpoint_horizon}). The horizon is configurable "
+            f"(D-11), so it can be configured wrong; refusing to obey a configured horizon "
+            f"the checkpoint cannot decode."
+        )
+
+    # --- SAFE-01/3: relative-action decoding is on and native ----------------
+    if not snapshot.use_relative_action:
+        raise ValueError(
+            f"SAFE-01/3 use_relative_action is {snapshot.use_relative_action!r} in the "
+            f"checkpoint's processor_config.json. This checkpoint is relative-arm / "
+            f"absolute-gripper; reading its output as a flat absolute 6-vector inflates "
+            f"commanded motion 1.83x-3.01x and the arm snaps, silently. Refusing to command "
+            f"an arm from mis-decoded actions."
+        )
+    if snapshot.decode_step_type != EXPECTED_DECODE_STEP:
+        raise ValueError(
+            f"SAFE-01/3 postprocessor decode step is {snapshot.decode_step_type}, expected "
+            f"{EXPECTED_DECODE_STEP}. GrootActionUnpackUnnormalizeStep means the "
+            f"relative-aware decoder was NOT installed (processor_groot.py:1297-1320) — it "
+            f"is reached only when the checkpoint's stats are unusable, and it is "
+            f"deliberately stubbed for native relative actions. Refusing to serve with the "
+            f"identity-normalizing decoder."
+        )
+
+    # --- SAFE-01/4: normalization has NOT fallen back to identity ------------
+    # The discriminating signals, not GrootConfig.normalization_mapping — that field is
+    # IDENTITY by design here and is not consulted upstream (see the module docstring).
+    if not snapshot.stats_non_empty:
+        raise ValueError(
+            f"SAFE-01/4 checkpoint stats are empty (stats_non_empty="
+            f"{snapshot.stats_non_empty!r}) for embodiment tag "
+            f"{snapshot.embodiment_tag!r}: the decoder would return normalized [-1, 1] "
+            f"actions while every log line looked healthy. Refusing to serve normalized "
+            f"actions as if they were joint targets."
+        )
+    if not snapshot.use_percentiles:
+        raise ValueError(
+            f"SAFE-01/4 use_percentiles is {snapshot.use_percentiles!r}; this checkpoint "
+            f"normalizes with q01/q99 percentiles (use_mean_std: False), so min/max "
+            f"normalization would rescale every action. Refusing to unnormalize with the "
+            f"wrong statistic."
+        )
+
+    # --- SAFE-01/5: image geometry and eval-mode determinism -----------------
+    if snapshot.letter_box_transform:
+        raise ValueError(
+            f"SAFE-01/5 letter_box_transform is {snapshot.letter_box_transform!r}; this "
+            f"checkpoint requires False (crop-then-resize, not letterbox). The letterbox "
+            f"branch yields a 256x256 frame where this checkpoint's recipe yields 256x340, "
+            f"so the model would see a geometry it was not trained on. Refusing to serve "
+            f"the wrong image geometry."
+        )
+    if (
+        snapshot.crop_fraction != EXPECTED_CROP_FRACTION
+        or snapshot.shortest_image_edge != EXPECTED_SHORTEST_IMAGE_EDGE
+        or not snapshot.use_albumentations
+    ):
+        raise ValueError(
+            f"SAFE-01/5 image geometry: crop_fraction={snapshot.crop_fraction} "
+            f"(want {EXPECTED_CROP_FRACTION}), "
+            f"shortest_image_edge={snapshot.shortest_image_edge} "
+            f"(want {EXPECTED_SHORTEST_IMAGE_EDGE}), "
+            f"use_albumentations={snapshot.use_albumentations} (want True). The effective "
+            f"recipe is resize-shortest-edge-to-256 -> center-crop-95% -> "
+            f"resize-shortest-edge-to-256; any of these three moving changes what the VLM "
+            f"sees. Refusing to serve a preprocessing path the checkpoint was not trained "
+            f"with."
+        )
+    if snapshot.preprocessor_training or snapshot.encode_step_training:
+        raise ValueError(
+            f"SAFE-01/5 processor is in TRAINING mode: "
+            f"preprocessor_training={snapshot.preprocessor_training!r}, "
+            f"encode_step_training={snapshot.encode_step_training!r}. Training mode enables "
+            f"Isaac's train-time random crop and this checkpoint's state dropout "
+            f"(state_dropout_prob: 0.2), so identical observations would produce different "
+            f"chunks. Refusing to serve a non-deterministic preprocessing path."
+        )
+
     return None
 
 

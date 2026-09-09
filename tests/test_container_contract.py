@@ -205,6 +205,42 @@ def test_real_socket_error_reply_raises_runtimeerror():
 
 # --- Dependency isolation guard ---------------------------------------------
 
+# RECORDED SUPPLY-CHAIN GATE — the two packages the ``async`` extra introduces.
+#
+# Widening the allowlist below to include ``async`` pulls exactly two names into
+# the client closure, and BOTH were reviewed and approved by a human before the
+# single ``uv add`` ran. Recorded here, at the guard that lets them in, so the
+# approval is greppable from the code rather than buried in a chat log:
+#
+#   * ``grpcio``   — the gRPC project's official PyPI distribution
+#     (https://pypi.org/project/grpcio/, homepage https://grpc.io). GENUINELY
+#     NEW to the closure. Declared by the installed wheel's own metadata as
+#     ``grpcio<2.0.0,>=1.73.1; extra == "grpcio-dep"``
+#     (lerobot-0.6.1.dist-info/METADATA:81) — upstream's range, not one this
+#     project chose — and named by lerobot's own fail-closed import guard:
+#     ``import lerobot.transport`` raises "'grpcio' is required but not
+#     installed. Install it with: pip install 'lerobot[grpcio-dep]'".
+#   * ``protobuf`` — Google's Protocol Buffers runtime
+#     (https://pypi.org/project/protobuf/). Declared as
+#     ``protobuf<8.0.0,>=6.31.1; extra == "grpcio-dep"`` (METADATA:82) and
+#     ALREADY RESOLVED at 6.33.6, so it is not actually entering the
+#     environment — only being re-declared through an extra.
+#
+# An automated legitimacy audit returned [SUS] for both. Both verdicts were
+# ACCEPTED AS FALSE POSITIVES of a ``too-new`` + ``unknown-downloads`` recency
+# heuristic in which ``publishedAt`` is the most recent release date of a
+# long-established project rather than the project's age. Neither name was
+# invented by a researcher: both are reached transitively via
+# ``lerobot[async] -> lerobot[grpcio-dep]`` (METADATA:227). The version decision
+# that actually matters — ``lerobot==0.6.1`` — is the unchanged incumbent pin.
+#
+# ``async`` was chosen over the leaner ``grpcio-dep`` deliberately: it is the
+# extra lerobot's own ImportError names, and it is the one this comment
+# predicted. ``matplotlib`` arrives with it (via ``lerobot[matplotlib-dep]``)
+# and trips nothing — ``pyproject.toml`` already declares ``matplotlib``
+# directly, and the name is in neither ``FORBIDDEN_DIRECT_DEPENDENCIES`` nor
+# ``FORBIDDEN_RESOLVED_PACKAGES``.
+
 # An ALLOWLIST, not a denylist: an extra that is not named here fails by
 # default, so a new heavyweight extra cannot slip in unnoticed. A later phase
 # widens this set to include lerobot's async extra — that widening must be a

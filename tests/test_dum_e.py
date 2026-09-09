@@ -706,6 +706,129 @@ class TestSpawnAgentWorker:
         assert mock_popen.call_args[1]["env"]["DUME_MAX_RELATIVE_TARGET"] == "12.5"
 
     @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_forwards_lerobot_handshake_keys_from_config(
+        self, mock_popen
+    ):
+        """The five D-11 handshake values reach the worker as DUME_LEROBOT_* vars.
+
+        These decide which network endpoint serves the policy, which checkpoint
+        the server resolves, and how many action steps come back — so they must
+        be configuration rather than constructor defaults nobody reads.
+        `actions_per_chunk` is the load-bearing one: 40 is the well-lit wrong
+        value (GrootConfig's default AND the checkpoint's own config.json), and
+        16 is correct.
+        """
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        controller_config = {
+            "lerobot_policy_port": 8080,
+            "lerobot_policy_type": "groot",
+            "lerobot_checkpoint_path": "/checkpoints/model",
+            "lerobot_actions_per_chunk": 16,
+            "lerobot_policy_device": "cuda",
+        }
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config=controller_config
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_LEROBOT_POLICY_PORT"] == "8080"
+        assert env["DUME_LEROBOT_POLICY_TYPE"] == "groot"
+        assert env["DUME_LEROBOT_CHECKPOINT_PATH"] == "/checkpoints/model"
+        assert env["DUME_LEROBOT_ACTIONS_PER_CHUNK"] == "16"
+        assert env["DUME_LEROBOT_POLICY_DEVICE"] == "cuda"
+
+        # Env vars are strings; the backend int()-coerces both numeric ones, so
+        # the forwarded spellings have to parse back.
+        assert int(env["DUME_LEROBOT_POLICY_PORT"]) == 8080
+        assert int(env["DUME_LEROBOT_ACTIONS_PER_CHUNK"]) == 16
+
+        # The LeRobot port is DISTINCT from the GR00T-native ZMQ port. Reusing one
+        # key for both backends is exactly the wrong-port trap the pair avoids.
+        assert "DUME_LEROBOT_POLICY_PORT" != "DUME_POLICY_PORT"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_omits_lerobot_keys_the_config_does_not_name(
+        self, mock_popen
+    ):
+        """A key the config does not name is not forwarded at all.
+
+        Every default lives in exactly ONE place — policy/lerobot/backend.py, the
+        module that owns the handshake — so restating it in the launcher could
+        only drift from the process that actually talks to the policy server.
+        """
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        lerobot_vars = (
+            "DUME_LEROBOT_POLICY_PORT",
+            "DUME_LEROBOT_POLICY_TYPE",
+            "DUME_LEROBOT_CHECKPOINT_PATH",
+            "DUME_LEROBOT_ACTIONS_PER_CHUNK",
+            "DUME_LEROBOT_POLICY_DEVICE",
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(config, agent_args, controller_config={})
+        env = mock_popen.call_args[1]["env"]
+        for name in lerobot_vars:
+            assert name not in env, name
+
+        # Naming ONE key forwards only that key.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config,
+                agent_args,
+                controller_config={"lerobot_actions_per_chunk": 16},
+            )
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_LEROBOT_ACTIONS_PER_CHUNK"] == "16"
+        for name in lerobot_vars:
+            if name != "DUME_LEROBOT_ACTIONS_PER_CHUNK":
+                assert name not in env, name
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_shell_env_lerobot_keys_override_config(
+        self, mock_popen
+    ):
+        """An exported DUME_LEROBOT_* value must WIN over the config file.
+
+        Precedence is shell env > config > backend default (env.setdefault, never
+        env.update). An operator pinning the action horizon or the checkpoint path
+        for a debugging run must not be silently overridden by a stale
+        my-dum-e.yaml.
+        """
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        controller_config = {
+            "lerobot_actions_per_chunk": 16,
+            "lerobot_policy_port": 8080,
+            # NOT exported below, so this key proves the test is non-vacuous: with
+            # no forwarding at all, an exported value survives trivially, and only
+            # a config-sourced value can distinguish setdefault from no-op.
+            "lerobot_policy_device": "cuda",
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DUME_LEROBOT_ACTIONS_PER_CHUNK": "40",
+                "DUME_LEROBOT_POLICY_PORT": "9099",
+            },
+            clear=True,
+        ):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config=controller_config
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_LEROBOT_ACTIONS_PER_CHUNK"] == "40"
+        assert env["DUME_LEROBOT_POLICY_PORT"] == "9099"
+        # The un-exported key still comes from the config file.
+        assert env["DUME_LEROBOT_POLICY_DEVICE"] == "cuda"
+
+    @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_env_inheritance(self, mock_popen):
         """Test that agent worker inherits current environment."""
         config = BackendConfig(namespace="test")

@@ -4,7 +4,9 @@ Covers the policy-backend selection seam:
 - ``IPolicyBackend`` covers every existing policy call site.
 - Omitting ``DUME_POLICY_BACKEND`` selects ``lerobot``.
 - An unknown value RAISES (never warn-and-fall-back).
-- ``lerobot`` raises an actionable "not implemented yet" error.
+- ``lerobot`` is CONSTRUCTIBLE and is an ``IPolicyBackend`` — it stopped raising
+  "not implemented yet" in phase 06 plan 04; the wire-level contract for that
+  backend lives in ``tests/test_lerobot_backend.py``.
 - ``groot-native`` stays selectable AND functional — proven end to end
   against the real ``scripts/mock_policy_server.py`` over a real loopback ZMQ
   socket, not a mocked transport.
@@ -201,39 +203,47 @@ def test_unknown_backend_raises_with_value_and_allowlist():
 def test_default_backend_is_lerobot():
     """With DUME_POLICY_BACKEND unset, the selected backend is 'lerobot'.
 
-    Observable through the lerobot branch's own raise — proving the CODE-level
-    default rather than a config-file default. clear=True guarantees no inherited
-    DUME_POLICY_BACKEND leaks in from the runner environment.
+    Observable through the TYPE the factory returns — proving the CODE-level
+    default rather than a config-file default. Until phase 06 plan 04 this was
+    observable through the lerobot branch's own raise; that raise is gone, so the
+    default is now asserted on the constructed object instead. clear=True
+    guarantees no inherited DUME_POLICY_BACKEND leaks in from the runner
+    environment.
     """
     assert DEFAULT_POLICY_BACKEND == "lerobot"
 
     with mock.patch.dict(os.environ, {}, clear=True):
         assert os.getenv("DUME_POLICY_BACKEND") is None
-        with pytest.raises(ValueError) as excinfo:
-            make_policy_backend(host="127.0.0.1")
+        backend = make_policy_backend(host="127.0.0.1", port=_free_port())
 
-    assert "lerobot" in str(excinfo.value)
+    try:
+        assert type(backend).__name__ == "LeRobotPolicyBackend"
+        assert isinstance(backend, IPolicyBackend)
+    finally:
+        backend.close()
 
 
-def test_lerobot_backend_raises_actionable_not_implemented():
-    """'lerobot' is KNOWN but not wired yet — raise actionably.
+def test_lerobot_backend_is_constructible_and_is_an_ipolicybackend():
+    """'lerobot' returns a backend, and CONSTRUCTION does not connect.
 
-    The message must name the variable, the selected value, the fact that the
-    backend is not implemented, and the alternative that works today. It is
-    operator-facing, so it says what the state IS rather than citing a roadmap
-    identifier the operator has no access to.
+    Two claims. (1) The branch no longer raises: the single not-implemented
+    ``raise`` this whole phase existed to replace is gone. (2) Construction opens a
+    channel but calls nothing — a gRPC channel is lazy — so a backend built
+    against an unbound port must come back cleanly and report ``ping() is False``
+    rather than raising. A ``ping()`` that returned True against an unbound port
+    would mean it is not probing the socket at all.
     """
+    port = _free_port()
     with mock.patch.dict(
         os.environ, {"DUME_POLICY_BACKEND": "lerobot"}, clear=True
     ):
-        with pytest.raises(ValueError) as excinfo:
-            make_policy_backend(host="127.0.0.1")
+        backend = make_policy_backend(host="127.0.0.1", port=port)
 
-    message = str(excinfo.value)
-    assert "DUME_POLICY_BACKEND" in message
-    assert "lerobot" in message
-    assert "not implemented yet" in message
-    assert "groot-native" in message
+    try:
+        assert isinstance(backend, IPolicyBackend)
+        assert backend.ping() is False
+    finally:
+        backend.close()
 
 
 def test_factory_module_import_pulls_no_torch_or_lerobot():

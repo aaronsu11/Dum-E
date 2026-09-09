@@ -17,15 +17,18 @@ except by length. A test that asserted only "the RPC returned" would pass on it.
 """
 
 import contextlib
+import os
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
 import zmq
+from loguru import logger
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -42,9 +45,11 @@ from mock_grpc_policy_server import (  # noqa: E402
 from mock_policy_server import serve_mock as serve_zmq_mock  # noqa: E402
 
 from lerobot.async_inference.helpers import RemotePolicyConfig  # noqa: E402
+from policy.factory import make_policy_backend  # noqa: E402
 from policy.gr00t.service import MsgSerializer  # noqa: E402
 from policy.lerobot import features  # noqa: E402
 from policy.lerobot.session import LeRobotPolicySession  # noqa: E402
+from shared import IPolicyBackend  # noqa: E402
 
 # The six joints in controller order. Imported rather than restated so this
 # module cannot become a second source of truth for the ordering.
@@ -109,6 +114,32 @@ def lerobot_session(port: int, host: str = "127.0.0.1"):
         yield session
     finally:
         session.close()
+
+
+@contextlib.contextmanager
+def lerobot_backend(port: int, **kwargs):
+    """Build the ``lerobot`` backend THROUGH THE FACTORY; close it on exit.
+
+    Through the factory deliberately: ``policy/factory.py``'s ``lerobot`` branch
+    is the single line this whole phase exists to replace, so every backend-level
+    test drives the real selector rather than importing the class directly.
+
+    ``clear=True`` guarantees no inherited ``DUME_POLICY_BACKEND`` or
+    ``DUME_LEROBOT_*`` value from the runner environment masks a missing forward
+    or silently changes the handshake this test asserts on.
+    """
+    with mock.patch.dict(os.environ, {"DUME_POLICY_BACKEND": "lerobot"}, clear=True):
+        backend = make_policy_backend(
+            host="127.0.0.1",
+            port=port,
+            camera_keys=CAMERA_KEYS,
+            robot_state_keys=ROBOT_STATE_KEYS,
+            **kwargs,
+        )
+    try:
+        yield backend
+    finally:
+        backend.close()
 
 
 def _remote_policy_config(actions_per_chunk: int = _ACTION_HORIZON) -> RemotePolicyConfig:
@@ -341,6 +372,168 @@ def test_both_mocks_run_in_one_session_on_distinct_ephemeral_ports():
         _zmq_kill(ctx, zmq_port)
         ctx.term()
         zmq_thread.join(timeout=2.0)
+
+
+# --- BACK-05: the normalized action contract, through the factory -------------
+
+
+def test_lerobot_end_to_end_over_real_grpc_socket():
+    """The whole slice: env selector -> factory -> IPolicyBackend -> real socket.
+
+    Asserts the SAME contract ``groot-native`` returns from its modality dict —
+    16 dicts, each carrying exactly the six ``"<joint>.pos"`` keys with ``float``
+    values — so ONE normalized action contract now spans both backends. The key
+    ITERATION ORDER is asserted too: a permuted dict with the right keys would
+    satisfy a set comparison and still move the wrong joints.
+    """
+    instruction = "Grab a banana and put it on the plate"
+
+    with grpc_mock("ok") as (port, server):
+        with lerobot_backend(port) as backend:
+            # The factory returns the ABSTRACTION, not a privileged concrete type.
+            assert isinstance(backend, IPolicyBackend)
+
+            backend.set_lang_instruction(instruction)
+            assert backend.language_instruction == instruction
+
+            assert backend.ping() is True
+
+            actions = backend.get_action(_synthetic_observation())
+
+    assert actions, "policy returned an empty action list"
+    assert len(actions) == _ACTION_HORIZON
+    for step in actions:
+        assert list(step) == ROBOT_STATE_KEYS
+        assert all(isinstance(v, float) for v in step.values())
+
+    # The instruction must ride LeRobot's own language key, or the server
+    # silently substitutes "Perform the task." — a quality loss that reads
+    # downstream as checkpoint drift.
+    assert server.dume_servicer.last_observation.observation["task"] == instruction
+    # And the handshake carried the DERIVED ordering, not a hand-written list.
+    sent = server.dume_servicer.last_specs
+    assert features.state_names(sent.lerobot_features) == ROBOT_STATE_KEYS
+    assert sent.actions_per_chunk == _ACTION_HORIZON
+    assert sent.rename_map == {}
+
+
+def test_decoded_dims_zero_to_four_are_arm_and_dim_five_is_gripper():
+    """Dim i of the flat action maps to joint i — asserted, never assumed.
+
+    Driven with a NON-UNIFORM vector, because that is the only kind that can
+    catch a silent reordering: every shape check and every key-set check passes
+    on a permuted chunk of zeros. Dims 0:5 are the ``single_arm`` group and dim 5
+    is ``gripper``, the split the checkpoint's ``action_configs`` encodes as
+    RELATIVE (arm) plus ABSOLUTE (gripper).
+    """
+    vector = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+
+    with grpc_mock("ok") as (port, server):
+        server.dume_servicer.action_vector = vector
+        with lerobot_backend(port) as backend:
+            backend.set_lang_instruction("pick up the banana")
+            actions = backend.get_action(_synthetic_observation())
+
+    assert len(actions) == _ACTION_HORIZON
+    for step in actions:
+        for index, joint in enumerate(ROBOT_STATE_KEYS):
+            assert step[joint] == pytest.approx(vector[index]), (joint, index, step)
+
+    # Stated positionally as well, so the arm/gripper split is explicit rather
+    # than implied by the loop above.
+    first = actions[0]
+    assert [first[j] for j in ROBOT_STATE_KEYS[:5]] == pytest.approx([0.0, 1.0, 2.0, 3.0, 4.0])
+    assert first["gripper.pos"] == pytest.approx(5.0)
+
+
+def test_get_action_without_any_instruction_raises():
+    """Fail closed on a missing instruction, BEFORE any gRPC call.
+
+    The port is deliberately unbound: a transport error would prove the guard
+    fired too late, so ``ValueError`` (not ``RuntimeError``) is the observable
+    difference between a fail-closed guard and a wasted round trip.
+    """
+    with lerobot_backend(_free_port()) as backend:
+        with pytest.raises(ValueError) as excinfo:
+            backend.get_action(_synthetic_observation())
+        assert "instruction" in str(excinfo.value).lower()
+
+        # An explicit empty string is just as unusable as no instruction.
+        with pytest.raises(ValueError):
+            backend.get_action(_synthetic_observation(), lang="")
+
+
+def test_language_instruction_is_readonly_property():
+    """``language_instruction`` is a read-only property backed by a field.
+
+    Adjacency edge: the parenthesis-free READ at
+    ``embodiment/so_arm10x/skills.py`` must work, while assignment is rejected so
+    mutation goes through ``set_lang_instruction``, which a backend can validate.
+    """
+    with lerobot_backend(_free_port()) as backend:
+        assert isinstance(
+            type(backend).language_instruction, property
+        ), "language_instruction must be a property, not a plain attribute"
+        assert backend.language_instruction is None
+
+        backend.set_lang_instruction("pick up the banana")
+        assert backend.language_instruction == "pick up the banana"
+
+        with pytest.raises(AttributeError):
+            backend.language_instruction = "assigned directly"
+
+
+def test_close_is_idempotent_and_session_closes_on_exception():
+    """``close()`` twice is a no-op, and ``session()`` closes on a raising body.
+
+    A double close that raised would mask the original exception in a ``finally``,
+    and an aborted episode that leaked the channel would carry it into the next.
+    """
+    with mock.patch.dict(os.environ, {"DUME_POLICY_BACKEND": "lerobot"}, clear=True):
+        backend = make_policy_backend(host="127.0.0.1", port=_free_port())
+        other = make_policy_backend(host="127.0.0.1", port=_free_port())
+
+    backend.close()
+    backend.close()  # second call is a no-op, never a raise
+
+    boom = RuntimeError("episode aborted")
+    with pytest.raises(RuntimeError, match="episode aborted"):
+        with other.session() as scoped:
+            assert scoped is other
+            raise boom
+
+    # close() ran in session()'s finally, so a further close is still a no-op.
+    other.close()
+
+
+def test_show_images_true_warns_rather_than_silently_ignoring():
+    """``show_images=True`` is not wired here, and says so out loud.
+
+    A silently discarded flag is how an operator concludes the preview is BROKEN
+    rather than absent, and then debugs the camera stack instead of reading this
+    line.
+    """
+    captured: list[str] = []
+    handler_id = logger.add(lambda message: captured.append(str(message)), level="WARNING")
+    try:
+        with lerobot_backend(_free_port(), show_images=True) as backend:
+            assert backend is not None
+    finally:
+        logger.remove(handler_id)
+
+    joined = "\n".join(captured)
+    assert "show_images" in joined
+    assert "lerobot" in joined.lower()
+
+    # And the quiet path stays quiet.
+    quiet: list[str] = []
+    handler_id = logger.add(lambda message: quiet.append(str(message)), level="WARNING")
+    try:
+        with lerobot_backend(_free_port()) as backend:
+            assert backend is not None
+    finally:
+        logger.remove(handler_id)
+    assert "show_images" not in "\n".join(quiet)
 
 
 def _zmq_get_action(ctx, port: int) -> dict:

@@ -83,28 +83,74 @@ class MockAsyncInferenceServicer(services_pb2_grpc.AsyncInferenceServicer):
         # modes describe wire-level failure shapes, and this is a payload value.
         self.action_vector: list[float] | None = None
 
-    # --- RED STUB (plan 06-04 Task 1) -----------------------------------------
-    # These four bodies are the implementation under test. They are deliberately
-    # left as aborts in this commit so the target tests fail on the planned
-    # behaviour instead of on a ModuleNotFoundError at collection (which the TDD
-    # reference classifies as INVALID_RED). Replaced in the GREEN commit.
-
     def Ready(self, request, context):  # noqa: N802 - upstream's generated name
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "RED stub: Ready not implemented yet")
+        """``Empty -> Empty``. Upstream also clears its shutdown event here."""
+        return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
-        context.abort(
-            grpc.StatusCode.UNIMPLEMENTED,
-            "RED stub: SendPolicyInstructions not implemented yet",
-        )
+        """``PolicySetup -> Empty``. ``request.data`` is a pickled RemotePolicyConfig."""
+        if self.mode == "refuse":
+            # The shape a SAFE-01 guard refusal takes on the wire: an ABORT with
+            # a specific, actionable message. FAILED_PRECONDITION is deliberately
+            # absent from the client's RETRYABLE_CODES, so this must surface in
+            # ONE attempt with the server's own text intact — three retries would
+            # bury the diagnosis under a generic "unreachable".
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                "SAFE-01/2 configured actions_per_chunk=40 disagrees with the "
+                "checkpoint's delta_indices (16). D-11 config drift.",
+            )
+        # Recorded so a test can assert what the CLIENT sent (policy_type,
+        # checkpoint path, actions_per_chunk, the lerobot_features ordering)
+        # rather than assuming it.
+        self.last_specs = pickle.loads(request.data)  # nosec B301 - see module docstring
+        return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
-        context.abort(
-            grpc.StatusCode.UNIMPLEMENTED, "RED stub: SendObservations not implemented yet"
-        )
+        """``stream Observation -> Empty``, reassembling the chunked payload.
+
+        The client sends via ``send_bytes_in_chunks``, so the server MUST consume
+        every message in the iterator: a client-streaming handler that returns
+        early leaves the client blocked on an unread stream.
+        """
+        buffer = bytearray()
+        for item in request_iterator:
+            if item.transfer_state == services_pb2.TRANSFER_BEGIN:
+                buffer = bytearray(item.data)
+            else:
+                buffer.extend(item.data)
+        self.last_observation = pickle.loads(bytes(buffer))  # nosec B301
+        return services_pb2.Empty()
 
     def GetActions(self, request, context):  # noqa: N802
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "RED stub: GetActions not implemented yet")
+        """``Empty -> Actions{data: pickled list[TimedAction]}``, zeros by default."""
+        if self.mode == "empty":
+            # NOT a hypothetical. Upstream's GetActions wraps its whole body in a
+            # blanket `except Exception` and returns services_pb2.Empty() from a
+            # method DECLARED to return Actions (policy_server.py:214-266). protobuf
+            # serializes that mismatch to b'', so the client sees a SUCCESSFUL RPC
+            # carrying zero bytes. This mode is what proves the client's
+            # zero-length check has teeth instead of an EOFError out of pickle.
+            return services_pb2.Actions(data=b"")
+
+        vector = self.action_vector
+        actions = [
+            TimedAction(
+                # Keyword arguments, NOT positional: TimedAction inherits
+                # TimedData, so the field order is (timestamp, timestep, action).
+                # Constructing it positionally in the wrong order would produce a
+                # mock that passes while the real server's replies fail.
+                timestamp=float(i),
+                timestep=i,
+                action=(
+                    torch.zeros(_ACTION_DIM)
+                    if vector is None
+                    else torch.tensor(vector, dtype=torch.float32)
+                ),
+            )
+            for i in range(_ACTION_HORIZON)
+        ]
+        return services_pb2.Actions(data=pickle.dumps(actions))
 
 
 def start_mock(port: int, host: str = "127.0.0.1", mode: str = "ok") -> grpc.Server:

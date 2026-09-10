@@ -69,6 +69,7 @@ from policy_guard.groot_guard import (  # noqa: E402
     EXPECTED_HORIZON,
     EXPECTED_SHORTEST_IMAGE_EDGE,
     EXPECTED_TAG,
+    EXPECTED_VIDEO_MODALITY_KEYS,
     NO_DECODE_STEP,
     SERVING_LETTER_BOX_TRANSFORM,
     VLM_ENCODE_STEP_KEY,
@@ -79,11 +80,13 @@ from policy_guard.groot_guard import (  # noqa: E402
     snapshot_from_loaded,
 )
 
+from policy.lerobot import features  # noqa: E402
+
 REAL_CHECKPOINT = REPO_ROOT / "checkpoints" / "GR00T-N1.7-3B-SO101"
 
 GUARD_SOURCE = REPO_ROOT / "policy_guard" / "groot_guard.py"
 
-#: The thirteen single-field mutations of the REAL snapshot, one per assertion the guard
+#: The fourteen single-field mutations of the REAL snapshot, one per assertion the guard
 #: makes, shared by the individual violation tests' intent and by the programmatic
 #: message-consistency gate below so the two cannot drift apart.
 VIOLATION_MUTATIONS: tuple[tuple[str, object], ...] = (
@@ -103,6 +106,11 @@ VIOLATION_MUTATIONS: tuple[tuple[str, object], ...] = (
     # assertion that has only ever been GREEN on the right value has never been tested.
     ("served_letter_box_transform", False),
     ("crop_fraction", None),
+    # The camera-view ORDER the checkpoint declares. LIBERO-style keys are the
+    # realistic wrong value: they match no served camera, so upstream degrades to
+    # ALPHABETICAL order with one logging.warning and the model gets the wrong view in
+    # the wrong slot while every shape check passes.
+    ("video_modality_keys", ("image", "wrist_image")),
     ("preprocessor_training", True),
 )
 
@@ -168,6 +176,10 @@ def test_real_checkpoint_snapshot_passes_the_guard():
     assert snapshot.crop_fraction == EXPECTED_CROP_FRACTION == 0.95
     assert snapshot.shortest_image_edge == EXPECTED_SHORTEST_IMAGE_EDGE == 256
     assert snapshot.use_albumentations is True
+    # The checkpoint's OWN camera-view order, which is NOT features.CAMERA_KEYS'
+    # ("wrist", "front") -- the checkpoint decides the slots, the client only decides
+    # which feature keys exist.
+    assert snapshot.video_modality_keys == EXPECTED_VIDEO_MODALITY_KEYS == ("front", "wrist")
 
 
 # --- Negative tests: the guard has teeth -------------------------------------
@@ -315,6 +327,77 @@ def test_violation_5b_wrong_crop_fraction_or_shortest_edge_raises():
         assert "crop_fraction=" in message
         assert "shortest_image_edge=" in message
         assert "use_albumentations=" in message
+
+
+def test_violation_5d_wrong_video_modality_keys_raises():
+    """The camera-view ORDER is guarded, not merely documented (WR-05).
+
+    This value decides which camera lands in which view slot:
+    ``_ordered_image_keys`` (``processor_groot.py:1563-1598``) matches the checkpoint's
+    ``modality_keys`` against the served ``observation.images.<cam>`` keys IN ORDER. The
+    reason it needs a guard rather than a comment is the failure MODE — upstream does
+    not raise on a mismatch. It emits ONE ``logging.warning``, once, and falls back to
+    ``sorted(available)``: alphabetical order. Shapes, chunk length and every other
+    SAFE-01 field are indifferent, so the model receives the wrist frame where it
+    expects the front frame and the arm moves plausibly to the wrong place.
+
+    Three wrong values are driven, because they fail three different ways:
+    LIBERO-style names that match NOTHING, a PERMUTATION that matches everything in the
+    wrong order, and a TRUNCATION that silently feeds fewer views than the weights were
+    trained on. A guard that only caught the first would leave the two that are hardest
+    to notice.
+    """
+    for wrong in (
+        ("image", "wrist_image"),
+        ("wrist", "front"),
+        ("front",),
+        (),
+    ):
+        bad = dataclasses.replace(real_snapshot(), video_modality_keys=wrong)
+        with pytest.raises(ValueError, match=r"^SAFE-01/5 ") as excinfo:
+            assert_groot_serving_contract(bad)
+        message = str(excinfo.value)
+        assert str(wrong) in message, (wrong, message)
+        assert str(EXPECTED_VIDEO_MODALITY_KEYS) in message, (wrong, message)
+        # The message must state the SILENT mechanism, or a reader concludes a
+        # mismatch would have raised somewhere downstream.
+        assert "ALPHABETICAL" in message, message
+        assert "logging.warning" in message, message
+
+    # A PERMUTATION is not merely "a different tuple": ("wrist", "front") is
+    # features.CAMERA_KEYS itself, which is the value a future reader is most likely to
+    # assume is authoritative. It must be refused.
+    assert tuple(features.CAMERA_KEYS) != EXPECTED_VIDEO_MODALITY_KEYS, (
+        "features.CAMERA_KEYS and the checkpoint's modality_keys are no longer "
+        "different orderings, so this test no longer proves the checkpoint is the "
+        "ordering authority"
+    )
+
+
+def test_video_modality_keys_come_from_the_checkpoint_not_from_camera_keys():
+    """The guard reads the CHECKPOINT's declaration, never the client's CAMERA_KEYS.
+
+    ``policy/lerobot/features.py:56-64`` says so in prose and points at
+    ``_ordered_image_keys``; this asserts it against the real sidecar. The two tuples
+    hold the same names in DIFFERENT orders, which is what makes the read direction
+    observable at all — if the guard derived the field from ``CAMERA_KEYS`` it would
+    read ``("wrist", "front")`` here and refuse every healthy handshake.
+    """
+    processor_kwargs = json.loads((REAL_CHECKPOINT / "processor_config.json").read_text())[
+        "processor_kwargs"
+    ]
+    on_disk = tuple(processor_kwargs["modality_configs"][EXPECTED_TAG]["video"]["modality_keys"])
+
+    assert on_disk == EXPECTED_VIDEO_MODALITY_KEYS
+    assert real_snapshot().video_modality_keys == on_disk
+    assert set(on_disk) == set(features.CAMERA_KEYS), (
+        "the checkpoint names cameras the client does not serve (or vice versa); "
+        "_ordered_image_keys would then feed fewer views than the weights expect"
+    )
+    assert on_disk != tuple(features.CAMERA_KEYS), (
+        "the two tuples now agree on ORDER, so this test can no longer show which of "
+        "them the guard read"
+    )
 
 
 def test_violation_5c_processor_in_training_mode_raises():
@@ -597,10 +680,10 @@ def test_every_message_names_its_assertion_id_and_the_observed_value():
 
     A message that omits the observed value forces an operator into the source to learn
     what actually went wrong, which is exactly what the ``policy/factory.py:57-62`` idiom
-    exists to prevent. Driving all thirteen mutations from one table also means an emptied or
+    exists to prevent. Driving all fourteen mutations from one table also means an emptied or
     reworded message goes red here even if its own violation test only matched the prefix.
     """
-    assert len(VIOLATION_MUTATIONS) == 13
+    assert len(VIOLATION_MUTATIONS) == 14
 
     for field_name, value in VIOLATION_MUTATIONS:
         bad = dataclasses.replace(real_snapshot(), **{field_name: value})

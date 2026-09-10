@@ -322,9 +322,14 @@ def run_preflight(checkpoint_path: str, backbone_revision: str) -> int:
         f"stats_non_empty={snapshot.stats_non_empty}, "
         f"crop_fraction={snapshot.crop_fraction}, "
         f"shortest_image_edge={snapshot.shortest_image_edge}, "
-        f"letter_box_transform={snapshot.letter_box_transform} "
-        f"(decode_step_type and the two training flags are NOT validated here — "
-        f"post-load site only)",
+        f"letter_box_transform={snapshot.letter_box_transform}, "
+        # The camera-view ORDER the checkpoint declares. On the line because it is
+        # config-visible AND because a mismatch is silent downstream: upstream falls
+        # back to alphabetical order with one logging.warning, so an operator needs to
+        # be able to read the accepted layout out of `docker logs`.
+        f"video_modality_keys={snapshot.video_modality_keys} "
+        f"(decode_step_type, served_letter_box_transform and the two training flags "
+        f"are NOT validated here — post-load site only)",
     )
 
     # ---- 5. the image carries the PINNED backbone snapshot ----

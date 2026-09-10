@@ -160,6 +160,24 @@ EXPECTED_CHECKPOINT_LETTER_BOX_TRANSFORM = False
 #: must not be upgraded to a fact.
 SERVING_LETTER_BOX_TRANSFORM = True
 
+#: ``processor_kwargs.modality_configs[EXPECTED_TAG]["video"]["modality_keys"]`` — **the value
+#: that decides WHICH CAMERA LANDS IN WHICH VIEW SLOT.** It is not a label: upstream's
+#: ``GrootN17PackInputsStep._ordered_image_keys`` (``processor_groot.py:1563-1598``) matches these
+#: names against the ``observation.images.<cam>`` keys the handshake declares, in THIS order, and
+#: that ordering is what the trained weights expect. ``policy/lerobot/features.py``'s
+#: ``CAMERA_KEYS`` is ``("wrist", "front")`` and deliberately does NOT decide the order — it only
+#: decides which feature keys exist.
+#:
+#: Asserted because the failure mode is silent and physical. When NONE of these names matches a
+#: served camera — a camera rename, or a LIBERO-style checkpoint carrying
+#: ``["image", "wrist_image"]`` — upstream does not raise. It emits ONE ``logging.warning``, once
+#: (``self._warned_image_keys``), and falls back to ``sorted(available)``: **alphabetical order**.
+#: Shapes stay correct, the 16x(6,) chunk stays correct, and all seventeen other SAFE-01 fields
+#: are indifferent to it, so the model receives the wrist frame where it expects the front frame
+#: and the arm moves plausibly to the wrong place. A partial match is worse still: it silently
+#: feeds FEWER views than the weights were trained on.
+EXPECTED_VIDEO_MODALITY_KEYS: tuple[str, ...] = ("front", "wrist")
+
 #: Registry name of the pipeline step that applies the image geometry
 #: (``@ProcessorStepRegistry.register(name=...)`` on ``GrootN17VLMEncodeStep``,
 #: ``processor_groot.py:2039``). The registry name is used rather than the class name because
@@ -198,6 +216,10 @@ _REQUIRED_PROCESSOR_KWARGS = (
     "crop_fraction",
     "shortest_image_edge",
     "use_albumentations",
+    # The camera-view ORDER authority. Required for the same T-06-08 reason as the rest: an
+    # absent modality_configs must raise here rather than let ``video_modality_keys`` be
+    # derived from nothing. See EXPECTED_VIDEO_MODALITY_KEYS.
+    "modality_configs",
 )
 
 
@@ -227,6 +249,7 @@ class GrootGuardSnapshot:
     crop_fraction: float | None
     shortest_image_edge: int | None
     use_albumentations: bool
+    video_modality_keys: tuple[str, ...]
     preprocessor_training: bool
     encode_step_training: bool
 
@@ -391,6 +414,19 @@ def assert_groot_serving_contract(snapshot: GrootGuardSnapshot) -> None:
             f"changes what the VLM sees. Refusing to serve a preprocessing path the "
             f"checkpoint was not trained with."
         )
+    if tuple(snapshot.video_modality_keys) != EXPECTED_VIDEO_MODALITY_KEYS:
+        raise ValueError(
+            f"SAFE-01/5 video modality keys are {tuple(snapshot.video_modality_keys)!r}, expected "
+            f"{EXPECTED_VIDEO_MODALITY_KEYS!r}. These are the checkpoint's OWN declaration of "
+            f"which camera lands in which view slot: _ordered_image_keys matches them against the "
+            f"observation.images.<cam> keys the handshake declares, IN THIS ORDER "
+            f"(processor_groot.py:1563-1598). An unmatched key does NOT raise — upstream emits a "
+            f"single logging.warning, once, and falls back to feeding all cameras in ALPHABETICAL "
+            f"order; a partial match silently feeds FEWER views. Shapes, chunk length and every "
+            f"other SAFE-01 field stay correct throughout, so the model receives the wrist frame "
+            f"where it expects the front frame and the arm moves plausibly to the wrong place. "
+            f"Refusing to serve a camera layout the checkpoint was not trained with."
+        )
     if snapshot.preprocessor_training or snapshot.encode_step_training:
         raise ValueError(
             f"SAFE-01/5 processor is in TRAINING mode: "
@@ -499,6 +535,7 @@ def snapshot_from_loaded(
             crop_fraction=None,
             shortest_image_edge=None,
             use_albumentations=False,
+            video_modality_keys=(),
             preprocessor_training=False,
             encode_step_training=False,
         )
@@ -551,7 +588,32 @@ def _snapshot_common(
         "crop_fraction": processor_kwargs["crop_fraction"],
         "shortest_image_edge": processor_kwargs["shortest_image_edge"],
         "use_albumentations": bool(processor_kwargs["use_albumentations"]),
+        "video_modality_keys": _video_modality_keys(processor_kwargs, embodiment_tag),
     }
+
+
+def _video_modality_keys(processor_kwargs: dict[str, Any], embodiment_tag: str) -> tuple[str, ...]:
+    """The checkpoint's declared camera-view ORDER for ``embodiment_tag``.
+
+    Returns an EMPTY tuple rather than raising when the tag, its ``video`` block or its
+    ``modality_keys`` list is absent or malformed. That is not a silent default in the T-06-08
+    sense — the point of T-06-08 is that a defaulted field would PASS the guard, and ``()`` can
+    never equal :data:`EXPECTED_VIDEO_MODALITY_KEYS`, so every deviation is REFUSED loudly by
+    ``SAFE-01/5``. Returning instead of raising also keeps the error attribution right in the one
+    case that matters: a WRONG ``embodiment_tag`` should be reported by ``SAFE-01/2``'s message
+    (which explains the nine tags and the delta_indices), not by a builder exception here that
+    fires first and names something else.
+    """
+    modality_configs = processor_kwargs.get("modality_configs")
+    if not isinstance(modality_configs, dict):
+        return ()
+    video = (modality_configs.get(embodiment_tag) or {}).get("video")
+    if not isinstance(video, dict):
+        return ()
+    keys = video.get("modality_keys")
+    if not isinstance(keys, (list, tuple)):
+        return ()
+    return tuple(str(key) for key in keys)
 
 
 def _read_processor_kwargs(checkpoint_path: Path) -> dict[str, Any]:

@@ -958,6 +958,273 @@ def _load_container_entrypoint():
     return module
 
 
+def _load_container_server():
+    """Load the container's ``server.py`` from source, without Docker.
+
+    Importable from the client venv: ``server.py``'s imports are all ``lerobot``,
+    ``torch``, ``grpc`` and ``policy_guard``, every one of which the Dum-E venv
+    already carries (``transformers`` is reached only transitively through
+    ``lerobot``, never named here). That is what makes the SAFE-01 post-load call
+    site's fail-closed behaviour pinnable by a keyless test instead of resting on a
+    live ``docker run``.
+
+    Unlike ``_load_container_entrypoint`` this loads no ``sys.path`` mutation of its
+    own — ``server.py`` performs none.
+    """
+    import importlib.util
+
+    path = REPO_ROOT / "docker" / "lerobot-policy" / "server.py"
+    spec = importlib.util.spec_from_file_location("_dume_container_server", path)
+    assert spec is not None and spec.loader is not None, f"cannot load {path}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _AbortRaised(Exception):
+    """What a real ``ServicerContext.abort`` does: terminate by raising."""
+
+
+class _FakeContext:
+    """A ``grpc.ServicerContext`` stand-in that records the abort it was given.
+
+    ``abort_returns`` inverts the one behaviour the refusal path used to depend on
+    implicitly, so "control leaves the handler" can be asserted rather than assumed.
+    """
+
+    def __init__(self, abort_returns: bool = False) -> None:
+        self.abort_returns = abort_returns
+        self.aborted: tuple[Any, str] | None = None
+
+    def peer(self) -> str:
+        return "ipv4:127.0.0.1:0"
+
+    def abort(self, code, details):
+        self.aborted = (code, details)
+        if self.abort_returns:
+            return None
+        raise _AbortRaised(details)
+
+
+def _handshake_request(server_module, actions_per_chunk: int = 16):
+    """A pickled ``RemotePolicyConfig`` in the shape the wire carries it."""
+    import pickle
+
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+
+    class _Request:
+        pass
+
+    request = _Request()
+    request.data = pickle.dumps(
+        RemotePolicyConfig(
+            policy_type="groot",
+            pretrained_name_or_path=str(REAL_CHECKPOINT_FOR_SERVER),
+            lerobot_features=features.build_lerobot_features(),
+            actions_per_chunk=actions_per_chunk,
+            device="cpu",
+            rename_map={},
+        )
+    )
+    return request
+
+
+REAL_CHECKPOINT_FOR_SERVER = REPO_ROOT / "checkpoints" / "GR00T-N1.7-3B-SO101"
+
+
+def _armed_handshake_server(server_module, monkeypatch):
+    """A ``DumEGrootPolicyServer`` whose weight load and pipelines are stubbed out.
+
+    Stubs exactly the three things a 12.6 GB load would otherwise require — the
+    model materialization, the processor build and the dtype histogram — and NOTHING
+    on the guard path. The handler body under test is the real one.
+    """
+
+    class _StubConfig:
+        embodiment_tag = "new_embodiment"
+        model_params_fp32 = False
+        input_features: dict = {}
+        output_features: dict = {}
+
+        def __init__(self):
+            self.base_model_path = str(REAL_CHECKPOINT_FOR_SERVER)
+
+    class _StubPolicy:
+        def __init__(self):
+            self.config = _StubConfig()
+
+        def to(self, device):
+            return self
+
+    class _GrootN17ActionDecodeStep:  # the class NAME is what the handler logs
+        env_action_dim = 6
+
+    class _StubPipeline:
+        def __init__(self, steps=()):
+            self.steps = tuple(steps)
+            self.name = "stand-in"
+
+    monkeypatch.setattr(
+        server_module.DumEGrootPolicy,
+        "from_pretrained",
+        classmethod(lambda cls, path, config=None: _StubPolicy()),
+    )
+    monkeypatch.setattr(
+        server_module,
+        "make_pre_post_processors",
+        lambda *a, **k: (
+            _StubPipeline(),
+            _StubPipeline([_GrootN17ActionDecodeStep()]),
+        ),
+    )
+    monkeypatch.setattr(server_module, "parameter_dtype_histogram", lambda module: {})
+
+    class _Logger:
+        def __init__(self):
+            self.lines: list[str] = []
+
+        def _record(self, fmt, *args):
+            self.lines.append(fmt % args if args else str(fmt))
+
+        info = _record
+        warning = _record
+        error = _record
+
+    server = object.__new__(server_module.DumEGrootPolicyServer)
+    # `running` is a read-only property over upstream's shutdown_event
+    # (policy_server.py), and only Ready() clears it. A cleared event is what the
+    # client's mandatory Ready-before-SendPolicyInstructions ordering produces, so
+    # this is the state the handler under test actually runs in.
+    server.shutdown_event = threading.Event()
+    assert server.running is True
+    server.logger = _Logger()
+    server.policy = None
+    server.preprocessor = None
+    server.postprocessor = None
+    return server
+
+
+def test_safe01_post_load_guard_drops_the_policy_on_a_non_valueerror_failure(monkeypatch):
+    """An ``AttributeError`` from ``snapshot_from_loaded`` REFUSES and drops the policy.
+
+    This is CR-02, and it is the discriminating case: the call site used to catch
+    ``except ValueError`` only. ``assert_groot_serving_contract`` raises only
+    ``ValueError``, but ``snapshot_from_loaded``'s own docstring advertises that it
+    fails **at attribute-access time** — i.e. ``AttributeError`` — and
+    ``infer_groot_n1_7_action_horizon`` can raise ``KeyError`` on a reshaped
+    sidecar. Under the narrow clause none of those reached the handler, so
+    ``self.policy`` stayed bound to a loaded, un-validated policy and the exception
+    escaped as ``UNKNOWN``; a client that ignored that and called
+    ``SendObservations``/``GetActions`` anyway would have been served from it.
+
+    A test that only proves the ``ValueError`` path still works cannot close this —
+    that path was never broken. So the failure is injected at a REAL read site by
+    deleting the attribute ``snapshot_from_loaded`` reads first.
+    """
+    server_module = _load_container_server()
+    if not REAL_CHECKPOINT_FOR_SERVER.is_dir():
+        pytest.fail(
+            f"checkpoint not found at {REAL_CHECKPOINT_FOR_SERVER} — a skip here would "
+            "be a silent pass on the fail-closed claim"
+        )
+    server = _armed_handshake_server(server_module, monkeypatch)
+    context = _FakeContext()
+
+    # THE INJECTION, at a real read site inside snapshot_from_loaded: a pack step
+    # that carries `state_dropout_prob` (so `_require_step` locates it and does NOT
+    # raise its own ValueError) but no `training`. `groot_guard.py:524` then does
+    # `bool(pack_step.training)` and raises AttributeError — the module's documented
+    # "breaks LOUDLY, at attribute-access time" behaviour, produced by the guard
+    # itself rather than hand-thrown. This is exactly the shape a pinned-lerobot
+    # pipeline reshape takes: the marker survives, the field next to it moves.
+    class _ReshapedPackStep:
+        state_dropout_prob = 0.2
+        # `training` deliberately ABSENT.
+
+    class _EncodeStep:
+        letter_box_transform = True
+        training = False
+
+    class _Pipeline:
+        def __init__(self, steps):
+            self.steps = tuple(steps)
+            self.name = "reshaped-preprocessor"
+
+    class _DecodeStep:
+        env_action_dim = 6
+
+    monkeypatch.setattr(
+        server_module,
+        "make_pre_post_processors",
+        lambda *a, **k: (
+            _Pipeline([_ReshapedPackStep(), _EncodeStep()]),
+            _Pipeline([_DecodeStep()]),
+        ),
+    )
+
+    with pytest.raises(_AbortRaised):
+        server_module.DumEGrootPolicyServer.SendPolicyInstructions(
+            server, _handshake_request(server_module), context
+        )
+
+    # 1. It refused, with FAILED_PRECONDITION and the exception TYPE named, so an
+    #    operator can tell "the guard said no" from "the guard could not run".
+    assert context.aborted is not None, "the handler did not abort"
+    code, details = context.aborted
+    assert code is server_module.grpc.StatusCode.FAILED_PRECONDITION
+    assert "AttributeError" in details, details
+
+    # 2. It dropped the un-validated policy AND the pipelines. This is the assertion
+    #    the narrow `except ValueError` failed: under it, `server.policy` was still
+    #    the loaded object here.
+    assert server.policy is None, (
+        "an un-validated policy is still bound after a guard failure the narrow "
+        "`except ValueError` clause did not catch — SendObservations/GetActions "
+        "would serve from it"
+    )
+    assert server.preprocessor is None
+    assert server.postprocessor is None
+
+    # 3. And it logged the refusal, not a pass.
+    log = "\n".join(server.logger.lines)
+    assert "SAFE-01 guard: REFUSED" in log, log
+    assert "AttributeError" in log, log
+    assert "SAFE-01 guard: PASS" not in log, log
+
+
+def test_safe01_post_load_guard_still_refuses_a_valueerror_violation(monkeypatch):
+    """Broadening the catch did not replace the ``ValueError`` message path.
+
+    The guard's own refusals must keep arriving with their ``SAFE-01/N`` identifier
+    intact, because that identifier is what the live suite greps for and what tells
+    an operator which assertion fired.
+    """
+    server_module = _load_container_server()
+    server = _armed_handshake_server(server_module, monkeypatch)
+    context = _FakeContext()
+
+    monkeypatch.setattr(
+        server_module,
+        "snapshot_from_loaded",
+        lambda *a, **k: (_ for _ in ()).throw(
+            ValueError("SAFE-01/2 configured actions_per_chunk=40 disagrees with 16")
+        ),
+    )
+
+    with pytest.raises(_AbortRaised):
+        server_module.DumEGrootPolicyServer.SendPolicyInstructions(
+            server, _handshake_request(server_module), context
+        )
+
+    _code, details = context.aborted
+    assert "SAFE-01/2" in details, details
+    assert "ValueError" in details, details
+    assert server.policy is None
+    log = "\n".join(server.logger.lines)
+    assert "SAFE-01 guard: REFUSED" in log
+    assert "SAFE-01 guard: PASS" not in log
+
+
 def test_preflight_refuses_when_a_check_never_runs():
     """A vanished preflight check FAILS; it is not silently absent (T-06-37).
 

@@ -664,6 +664,25 @@ class DumEGrootPolicyServer(PolicyServer):
         # pipeline reshape moved any of them. That is a refusal to serve for the
         # same reason a failed assertion is, and it must reach the operator as one
         # rather than as an un-named exception escaping a gRPC handler.
+        #
+        # ``except Exception`` and NOT ``except ValueError``, which is what this used
+        # to be. ``assert_groot_serving_contract`` raises only ``ValueError``, but
+        # ``snapshot_from_loaded`` is DOCUMENTED as failing a different way —
+        # "every attribute read here ... breaks LOUDLY, at attribute-access time"
+        # (``policy_guard/groot_guard.py:468-471``). Attribute-access failure is
+        # ``AttributeError``, not ``ValueError``: ``config.base_model_path``,
+        # ``config.embodiment_tag``, ``pack_step.training`` and
+        # ``encode_step.letter_box_transform`` are all such sites, and
+        # ``infer_groot_n1_7_action_horizon`` can raise ``KeyError`` on a reshaped
+        # sidecar. Under the narrow clause NONE of those fired the handler below, so
+        # ``self.policy`` stayed bound to a loaded, UN-VALIDATED policy while the
+        # exception escaped as ``UNKNOWN`` — and a client that ignores that and calls
+        # SendObservations/GetActions anyway would be served from it. That is exactly
+        # the scenario the fail-closed drop claims to have closed.
+        #
+        # "The guard refused" and "the guard could not run" are both "the guard did
+        # not pass", and neither may leave a servable policy behind. The type name is
+        # in the message so the two remain distinguishable to an operator.
         try:
             snapshot = snapshot_from_loaded(
                 self.policy.config,
@@ -672,20 +691,26 @@ class DumEGrootPolicyServer(PolicyServer):
                 self.actions_per_chunk,
             )
             assert_groot_serving_contract(snapshot)
-        except ValueError as exc:
-            self.logger.error("SAFE-01 guard: REFUSED | %s", exc)
-            # Drop the un-validated policy BEFORE refusing. ``context.abort``
-            # terminates THIS RPC, but a client that ignores the abort and calls
-            # SendObservations/GetActions anyway must not be served from a policy
-            # the guard rejected — and ``GetActions``'s blanket
+        except Exception as exc:  # noqa: BLE001 - a guard that cannot run must refuse, not serve
+            self.logger.error("SAFE-01 guard: REFUSED | %s: %s", type(exc).__name__, exc)
+            # Drop the un-validated policy BEFORE refusing, UNCONDITIONALLY.
+            # ``context.abort`` terminates THIS RPC, but a client that ignores the
+            # abort and calls SendObservations/GetActions anyway must not be served
+            # from a policy the guard rejected — and ``GetActions``'s blanket
             # ``except Exception -> Empty()`` would turn the resulting AttributeError
             # into a SUCCESSFUL RPC carrying zero bytes, which
             # policy/lerobot/session.py's zero-length guard names explicitly.
+            # The pipelines go too: they hold their own references to the policy's
+            # config and steps, and a half-dropped state is not a fail-closed one.
             # There is deliberately NO path here that logs a violation and returns
-            # the reply: no warn-and-serve, and the ValueError is re-raised as an
-            # abort rather than caught and continued (T-06-13).
+            # the reply: no warn-and-serve (T-06-13/T-06-36).
             self.policy = None
-            _refuse(context, str(exc))
+            self.preprocessor = None
+            self.postprocessor = None
+            # RETURNED, not called as a statement: see the note in ``_refuse``. The
+            # PASS log below must be unreachable from here even if ``abort`` ever
+            # stops raising.
+            return _refuse(context, f"{type(exc).__name__}: {exc}")
 
         # ONE INFO line, so a single `docker logs | grep` shows BOTH that the guard
         # ran and what it saw. A guard that passes SILENTLY is indistinguishable

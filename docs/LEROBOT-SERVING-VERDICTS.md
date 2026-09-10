@@ -378,7 +378,7 @@ by this plan and imported by both sites.
 
 | Site | File | What it can see | What it validates |
 |---|---|---|---|
-| **Preflight** (config-only, check 4 of 6) | `docker/lerobot-policy/entrypoint.py` | The bind-mounted checkpoint directory only. No policy, no processors, no GPU | SAFE-01/1, /2, /4 and the geometry half of /5 — against `EXPECTED_HORIZON`, because no client exists yet |
+| **Preflight** (config-only, check 4 of 6) | `docker/lerobot-policy/entrypoint.py` | The bind-mounted checkpoint directory only. No policy, no processors, no GPU | SAFE-01/1, /2, /4 and the config-visible half of /5 — the geometry knobs plus `video_modality_keys` — against `EXPECTED_HORIZON`, because no client exists yet |
 | **Post-load** | `docker/lerobot-policy/server.py` | The loaded `GrootPolicy.config` plus the rebuilt preprocessor/postprocessor — the objects that will actually run inference | All five, against the **client-supplied** `self.actions_per_chunk` |
 
 Both are needed and neither is redundant:
@@ -400,9 +400,18 @@ The preflight check's own PASS line, verbatim, from the serving path:
 [4/6] SAFE-01 serving contract for '/checkpoints/model' (config-only) ...
   PASS: SAFE-01/1..5 hold config-only: embodiment_tag='new_embodiment', checkpoint_horizon=16,
   use_relative_action=True, use_percentiles=True, stats_non_empty=True, crop_fraction=0.95,
-  shortest_image_edge=256, letter_box_transform=False (decode_step_type and the two training flags
-  are NOT validated here — post-load site only)
+  shortest_image_edge=256, letter_box_transform=False, video_modality_keys=('front', 'wrist')
+  (decode_step_type, served_letter_box_transform and the two training flags are NOT validated
+  here — post-load site only)
 ```
+
+`video_modality_keys` is on this line because it is **config-visible and silently consequential**.
+It is the checkpoint's own declaration of which camera lands in which view slot, and upstream does
+not raise on a mismatch: `_ordered_image_keys` (`processor_groot.py:1563-1598`) emits one
+`logging.warning` and falls back to feeding all cameras in **alphabetical** order. Shapes, chunk
+length and every other SAFE-01 field stay correct, so an operator needs to be able to read the
+accepted layout out of `docker logs`. Note `features.CAMERA_KEYS` is `("wrist", "front")` — the
+*checkpoint* decides the order, the client only decides which feature keys exist.
 
 That check has been **red**, not merely written: against a directory that passes checks 1-3 (all
 three sidecars present, `is_raw_groot_n1_7_checkpoint` True, horizon 16) but whose

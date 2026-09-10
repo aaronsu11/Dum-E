@@ -1032,12 +1032,61 @@ def _handshake_request(server_module, actions_per_chunk: int = 16):
 REAL_CHECKPOINT_FOR_SERVER = REPO_ROOT / "checkpoints" / "GR00T-N1.7-3B-SO101"
 
 
+class _PackStep:
+    """Stands in for ``GrootN17PackInputsStep``: the ``state_dropout_prob`` marker."""
+
+    state_dropout_prob = 0.2
+    training = False
+
+
+class _EncodeStep:
+    """Stands in for ``GrootN17VLMEncodeStep`` with the serving pad FORCED on."""
+
+    def __init__(self, letter_box_transform: bool = True) -> None:
+        self.letter_box_transform = letter_box_transform
+        self.training = False
+
+
+class GrootN17ActionDecodeStep:  # noqa: N801 - the NAME is the assertion
+    """Stands in for upstream's relative-aware decode step.
+
+    Deliberately NOT underscore-prefixed: SAFE-01/3 compares
+    ``type(step).__name__`` against ``EXPECTED_DECODE_STEP``, so the class name IS
+    the thing under test. The legacy ``GrootActionUnpackUnnormalizeStep`` is what a
+    real refusal here would name. ``env_action_dim`` is the marker
+    ``_decode_step_type`` locates it by.
+    """
+
+    env_action_dim = 6
+
+
+class _StubPipeline:
+    def __init__(self, steps=()):
+        self.steps = tuple(steps)
+        self.name = "stand-in"
+
+
+def _guard_passing_pipelines():
+    """Pipeline stubs whose shape the SAFE-01 guard ACCEPTS against the real checkpoint.
+
+    A harness that could only ever produce a refusal would make every
+    ``"SAFE-01 guard: PASS" not in log`` assertion below vacuous, so the default is
+    the passing shape and ``test_..._logs_pass_on_a_conforming_pipeline`` is the
+    positive control that proves it.
+    """
+    return _StubPipeline([_PackStep(), _EncodeStep()]), _StubPipeline(
+        [GrootN17ActionDecodeStep()]
+    )
+
+
 def _armed_handshake_server(server_module, monkeypatch):
     """A ``DumEGrootPolicyServer`` whose weight load and pipelines are stubbed out.
 
     Stubs exactly the three things a 12.6 GB load would otherwise require — the
     model materialization, the processor build and the dtype histogram — and NOTHING
-    on the guard path. The handler body under test is the real one.
+    on the guard path: every SAFE-01 field except the four the pipelines carry is
+    read from the REAL checkpoint's sidecars. The handler body under test is the
+    real one.
     """
 
     class _StubConfig:
@@ -1056,26 +1105,13 @@ def _armed_handshake_server(server_module, monkeypatch):
         def to(self, device):
             return self
 
-    class _GrootN17ActionDecodeStep:  # the class NAME is what the handler logs
-        env_action_dim = 6
-
-    class _StubPipeline:
-        def __init__(self, steps=()):
-            self.steps = tuple(steps)
-            self.name = "stand-in"
-
     monkeypatch.setattr(
         server_module.DumEGrootPolicy,
         "from_pretrained",
         classmethod(lambda cls, path, config=None: _StubPolicy()),
     )
     monkeypatch.setattr(
-        server_module,
-        "make_pre_post_processors",
-        lambda *a, **k: (
-            _StubPipeline(),
-            _StubPipeline([_GrootN17ActionDecodeStep()]),
-        ),
+        server_module, "make_pre_post_processors", lambda *a, **k: _guard_passing_pipelines()
     )
     monkeypatch.setattr(server_module, "parameter_dtype_histogram", lambda module: {})
 
@@ -1141,24 +1177,12 @@ def test_safe01_post_load_guard_drops_the_policy_on_a_non_valueerror_failure(mon
         state_dropout_prob = 0.2
         # `training` deliberately ABSENT.
 
-    class _EncodeStep:
-        letter_box_transform = True
-        training = False
-
-    class _Pipeline:
-        def __init__(self, steps):
-            self.steps = tuple(steps)
-            self.name = "reshaped-preprocessor"
-
-    class _DecodeStep:
-        env_action_dim = 6
-
     monkeypatch.setattr(
         server_module,
         "make_pre_post_processors",
         lambda *a, **k: (
-            _Pipeline([_ReshapedPackStep(), _EncodeStep()]),
-            _Pipeline([_DecodeStep()]),
+            _StubPipeline([_ReshapedPackStep(), _EncodeStep()]),
+            _StubPipeline([GrootN17ActionDecodeStep()]),
         ),
     )
 
@@ -1223,6 +1247,94 @@ def test_safe01_post_load_guard_still_refuses_a_valueerror_violation(monkeypatch
     log = "\n".join(server.logger.lines)
     assert "SAFE-01 guard: REFUSED" in log
     assert "SAFE-01 guard: PASS" not in log
+
+
+def test_safe01_post_load_guard_logs_pass_on_a_conforming_pipeline(monkeypatch):
+    """THE POSITIVE CONTROL for the three refusal tests above.
+
+    They assert ``"SAFE-01 guard: PASS" not in log``. If this harness could never
+    produce that line, all three would be vacuous. So: with pipeline stubs whose
+    markers and flags conform — a pack step carrying ``state_dropout_prob`` and
+    ``training=False``, an encode step with the serving pad FORCED on, and a decode
+    step named ``GrootN17ActionDecodeStep`` — the real handler body runs the real
+    guard against the REAL checkpoint's sidecars and passes.
+
+    Note what this does NOT stub: the SAFE-01 assertions themselves, the snapshot
+    builder, or any of the thirteen checkpoint-derived fields. Only the weight load
+    and the processor build are stubbed.
+    """
+    server_module = _load_container_server()
+    server = _armed_handshake_server(server_module, monkeypatch)
+    context = _FakeContext()
+
+    reply = server_module.DumEGrootPolicyServer.SendPolicyInstructions(
+        server, _handshake_request(server_module), context
+    )
+
+    assert context.aborted is None, f"a conforming pipeline was refused: {context.aborted}"
+    assert reply is not None
+    log = "\n".join(server.logger.lines)
+    assert "SAFE-01 guard: PASS" in log, log
+    assert "SAFE-01 guard: REFUSED" not in log, log
+    # The served letterbox value is on the PASS line specifically because it is the
+    # one value the checkpoint's own configuration contradicts.
+    assert "served_letter_box_transform=True" in log, log
+    assert "checkpoint_letter_box_transform=False" in log, log
+    assert server.policy is not None
+
+
+def test_a_returning_abort_cannot_produce_a_safe01_pass_line(monkeypatch):
+    """A refusal never reaches the ``SAFE-01 guard: PASS`` log, even if abort returns.
+
+    WR-04. ``_refuse`` was called as a bare statement and control left the handler
+    only because ``context.abort`` happens to raise. If that ever stopped being true
+    — an ``aio`` servicer context, a test double, an upstream change — execution fell
+    through to the unconditional ``SAFE-01 guard: PASS`` line and
+    ``return services_pb2.Empty()``: a PASS log and an OK handshake reply for a
+    handshake the guard REFUSED. That is the precise inverse of T-06-14, and
+    ``tests/test_lerobot_serving_live.py`` greps that exact line as positive
+    evidence. (It would also reference the unbound ``snapshot`` local, masking the
+    real diagnosis behind an ``UnboundLocalError``.)
+
+    The property is asserted with the inversion actually injected — an ``abort``
+    that RETURNS — rather than by reading the code, because "abort raises" is the
+    assumption under test.
+
+    The refusal is injected at ``assert_groot_serving_contract``, NOT at
+    ``snapshot_from_loaded``, and the difference is the whole point: a
+    snapshot-build failure leaves ``snapshot`` unbound, so the fall-through would
+    die on ``UnboundLocalError`` before the PASS line and the hazard would be
+    invisible. A guard REFUSAL — the common case, e.g. SAFE-01/2's wrong horizon —
+    leaves ``snapshot`` bound with real values, so the fall-through logs a fully
+    populated, entirely false PASS line and returns OK.
+    """
+    server_module = _load_container_server()
+    server = _armed_handshake_server(server_module, monkeypatch)
+    context = _FakeContext(abort_returns=True)
+
+    monkeypatch.setattr(
+        server_module,
+        "assert_groot_serving_contract",
+        lambda snapshot: (_ for _ in ()).throw(
+            ValueError("SAFE-01/2 configured actions_per_chunk=40 disagrees with 16")
+        ),
+    )
+
+    # It must not return an OK reply. Any raise is acceptable; a return is not.
+    with pytest.raises(Exception) as excinfo:  # noqa: PT011 - the TYPE is not the contract
+        server_module.DumEGrootPolicyServer.SendPolicyInstructions(
+            server, _handshake_request(server_module), context
+        )
+    assert not isinstance(excinfo.value, AssertionError), excinfo.value
+
+    assert context.aborted is not None, "the refusal never reached context.abort"
+    log = "\n".join(server.logger.lines)
+    assert "SAFE-01 guard: REFUSED" in log, log
+    assert "SAFE-01 guard: PASS" not in log, (
+        "a handshake the guard REFUSED produced a 'SAFE-01 guard: PASS' log line — "
+        f"the live suite greps that line as positive evidence:\n{log}"
+    )
+    assert server.policy is None
 
 
 def test_preflight_refuses_when_a_check_never_runs():

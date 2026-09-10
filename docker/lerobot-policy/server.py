@@ -177,6 +177,7 @@ import collections
 import os
 import pickle  # nosec B403 - the lerobot wire protocol is pickle in both directions
 import time
+from typing import NoReturn
 
 import grpc
 import torch
@@ -272,7 +273,7 @@ SEED_ENV_VAR: str = "DUME_POLICY_SEED"
 SERVING_DTYPE: torch.dtype = torch.bfloat16
 
 
-def _refuse(context, message: str):
+def _refuse(context, message: str) -> NoReturn:
     """Abort the RPC with ``FAILED_PRECONDITION`` and the guard's own message.
 
     ``FAILED_PRECONDITION`` is chosen deliberately, and the choice is load-bearing
@@ -290,10 +291,33 @@ def _refuse(context, message: str):
       under a generic "unreachable" — or be indistinguishable from a transport
       fault. The operator would debug the network instead of the checkpoint.
 
-    ``context.abort`` raises, so control never returns to the caller; the
-    ``return`` below exists only so a reader is not left wondering.
+    **This function never returns, and that guarantee does not rest on
+    ``context.abort``.** A real synchronous ``ServicerContext.abort`` raises, so
+    control never reaches the second statement below. But the caller's next
+    statement after a refusal used to be the unconditional
+    ``SAFE-01 guard: PASS`` log line and ``return services_pb2.Empty()``, so
+    "abort happens to raise" was silently load-bearing: an ``aio`` servicer
+    context, a test double, or an upstream change that made ``abort`` return would
+    have produced **a ``SAFE-01 guard: PASS`` line for a handshake the guard
+    refused**, plus an OK handshake reply — the precise inverse of threat T-06-14
+    (a log line that cannot be trusted to mean what it says), and a line
+    ``tests/test_lerobot_serving_live.py`` greps for as positive evidence. It
+    would also reference the unbound ``snapshot`` local and raise
+    ``UnboundLocalError``, masking the real diagnosis.
+
+    So the raise is made explicit here rather than inferred. The annotation is
+    ``NoReturn`` so a reader and a type checker see the same contract.
     """
-    return context.abort(grpc.StatusCode.FAILED_PRECONDITION, message)
+    context.abort(grpc.StatusCode.FAILED_PRECONDITION, message)
+    # Only reachable via a context whose abort RETURNS. Refusing loudly is the
+    # only acceptable outcome: this function's callers have already dropped the
+    # policy, so continuing would report a pass for a refusal.
+    raise RuntimeError(
+        "context.abort() returned instead of raising, so this refusal did not "
+        "terminate the RPC. Refusing by raising instead: the caller's next "
+        "statement logs 'SAFE-01 guard: PASS' and returns an OK handshake reply, "
+        f"and the guard REFUSED. Original refusal: {message}"
+    )
 
 
 def _maybe_seed_rng(logger) -> int | None:

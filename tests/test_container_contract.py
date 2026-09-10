@@ -938,3 +938,86 @@ def test_client_requires_python_stays_312():
     """
     text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'requires-python = ">=3.12"' in text
+
+
+def _load_container_entrypoint():
+    """Load the container's entrypoint module from source, without Docker.
+
+    The Dockerfile copies only ``docker/lerobot-policy/*.py`` into the image, so
+    there is no package to import from the host tree. Loading the file directly
+    is what lets the preflight harness's exit contract be pinned by a keyless CI
+    test instead of resting on a manual ``docker run`` observation.
+    """
+    import importlib.util
+
+    path = REPO_ROOT / "docker" / "lerobot-policy" / "entrypoint.py"
+    spec = importlib.util.spec_from_file_location("_dume_container_entrypoint", path)
+    assert spec is not None and spec.loader is not None, f"cannot load {path}"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_preflight_refuses_when_a_check_never_runs():
+    """A vanished preflight check FAILS; it is not silently absent (T-06-37).
+
+    This is the repudiation gap the Phase 6 security audit found. The harness is
+    a ported copy whose original gates on ``passed == len(self.results)`` — every
+    *recorded* check. Under that contract, deleting a check from
+    ``run_preflight`` records nothing for it, the remaining checks all pass, and
+    the container starts on an incomplete preflight, indistinguishable from one
+    that genuinely verified everything.
+
+    Both halves are pinned, because only asserting the happy path is how this
+    regressed in the first place: all-ran-and-passed exits 0, and
+    fewer-ran-but-all-passed exits non-zero.
+    """
+    entrypoint = _load_container_entrypoint()
+
+    # All expected checks ran and passed -> serve.
+    complete = entrypoint.Checks(3)
+    for i in range(3):
+        complete.start(f"check {i}")
+        complete.ok(f"name-{i}", "fine")
+    assert complete.report() == 0
+
+    # One check never ran. Every RECORDED check passed, so the original contract
+    # would return 0 here -- that is precisely the hole.
+    truncated = entrypoint.Checks(3)
+    for i in range(2):
+        truncated.start(f"check {i}")
+        truncated.ok(f"name-{i}", "fine")
+    assert truncated.report() != 0, (
+        "a preflight missing a check must refuse to serve; every recorded check "
+        "passing is not evidence that every expected check ran"
+    )
+
+    # A recorded failure still fails, so the new clause did not replace the old one.
+    failing = entrypoint.Checks(2)
+    failing.start("check 0")
+    failing.ok("name-0", "fine")
+    failing.start("check 1")
+    failing.fail("name-1", "nope")
+    assert failing.report() != 0
+
+
+def test_preflight_numbered_lines_track_total_checks():
+    """``TOTAL_CHECKS`` is the single source of the ``[n/N]`` prefixes.
+
+    Guards against the stale-literal drift the audit looked for: the count was
+    raised 5 -> 6 when SAFE-01 was armed, and the prefixes must follow the
+    constant rather than a hardcoded number.
+    """
+    entrypoint = _load_container_entrypoint()
+    source = (REPO_ROOT / "docker" / "lerobot-policy" / "entrypoint.py").read_text(
+        encoding="utf-8"
+    )
+
+    # run_preflight() must open exactly TOTAL_CHECKS numbered checks.
+    assert source.count("checks.start(") == entrypoint.TOTAL_CHECKS, (
+        f"run_preflight() opens {source.count('checks.start(')} checks but "
+        f"TOTAL_CHECKS is {entrypoint.TOTAL_CHECKS}"
+    )
+
+    # The prefix is formatted from self.total, never a literal.
+    assert 'f"\\n[{self.index}/{self.total}]' in source

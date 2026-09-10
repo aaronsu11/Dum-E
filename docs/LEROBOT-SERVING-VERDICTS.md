@@ -320,7 +320,7 @@ mechanism that carries it instead:
 |---|---|---|
 | BACK-05 | A silent joint **permutation** passes every shape and key-set check | Ordering authority derived from `build_lerobot_features`, an ordered-list comparison, a construction-time `assert_state_ordering`, `zip(..., strict=True)`, and a **non-uniform** action vector proving dim *i* lands on joint *i* (06-04) |
 | LRG-01 | "Answers requests" is a liveness claim, not a data-shape claim | Every assertion is on the **decoded chunk**: 16 `TimedAction`s of shape `(6,)` over real gRPC, plus the zero-length-`data` guard raising a named error instead of `EOFError` (06-01, 06-04) |
-| LRG-02 | "Loads the right checkpoint" is a provenance claim | A five-check refuse-to-**start** preflight that returns before `add_insecure_port`, plus the resolved `base_model_path` asserted from the real load path (06-01, 06-06); the SAFE-01 post-load arming is 06-03's |
+| LRG-02 | "Loads the right checkpoint" is a provenance claim | A six-check refuse-to-**start** preflight that returns before `add_insecure_port`, plus the resolved `base_model_path` asserted from the real load path (06-01, 06-06); the SAFE-01 post-load arming is 06-03's |
 | LRG-03 | Relative-vs-absolute is a semantic claim about decoding | Two robot states through one observation: the arm targets track the anchor while the gripper does not, measured against a same-state noise floor (06-01) |
 | LRG-04 | Horizon 16 is a config fact, and the emitted length is forced by three truncations | `infer_groot_n1_7_action_horizon(path, "new_embodiment") == 16` asserted at CONFIG level from two independent places, with the tag passed **explicitly** because inference returns `None` here (06-02, 06-06) |
 | LRG-06 | A **deployment-shape** risk (what the run command publishes), not a shape-of-data risk | §2 above: the publish-spec test with three synthetic non-vacuity proofs (06-05) |
@@ -350,7 +350,7 @@ committed verdict has a live guard behind it rather than resting on a stale `.np
 - `scripts/build_gr00t_image.sh` — the `PIN=` the cross-backend measurement is recorded against
 - `tests/test_loopback_publish_spec.py` — the LRG-06 publish-spec guard (6 tests, never skips)
 - `README.md` — the documented `lerobot-policy` run command, under the LRG-06 anchor
-- `docker/lerobot-policy/entrypoint.py` — the five-check refuse-to-start preflight and the
+- `docker/lerobot-policy/entrypoint.py` — the six-check refuse-to-start preflight and the
   deliberate all-interfaces internal bind
 - `policy_guard/groot_guard.py` — the SAFE-01 serving-contract assertions
 - `docs/UNITS-VERDICT.md` — the sibling recorded verdict (PAR-04 / PAR-06), whose format this

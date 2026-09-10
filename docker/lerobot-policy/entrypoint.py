@@ -122,7 +122,16 @@ class Checks:
     ``scripts/`` does not exist inside the container and there is nothing to
     import from. Keep the two in sync by hand if the host-side harness changes
     shape; the contract that matters is ``report()`` returning non-zero unless
-    every recorded check passed.
+    every EXPECTED check ran and passed.
+
+    DELIBERATE DIVERGENCE from the ported original — do not "resync" it away:
+    the original gates on ``passed == len(self.results)``, i.e. every *recorded*
+    check. That is a repudiation hole here (T-06-37): a check deleted from
+    ``run_preflight`` records nothing, so the remaining checks all pass and the
+    container starts anyway — indistinguishable from a preflight that genuinely
+    verified everything. This copy additionally requires
+    ``len(self.results) == self.total``, so a vanished check FAILS rather than
+    being silently absent. ``tests/test_container_contract.py`` pins both halves.
     """
 
     def __init__(self, total: int) -> None:
@@ -150,8 +159,25 @@ class Checks:
         for name, ok in self.results.items():
             print(f"  {_green('PASS') if ok else _red('FAIL')}  {name}")
         print(f" {passed}/{len(self.results)} checks passed")
+        # A check that never ran is reported distinctly from a check that failed:
+        # the two demand different operator responses (a code/build defect vs a
+        # bad mount or a drifted revision), and conflating them is the
+        # repudiation failure T-06-37 names. Early-return failure paths
+        # legitimately record fewer than `total`, but they already carry a FAIL
+        # and so exit non-zero via the `passed` clause below.
+        missing = self.total - len(self.results)
+        if missing > 0 and passed == len(self.results):
+            print(
+                _red(
+                    f"  FAIL: {missing} of {self.total} preflight check(s) never ran. "
+                    "Every recorded check passed, so this is not a bad mount or a "
+                    "drifted revision — a check was removed from run_preflight() or "
+                    "TOTAL_CHECKS disagrees with it. Refusing to serve on an "
+                    "incomplete preflight."
+                )
+            )
         print("=" * 72)
-        return 0 if passed == len(self.results) else 1
+        return 0 if passed == len(self.results) == self.total else 1
 
 
 def _cached_backbone_revisions() -> tuple[Path, list[str]]:

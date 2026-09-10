@@ -225,13 +225,15 @@ you run side by side.
     If it is ever tightened, that should be its own change with its own verification — not
     a side effect of documenting this container.
 
-4. Verify the refusal path without starting a server. The container runs a five-check
+4. Verify the refusal path without starting a server. The container runs a six-check
    preflight before it constructs the gRPC server, and it **refuses to serve** rather than
    warning: an absent or wrong checkpoint mount, a non-raw checkpoint, an action horizon
-   that is not the checkpoint's real 16, a missing or mismatched pinned backbone snapshot,
-   or a processor build that cannot reach its offline cache each print a red `FAIL:` naming
-   the observed value and exit non-zero before anything listens. `--preflight-only` runs
-   exactly those checks and exits with their verdict, constructing no server:
+   that is not the checkpoint's real 16, a SAFE-01 serving-contract violation, a missing or
+   mismatched pinned backbone snapshot, or a processor build that cannot reach its offline
+   cache each print a red `FAIL:` naming the observed value and exit non-zero before
+   anything listens. A check that never runs at all also fails, rather than passing quietly.
+   `--preflight-only` runs exactly those checks and exits with their verdict, constructing
+   no server:
 
     ```bash
     docker run --rm --gpus all \

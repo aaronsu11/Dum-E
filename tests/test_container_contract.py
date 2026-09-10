@@ -981,6 +981,129 @@ def _load_container_server():
     return module
 
 
+BUILD_WRAPPER = REPO_ROOT / "scripts" / "build_lerobot_policy_image.sh"
+
+
+def _run_build_wrapper_sandboxed(tmp_path, dotenv_body: str):
+    """Run the build wrapper in a throwaway tree with ``docker`` stubbed out.
+
+    Executes the REAL script, so the dotenv handling under test is the shipped one.
+    ``docker`` is replaced by a shim that echoes its argv and exits 0, which is what
+    makes the ``--build-arg`` values observable: they are the pins the script actually
+    handed the build, not a restatement of its own variables.
+
+    Nothing here touches the real repo, the real ``.env`` or the real Docker daemon.
+    """
+    import shutil
+    import subprocess
+
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    (root / "docker" / "lerobot-policy").mkdir(parents=True)
+    shutil.copy(BUILD_WRAPPER, root / "scripts" / BUILD_WRAPPER.name)
+    (root / "docker" / "lerobot-policy" / "Dockerfile").write_text("FROM scratch\n")
+    (root / ".env").write_text(dotenv_body)
+
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    docker = fakebin / "docker"
+    docker.write_text('#!/bin/sh\necho "[docker] $*"\nexit 0\n')
+    docker.chmod(0o755)
+
+    env = dict(os.environ)
+    env.pop("HF_TOKEN", None)
+    env.pop("DUME_NO_DOTENV", None)
+    env["PATH"] = f"{fakebin}:{env['PATH']}"
+    return subprocess.run(
+        ["bash", f"scripts/{BUILD_WRAPPER.name}"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_dotenv_cannot_replace_the_build_wrappers_reproducibility_pins(tmp_path):
+    """A ``.env`` entry cannot silently replace ``LEROBOT_PIN``/``BACKBONE_REVISION``.
+
+    WR-08. The wrapper assigned its five pins and THEN ran ``set -a; . .env; set +a``,
+    which executes .env in the current shell and exports everything it assigns — so any
+    of those five names appearing in .env overwrote the pin, unconditionally and with no
+    message. The post-build assertion could not catch it, because it compares the image
+    against ``$BACKBONE_REVISION``: the SAME overridden variable. The "reproducibility
+    anchor" was self-referential once .env was in play, and the image would still be
+    tagged ``lerobot-policy`` while carrying a different backbone revision than the
+    script declares.
+
+    Asserted against the pins the script actually handed ``docker build``, and against
+    the value it handed the in-image assertion — the two places the override would show
+    up — rather than against the script's own echo of its variables.
+    """
+    hostile = (
+        "HF_TOKEN=hf_sandbox_not_a_real_token\n"
+        "LEROBOT_PIN=9.9.9\n"
+        "BACKBONE_REVISION=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"
+        "IMAGE_TAG=totally-different\n"
+    )
+    result = _run_build_wrapper_sandboxed(tmp_path, hostile)
+    combined = result.stdout + result.stderr
+
+    source = BUILD_WRAPPER.read_text(encoding="utf-8")
+    pinned_revision = re.search(r'^BACKBONE_REVISION="([0-9a-f]+)"', source, re.M).group(1)
+    pinned_lerobot = re.search(r'^LEROBOT_PIN="([^"]+)"', source, re.M).group(1)
+
+    assert f"--build-arg LEROBOT_PIN={pinned_lerobot}" in combined, combined
+    assert f"--build-arg BACKBONE_REVISION={pinned_revision}" in combined, combined
+    assert f"EXPECT_BACKBONE_REVISION={pinned_revision}" in combined, (
+        "the in-image assertion was handed the .env's revision, so it validated the "
+        f"override instead of catching it:\n{combined}"
+    )
+    for override in ("9.9.9", "deadbeef", "totally-different"):
+        assert override not in combined, (
+            f"the .env value {override!r} reached the build:\n{combined}"
+        )
+
+    # The correct behaviour must be VISIBLE. "The .env entry is ignored" is otherwise
+    # as silent as "the .env entry wins" was, and an operator who put a revision in
+    # .env expecting it to take effect could not tell which happened. Names only --
+    # never values, and never the token.
+    assert "WARNING: .env names build pin(s)" in result.stderr, result.stderr
+    for named in ("LEROBOT_PIN", "BACKBONE_REVISION", "IMAGE_TAG"):
+        assert named in result.stderr, result.stderr
+    assert "hf_sandbox_not_a_real_token" not in combined, "the token was echoed"
+
+
+def test_the_build_wrapper_still_reads_hf_token_from_dotenv(tmp_path):
+    """Hardening the dotenv path did not break the thing it exists for.
+
+    The token still has to come out of ``.env`` — this repo's convention is that
+    credentials live there, not in the shell — and a wrapper that stopped reading it
+    would fail closed on every normal invocation.
+    """
+    result = _run_build_wrapper_sandboxed(tmp_path, "HF_TOKEN=hf_sandbox_not_a_real_token\n")
+    combined = result.stdout + result.stderr
+
+    assert "HF_TOKEN is not set" not in combined, (
+        f"the wrapper no longer reads HF_TOKEN from .env:\n{combined}"
+    )
+    assert "--secret id=hf_token,env=HF_TOKEN" in combined, combined
+    # A token still reaches Docker ONLY as a BuildKit secret, never a --build-arg
+    # (which would persist into the image history).
+    assert "--build-arg HF_TOKEN" not in combined, combined
+    assert "hf_sandbox_not_a_real_token" not in combined, "the token was echoed"
+    # And no pin warning on a normal .env.
+    assert "names build pin(s)" not in result.stderr, result.stderr
+
+
+def test_the_build_wrapper_fails_closed_without_a_token(tmp_path):
+    """No token anywhere still refuses to build, naming the gated repo."""
+    result = _run_build_wrapper_sandboxed(tmp_path, "SOMETHING_ELSE=x\n")
+    assert result.returncode != 0
+    assert "HF_TOKEN is not set" in result.stderr
+    assert "[docker] build" not in result.stdout, "it started a build without a token"
+
+
 def test_container_camera_and_frame_geometry_match_the_client_handshake():
     """The server's declared geometry IS the client's, asserted ACROSS the boundary.
 

@@ -56,6 +56,24 @@ IMAGE_TAG="lerobot-policy"
 
 DOCKERFILE="docker/lerobot-policy/Dockerfile"
 
+# == FREEZE THE ANCHOR BEFORE ANYTHING ELSE CAN TOUCH IT.
+#
+# `readonly` here is load-bearing, not tidiness. The dotenv fallback below used to
+# run AFTER these five assignments and used `set -a` + `.`, which executes .env in
+# THIS shell and exports everything it assigns — so a LEROBOT_PIN or
+# BACKBONE_REVISION line in .env silently replaced the pin, unconditionally and
+# with no message. The post-build assertion could not catch it either, because it
+# compares the image against `$BACKBONE_REVISION`: the same overridden variable. A
+# "reproducibility anchor" that reads its own overridden value is self-referential,
+# and the image would have been tagged `lerobot-policy` while carrying a different
+# backbone revision than this script declares.
+#
+# With `readonly`, an override attempt is a hard `set -e` failure naming the
+# variable instead of a silent substitution. The extraction below no longer sources
+# .env into this shell at all, so this is defence in depth rather than the only
+# barrier — both are kept, because the failure being defended against is silent.
+readonly LEROBOT_PIN BACKBONE_MODEL BACKBONE_REVISION IMAGE_TAG DOCKERFILE
+
 # ==================== DOTENV FALLBACK ====================
 # This repo's convention is that credentials live in the repo-root .env, not in
 # the shell environment — tests/test_speech_live.py loads dotenv for exactly this
@@ -63,14 +81,43 @@ DOCKERFILE="docker/lerobot-policy/Dockerfile"
 # environment". A build wrapper that refuses to build while the token sits in
 # .env two lines away would be user-hostile, so load it here when it is absent.
 #
+# ONLY HF_TOKEN is extracted, and the sourcing happens in a SEPARATE `bash -c`
+# PROCESS. That is the actual fix for the fail-open: nothing .env assigns can reach
+# this shell at all, so the five pins above are untouchable through it, and the
+# arbitrary shell .env executes cannot clobber any other exported variable of ours
+# either. A `$( ... )` subshell would NOT do: it inherits the `readonly` attributes
+# set above, so a `.env` naming a pin would make the assignment fail, take the
+# subshell down under the inherited `set -e`, and abort this script with no message
+# at all — fail-closed but undiagnosable, which is not the standard the rest of this
+# file holds. `|| true` keeps a broken .env from aborting the build before the
+# named, fail-closed HF_TOKEN check below can report it.
+#
 # The token is never echoed, and it still reaches Docker only as a BuildKit
 # secret. DUME_NO_DOTENV=1 disables this so the fail-closed check below stays
 # testable on a machine that does have a .env.
 if [ -z "${HF_TOKEN:-}" ] && [ "${DUME_NO_DOTENV:-0}" != "1" ] && [ -f "$_REPO_ROOT/.env" ]; then
-  set -a
-  # shellcheck source=/dev/null
-  . "$_REPO_ROOT/.env"
-  set +a
+  # Report — by NAME only, never by value — any pin the .env names. Without this the
+  # correct new behaviour ("the .env entry is ignored") is as silent as the old wrong
+  # behaviour ("the .env entry wins"), and an operator who put a revision in .env
+  # expecting it to take effect would have no way to tell which happened.
+  _shadowed="$(
+    grep -oE '^[[:space:]]*(export[[:space:]]+)?(LEROBOT_PIN|BACKBONE_MODEL|BACKBONE_REVISION|IMAGE_TAG|DOCKERFILE)=' \
+      "$_REPO_ROOT/.env" 2>/dev/null |
+      grep -oE '(LEROBOT_PIN|BACKBONE_MODEL|BACKBONE_REVISION|IMAGE_TAG|DOCKERFILE)' |
+      sort -u | tr '\n' ' '
+  )" || true
+  if [ -n "${_shadowed:-}" ]; then
+    echo "WARNING: .env names build pin(s): ${_shadowed}" >&2
+    echo "         They are IGNORED. These five values are this script's reproducibility" >&2
+    echo "         anchor and are readonly; only HF_TOKEN is read from .env. Edit this" >&2
+    echo "         script to change a pin." >&2
+  fi
+  # shellcheck disable=SC2016
+  HF_TOKEN="$(
+    bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s" "${HF_TOKEN:-}"' _ "$_REPO_ROOT/.env" \
+      2>/dev/null || true
+  )"
+  export HF_TOKEN
 fi
 
 # Fail closed on a missing token rather than building a cache-empty layer that

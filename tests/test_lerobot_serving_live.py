@@ -57,6 +57,7 @@ Run it:
 """
 
 import datetime
+import json
 import os
 import socket
 import subprocess
@@ -123,6 +124,95 @@ CONTAINER_READY_BUDGET_S = 240.0
 #: ``FAILED_PRECONDITION`` would burn the whole budget and then be reported as a
 #: generic "unreachable".
 REFUSAL_BUDGET_S = 60.0
+
+#: **The served image geometry, and the oracle it must reproduce.** A 480x640x3
+#: uint8 frame must reach the VLM as the padded square Isaac-GR00T produced when it
+#: trained these weights — not the ``(256, 340, 3)`` LeRobot's flag-honouring path
+#: yields for this checkpoint's ``letter_box_transform: false``. The digest is
+#: Isaac's own eval output, measured in ``gr00t:latest``; reproducing it INSIDE the
+#: serving image is what makes the cross-backend agreement a property of the shipped
+#: container rather than of the host venv.
+#:
+#: Recorded here as literals rather than imported from ``scripts/`` because these are
+#: what the CONTAINER must produce; the host-side pins live in
+#: ``tests/test_par05_image_geometry.py`` and the two are compared by
+#: ``test_live_container_image_preprocesses_480x640_to_the_padded_square``.
+SERVED_GEOMETRY = (256, 256, 3)
+SERVED_GEOMETRY_SHA256 = "c30150ec8d9d7ccb648aade0588aed2d18a356ab7f984a510dc57bb6c485927f"
+
+#: An in-container probe of the SERVED image geometry. Run through ``docker exec``
+#: against the already-serving container, so it measures the shipped image's own
+#: ``lerobot``, ``numpy`` and OpenCV builds.
+#:
+#: It BUILDS the real preprocessor pipeline with the server's own override fragment
+#: (imported from ``policy_guard``, which the Dockerfile copies to ``/app`` — one
+#: definition across the process boundary), then reads the five geometry settings off
+#: the constructed ``GrootN17VLMEncodeStep`` and calls the same transform that step
+#: calls. Nothing is reimplemented: upstream documents its ``cv2.INTER_AREA`` resize
+#: and floored center crop as needing to stay bit-exact, so a hand-rolled copy would
+#: manufacture the mismatch this measurement exists to rule out.
+#:
+#: Weight-free and GPU-free by construction — the encode step's Qwen processor is
+#: lazy and never touched, and no policy is loaded — so it cannot disturb the
+#: server's resident VRAM while it runs.
+_SERVED_GEOMETRY_PROBE = '''
+import hashlib, json
+import numpy as np
+from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.policies import make_pre_post_processors
+from lerobot.policies.groot.configuration_groot import GrootConfig
+from lerobot.policies.groot.processor_groot import (
+    _transform_n1_7_image_for_vlm_albumentations,
+)
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+
+from policy_guard.groot_guard import EXPECTED_TAG, serving_preprocessor_overrides
+
+CK = "/checkpoints/model"
+cfg = GrootConfig(base_model_path=CK, embodiment_tag=EXPECTED_TAG, model_params_fp32=False)
+cfg.input_features = {
+    f"{OBS_IMAGES}.{cam}": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 480, 640))
+    for cam in ("wrist", "front")
+}
+cfg.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(6,))
+cfg.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,))}
+cfg.device = "cpu"
+
+overrides = {"device_processor": {"device": "cpu"}, "rename_observations_processor": {"rename_map": {}}}
+overrides.update(serving_preprocessor_overrides())
+pre, _post = make_pre_post_processors(
+    cfg,
+    pretrained_path=CK,
+    preprocessor_overrides=overrides,
+    postprocessor_overrides={"device_processor": {"device": "cpu"}},
+)
+steps = [s for s in pre.steps if hasattr(s, "letter_box_transform")]
+if not steps:
+    raise SystemExit("no pipeline step carries letter_box_transform")
+step = steps[-1]
+settings = {
+    name: getattr(step, name)
+    for name in (
+        "image_crop_size",
+        "image_target_size",
+        "shortest_image_edge",
+        "crop_fraction",
+        "letter_box_transform",
+    )
+}
+frame = np.random.RandomState(0).randint(0, 255, (480, 640, 3), dtype=np.uint8)
+out = _transform_n1_7_image_for_vlm_albumentations(frame, **settings)
+declared = json.load(open(CK + "/processor_config.json"))["processor_kwargs"]["letter_box_transform"]
+print("DUME_PROBE " + json.dumps({
+    "shape": [int(n) for n in out.shape],
+    "dtype": str(out.dtype),
+    "sha256": hashlib.sha256(np.ascontiguousarray(out).tobytes()).hexdigest(),
+    "input_sha256": hashlib.sha256(np.ascontiguousarray(frame).tobytes()).hexdigest(),
+    "served_letter_box_transform": bool(settings["letter_box_transform"]),
+    "checkpoint_letter_box_transform": bool(declared),
+    "numpy": np.__version__,
+}))
+'''
 
 #: A language instruction is REQUIRED, not decorative. The LeRobot-side language
 #: key is "task" (``processor_groot.py:1547``); when it is absent
@@ -550,6 +640,12 @@ def test_live_guard_pass_is_logged_on_the_real_load_path():
     that is invoked and passes — which is why the pass is an observable log line
     (threat T-06-14, repudiation) rather than silence.
 
+    It also carries the SERVED IMAGE GEOMETRY, which is the same question asked of a
+    different field: the checkpoint declares ``letter_box_transform: false`` and the
+    serving path forces it ``true``, so the PASS line must report both — and the
+    in-image probe called at the end turns that reported flag into a measured
+    ``(256, 256, 3)`` matching Isaac-GR00T's own bytes.
+
     It also discharges what plan 06-02 could not: ``snapshot_from_loaded`` locates
     the pack step by ``state_dropout_prob``, the encode step by
     ``letter_box_transform`` and the decode step by ``env_action_dim``, and 06-02's
@@ -591,6 +687,127 @@ def test_live_guard_pass_is_logged_on_the_real_load_path():
         "SAFE-01/3 should have refused) or snapshot_from_loaded's env_action_dim marker "
         f"no longer locates the decode step.\n  log window:\n{log}"
     )
+
+    # ---- the SERVED image geometry, the one value that contradicts the checkpoint ----
+    # Both flags are asserted from the same line, because either alone would be weak:
+    # `served_letter_box_transform=True` alone could be a constant the guard prints
+    # without having read the pipeline, and `checkpoint_letter_box_transform=False`
+    # alone says nothing about what the server does. Together they show the override
+    # LANDED on the object that will transform frames — the checkpoint says off, the
+    # served pipeline says on. If it ever stopped landing, SAFE-01/5 would refuse the
+    # handshake outright; that refusal is proven keylessly by
+    # tests/test_groot_guard.py::test_violation_5a2_served_letterbox_off_raises, and
+    # this is the positive, wired half.
+    assert "served_letter_box_transform=True" in log, (
+        "the guard's PASS line does not report served_letter_box_transform=True, so the "
+        "forced letterbox pad is NOT observable on the served pipeline. Either the "
+        "override in docker/lerobot-policy/server.py did not land (the step's registry "
+        "name may have moved) or the log line lost the value — and without it a server "
+        "feeding the VLM the unpadded (256, 340, 3) geometry is indistinguishable from a "
+        f"correct one.\n  log window:\n{log}"
+    )
+    assert "checkpoint_letter_box_transform=False" in log, (
+        "the guard's PASS line does not report checkpoint_letter_box_transform=False. "
+        "That value is what makes the forced True above evidence of an override rather "
+        f"than a value inherited from the checkpoint's own configuration.\n"
+        f"  log window:\n{log}"
+    )
+
+    # And what that flag actually MEANS, measured in the shipped image rather than
+    # inferred from the log: 480x640 -> (256, 256, 3), byte-identical to Isaac-GR00T's
+    # own eval output. See the helper's docstring for why it rides along here.
+    _assert_served_geometry_in_the_image()
+
+
+def _assert_served_geometry_in_the_image() -> dict:
+    """MEASURE, inside the shipped image, what a 480x640 frame becomes.
+
+    Not a separate test on purpose, and the reason is cohesion rather than bookkeeping:
+    it answers the same question as the PASS-line assertions it is called from — *is the
+    object that will serve inference the one we intend?* — and it is what turns the log
+    line's ``served_letter_box_transform=True`` from a reported flag into a geometry. It
+    also shares that test's handshake instead of paying for another one. (It keeps the
+    module's opt-in skip count at 8, too, which is worth stating but is not the reason.)
+
+    The probe builds the real preprocessor pipeline with the server's own override
+    fragment, reads the geometry settings off the constructed encode step, and runs the
+    same transform that step runs — inside the image, on the image's own numpy and
+    OpenCV builds. Nothing is reimplemented.
+
+    Three things are asserted, and each closes off a way the result could be hollow:
+
+    1. The INPUT bytes are the shared seed-0 frame the Isaac-side measurement used. Two
+       independently generated frames would not be a comparison at all.
+    2. The OUTPUT shape is the padded square, and its digest equals Isaac-GR00T's own
+       eval output digest — measured in ``gr00t:latest`` at the pinned ``23ace64f``.
+    3. The served flag is ``True`` while the checkpoint's declared flag is ``False``, so
+       the geometry is the result of the override rather than of the configuration.
+
+    **This does not upgrade the cross-container fidelity contract**, which
+    ``docs/LEROBOT-SERVING-VERDICTS.md`` §1 keeps at *shape only*: a future OpenCV build
+    may legitimately move a pixel. If a base-image bump turns this red, RE-MEASURE both
+    backends and re-record — never replace it with a tolerance.
+
+    No weights, no GPU, no network: no policy is loaded and the encode step's Qwen
+    processor is lazy and never touched, so this cannot perturb the resident server.
+    """
+    # Imported here, the same idiom `_documented_run_command` uses: the keyless module
+    # owns the sys.path fix-up for `scripts/`, and importing its pins is what stops this
+    # file's literals drifting from the recorded verdict.
+    from tests.test_par05_image_geometry import (
+        GR00T_NATIVE_EVAL_OUTPUT_SHA256,
+        SERVING_EXPECTED_SHAPE,
+        SHARED_INPUT_FRAME_SHA256,
+    )
+
+    assert SERVED_GEOMETRY == SERVING_EXPECTED_SHAPE
+    assert SERVED_GEOMETRY_SHA256 == GR00T_NATIVE_EVAL_OUTPUT_SHA256
+
+    completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["docker", "exec", "-i", CONTAINER_NAME, "python3", "-"],
+        input=_SERVED_GEOMETRY_PROBE,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"the in-container geometry probe exited {completed.returncode}. A probe that "
+        f"cannot run is not a passing measurement.\n  stdout:\n{completed.stdout}\n"
+        f"  stderr:\n{completed.stderr}"
+    )
+    lines = [line for line in completed.stdout.splitlines() if line.startswith("DUME_PROBE ")]
+    assert len(lines) == 1, (
+        f"expected exactly one DUME_PROBE line from the in-container probe, got "
+        f"{len(lines)}.\n  stdout:\n{completed.stdout}\n  stderr:\n{completed.stderr}"
+    )
+    measured = json.loads(lines[0].removeprefix("DUME_PROBE "))
+
+    assert measured["input_sha256"] == SHARED_INPUT_FRAME_SHA256, (
+        f"the container generated a different input frame ({measured['input_sha256']}) "
+        f"than the Isaac-side measurement hashed ({SHARED_INPUT_FRAME_SHA256}), so this "
+        f"is not a comparison between the two backends at all. numpy in the image: "
+        f"{measured['numpy']}"
+    )
+    assert tuple(measured["shape"]) == SERVED_GEOMETRY, (
+        f"the shipped image preprocesses a 480x640 frame to {tuple(measured['shape'])}, "
+        f"expected {SERVED_GEOMETRY}. The served geometry is not the padded square "
+        f"Isaac-GR00T produced when it trained these weights."
+    )
+    assert measured["dtype"] == "uint8"
+    assert measured["sha256"] == SERVED_GEOMETRY_SHA256, (
+        f"shape is right but the BYTES are not: {measured['sha256']} against Isaac's "
+        f"{SERVED_GEOMETRY_SHA256}. RE-MEASURE both backends and re-record; do not relax "
+        f"this to a tolerance."
+    )
+    assert measured["served_letter_box_transform"] is True
+    assert measured["checkpoint_letter_box_transform"] is False, (
+        "the checkpoint now DECLARES the letterbox pad on, so the recorded geometry "
+        "verdict was measured against a different recipe and must be re-measured "
+        "(SAFE-01/5 refuses this case on purpose)."
+    )
+    print(f"\n  served geometry, measured in the image: {measured}")
+    return measured
 
 
 def test_live_wrong_actions_per_chunk_is_refused_with_safe01_2():

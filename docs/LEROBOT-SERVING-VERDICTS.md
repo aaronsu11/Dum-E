@@ -1,11 +1,22 @@
 # LeRobot Serving Verdicts
 
-**Status:** PAR-05's **LeRobot side** is resolved by executed evidence (§1); its **cross-backend
-comparison has since been run and MISMATCHED** — LeRobot `(256, 340, 3)` vs Isaac-GR00T
-`(256, 256, 3)` (last section), so PAR-05 is **flagged for review** and criterion 5's "identical
-shape" clause is **not satisfied**. LRG-06 **enforced** by a committed test (§2). The ROADMAP's Phase 6
-criteria carry six recorded corrections (§3) and three named open gaps (§4), of which gap 1 (A8) is now
-closed as a measurement. Standing engineering resolution — not a changelog entry.
+**Status:** PAR-05 is **resolved on both sides, and the cross-backend comparison now AGREES** —
+Isaac-GR00T `(256, 256, 3)` and the LeRobot **serving** path `(256, 256, 3)`, byte-identical
+(sha256 `c30150ec…`). ~~its cross-backend comparison has since been run and MISMATCHED — LeRobot
+`(256, 340, 3)` vs Isaac-GR00T `(256, 256, 3)`, so PAR-05 is flagged for review and criterion 5's
+"identical shape" clause is not satisfied~~ — superseded by the gap-closure fix recorded in the last
+section: the serving path now **forces the letterbox pad on**, which is the single stage the two
+backends disagreed about. Criterion 5's *"identical shape"* clause **is** satisfied for the serving
+path. LRG-06 **enforced** by a committed test (§2). The ROADMAP's Phase 6 criteria carry six recorded
+corrections (§3) and three named open gaps (§4), of which gap 1 (A8) is closed as a measurement **and
+its mismatch is now resolved**. Standing engineering resolution — not a changelog entry.
+
+**The one assumption this rests on, stated up front because it was accepted knowingly.** Matching
+Isaac rather than honouring the checkpoint's own flag rests on an **inference**: "the weights were
+trained on Isaac's padded square" follows from "Isaac trained this checkpoint". **The training recipe
+itself was never read, and no local artifact records it.** The operator chose to act on the inference
+rather than spend a step confirming it. If Phase 7's parity work disappoints, this is the first thing
+to re-examine. It is not settled fact and must not be written up as one.
 
 This document records what Phase 6 settled about serving the fine-tuned
 `checkpoints/GR00T-N1.7-3B-SO101` checkpoint through LeRobot: the checkpoint's real preprocessed
@@ -24,19 +35,36 @@ comparison `scripts/dump_gr00t_native_preprocessed_image.py`; the always-running
 
 ## PAR-05 image-geometry verdict
 
-> **A 480x640x3 uint8 frame becomes exactly `(256, 340, 3)` uint8** under this checkpoint's own
-> image recipe.
+> **THE SERVING VERDICT: a 480x640x3 uint8 frame becomes exactly `(256, 256, 3)` uint8** on the path
+> Dum-E's `lerobot-policy` container actually serves, because that path **forces the letterbox pad
+> on**.
+>
+> **HISTORY, kept because the fix only makes sense against it:** ~~a 480x640x3 uint8 frame becomes
+> exactly `(256, 340, 3)` uint8 under this checkpoint's own image recipe~~ — still true of the
+> **unpatched** upstream transform run as this checkpoint configures it
+> (`letter_box_transform: false`), and no longer what the server feeds the VLM.
 
-This is a resolution stated as exact integers, not an approximation and not a note. The transform is
+Both are resolutions stated as exact integers, not approximations and not notes. The transform is
 a deterministic cv2 `INTER_AREA` resize plus a floored center crop, so there is no tolerance to
 allow: `tests/test_par05_image_geometry.py` asserts tuple equality on integers, and the
 within-LeRobot comparisons use `numpy.array_equal`, never `numpy.allclose`.
 
-**The effective pipeline** (`processor_groot.py:1435-1468`):
+**The effective pipelines** (`processor_groot.py:1423-1468`):
 
 ```
-resize-shortest-edge-to-256  ->  center-crop-95%  ->  resize-shortest-edge-to-256
+SERVING   :  letterbox-pad-to-square (FORCED)  ->  resize-shortest-edge-to-256  ->  center-crop-95%  ->  resize-shortest-edge-to-256
+UNPATCHED :                                        resize-shortest-edge-to-256  ->  center-crop-95%  ->  resize-shortest-edge-to-256
 ```
+
+**Where the forced pad is injected, and how it is verified.** One definition,
+`policy_guard.groot_guard.serving_preprocessor_overrides()`, merged into the same
+`make_pre_post_processors` call in `docker/lerobot-policy/server.py` that already carries the device
+and rename-map overrides — upstream's own public step-override seam
+(`processor_groot.py:401-455`), not a monkeypatch and not a hand-rolled resize. `SAFE-01/5` then
+reads the **effective** value back off the built `GrootN17VLMEncodeStep` and refuses the handshake
+if the override did not land, so a silently-dropped pad cannot become a silently-wrong geometry.
+Measured in the shipped image (`docker exec`, no weights, no GPU): `(256, 256, 3)` uint8, sha256
+`c30150ec…`, `served_letter_box_transform=True` against the checkpoint's declared `False`.
 
 ### The recipe, and where it comes from
 
@@ -48,7 +76,7 @@ different shape.
 
 | Key | Value | Role in the verdict |
 |---|---|---|
-| `letter_box_transform` | `false` | This checkpoint does **not** take the letterbox branch |
+| `letter_box_transform` | `false` | What the checkpoint **declares**. The unpatched transform honours it; **the serving path overrides it to `true`** (see above). Asserted as a drift catcher: every number in this document was measured against a checkpoint declaring `false` |
 | `crop_fraction` | `0.95` | The center crop; **set**, so it takes precedence over `image_crop_size` |
 | `image_crop_size` | `[230, 230]` | **Provably inert** — see below |
 | `image_target_size` | `[256, 256]` | Supplies `target_h` as the fallback resize edge only; **not** the output shape |
@@ -57,47 +85,70 @@ different shape.
 
 ### Observed shapes
 
-Measured by `scripts/dump_preprocessed_image.py --outdir outputs/par05 --seed 0` (6/6 checks PASS,
+Measured by `scripts/dump_preprocessed_image.py --outdir outputs/par05 --seed 0` (**9/9** checks PASS,
 exit 0), transcribed from `outputs/par05/manifest.json`. Seed **0**; source frame **480x640x3
 uint8**, built with `numpy.random.RandomState(0)` so the bytes are reproducible.
 
 | Case | Input shape | Output shape | dtype |
 |---|---|---|---|
-| `checkpoint_recipe` | `[480, 640, 3]` | **`[256, 340, 3]`** | `uint8` |
-| `placeholder_corrupted` (C-3) | `[224, 224, 3]` | `[256, 256, 3]` | `uint8` |
+| **`serving_path`** (pad FORCED, geometry read off the BUILT pipeline) | `[480, 640, 3]` | **`[256, 256, 3]`** | `uint8` |
+| `checkpoint_recipe` (unpatched, pad as declared) | `[480, 640, 3]` | `[256, 340, 3]` | `uint8` |
+| `placeholder_corrupted` (C-3, unpatched) | `[224, 224, 3]` | `[256, 256, 3]` | `uint8` |
 | `square_256` | `[256, 256, 3]` | `[256, 256, 3]` | `uint8` |
 | `letterbox` (`letter_box_transform=True`) | `[480, 640, 3]` | `[256, 256, 3]` | `uint8` |
 
-Two further measured facts from the same manifest:
+The `serving_path` row is not a re-run of the `letterbox` row with a different name, even though the
+two agree byte-for-byte. It is measured off the **real built pipeline**: the probe calls
+`make_pre_post_processors` with the server's own override fragment, reads the five geometry settings
+off the constructed `GrootN17VLMEncodeStep`, and hands them to the transform that step itself calls.
+Check 3 fails if the override did not land, so the row cannot become a restatement of an intention.
+
+Three further measured facts from the same manifest:
 
 - **`crop_size_inert: true`** — the `[230, 230]` output and a `[999, 999]` output are byte-identical
   under `numpy.array_equal`. `image_crop_size` is consulted **only** when `crop_fraction is None`
   (`processor_groot.py:1453-1454`), so `[230, 230]` is dead configuration on this checkpoint.
   **Recorded so a future reader does not spend time tuning a value that does nothing.** Proven by
   measurement, not by citing upstream's source.
-- **`replay_identical: true`** — two invocations on the same frame are byte-identical. The serving
-  path takes the deterministic CENTER crop; the train-time random crop is gated on
-  `self.training and torch.is_grad_enabled()` and both are false there.
+- **`replay_identical: true`** and **`serving_replay_identical: true`** — two invocations on the same
+  frame are byte-identical, on both geometries. The serving path takes the deterministic CENTER crop;
+  the train-time random crop is gated on `self.training and torch.is_grad_enabled()` and both are
+  false there.
+- **`serving_corruption_shape_invisible: true`** — **the honest cost of the forced pad, recorded as a
+  measurement rather than omitted.** Because the pad squares every input, the C-3 corruption and a
+  correct frame now emerge with the **same** shape `(256, 256, 3)` on the serving path and differ only
+  in pixels. The shape-only discriminability described in the *Fidelity decision* below was a property
+  of the **unpatched** path and is no longer available on the served one. What carries C-3 now is
+  **prevention**, not detection: `fixup_policy_features` sets `input_features` before
+  `from_pretrained`, so the `(3, 224, 224)` placeholder branch — guarded by `config is None`
+  (`modeling_groot.py:247-261`) — never runs at all. Do not inherit "a shape check catches C-3" as a
+  live reassurance.
 
 ### Stale framing
 
 The ROADMAP asks to settle *"341x256-crop vs 256x256-letterbox empirically"*. **That framing is a
 misread, and `REQUIREMENTS.md:50` already records it as one** — the ROADMAP section never caught up.
-The real answer is neither option, and both halves of the framing are real but non-decisive:
+Its two halves are real but neither described the answer, and the served answer is now the second of
+them **for a reason the framing did not contain**:
 
 - **`256x341` is an INTERMEDIATE**, not an output: it is what the first resize-shortest-edge of a
   480x640 frame produces, before the 95% center crop and the second resize.
-- **`256x256` is the LETTERBOX branch**, which this checkpoint does not take
-  (`letter_box_transform: false`). It is also reachable *without* letterboxing, from any square
-  input — which is why "256x256" on its own identifies nothing.
+- **`256x256` is the LETTERBOX branch.** The checkpoint's own config declines it
+  (`letter_box_transform: false`); the serving path **takes it anyway**, by override, because Isaac's
+  code took it when it trained these weights. It is also reachable *without* letterboxing, from any
+  square input — which is why "256x256" on its own still identifies nothing, and why the served
+  geometry has to be evidenced by the pad flag rather than by the shape alone.
 
-Both negatives are documented by **named passing tests** rather than omitted, so they cannot be
+Both facts are documented by **named passing tests** rather than omitted, so they cannot be
 "simplified" away later:
 
-- `test_letterbox_branch_is_256x256x3_and_this_checkpoint_does_not_take_it`
+- `test_letterbox_branch_is_256x256x3_and_this_checkpoint_declares_it_off`
 - `test_square_256_input_is_256x256x3`
 
-Each docstring states that it documents the stale framing and is **never the verdict's evidence**.
+Each docstring states that it documents the stale framing rather than evidencing the verdict. The
+letterbox test additionally asserts that forcing the pad reproduces the SERVED output byte for byte, so
+the two facts — "this branch is reachable" and "the serving path takes it" — are pinned in one place and
+cannot drift apart.
 
 ### Fidelity decision
 
@@ -106,14 +157,25 @@ Each docstring states that it documents the stale framing and is **never the ver
 | Cross-container (LeRobot vs pinned Isaac-GR00T `23ace64f`) | **shape only** | Two different OpenCV builds and two different Python versions (the GR00T container is Py3.10); bit-exactness is not a reasonable contract across them |
 | Within-LeRobot (two dumps, same interpreter) | **exact array equality** (`numpy.array_equal`) | Same OpenCV build in the same process, so an interpolation or floored-crop change must be a hard failure, not an approximate pass |
 
-**Shape-only is defensible here for a specific, measured reason, not for convenience.** A shape check
-would normally be weak. It is strong on this leg because the corruption it must catch **changes the
-shape**: a frame pre-resized to 224x224 by `from_pretrained`'s placeholder feature (C-3 — the
-placeholder is `(3, 224, 224)` at `modeling_groot.py:255-261`, and
-`prepare_raw_observation` resizes every camera to it at `helpers.py:165-168`) emerges as
-`(256, 256, 3)`, **not** `(256, 340, 3)`.
-`test_placeholder_pre_resize_corruption_is_256x256x3_and_differs` asserts both the corrupted shape
-and that it differs from the correct one, so the discriminating property is itself under test.
+~~**Shape-only is defensible here for a specific, measured reason, not for convenience.** A shape
+check would normally be weak. It is strong on this leg because the corruption it must catch **changes
+the shape**: a frame pre-resized to 224x224 by `from_pretrained`'s placeholder feature emerges as
+`(256, 256, 3)`, **not** `(256, 340, 3)`.~~
+
+**SUPERSEDED for the serving path by the forced pad, and the replacement is weaker — stated plainly
+rather than glossed.** The struck rationale was a property of the **unpatched** geometry and still
+holds there (`test_placeholder_pre_resize_corruption_is_256x256x3_and_differs_only_unpatched` asserts
+it). On the **served** geometry it does not: the pad squares every input, so the C-3 corruption (the
+placeholder is `(3, 224, 224)` at `modeling_groot.py:255-261`, and `prepare_raw_observation` resizes
+every camera to it at `helpers.py:165-168`) emerges as `(256, 256, 3)` — **the same shape as a correct
+frame**, differing only in pixels. That same test asserts both halves of the new situation too (same
+shape, different bytes), so the loss of discriminability is itself under test rather than merely
+described.
+
+What carries C-3 now is **prevention**: `fixup_policy_features` sets `input_features` before
+`from_pretrained`, so the placeholder branch — guarded by `config is None` — never executes. The
+cross-container leg's fidelity stays **shape only** as a *contract*; the byte-level agreement recorded
+in the last section is an observation on top of it, not a promotion of it.
 
 ---
 
@@ -210,29 +272,33 @@ in-container half is plan 06-03's and is appended below when measured.
 
 Named explicitly so none of them disappears into a summary.
 
-### 1. ~~The cross-container PAR-05 dump was never attempted~~ — RUN, and it MISMATCHED (assumption A8)
+### 1. ~~The cross-container PAR-05 dump was never attempted~~ ~~— RUN, and it MISMATCHED~~ — RUN, MISMATCHED, and now RESOLVED (assumption A8)
 
-**This gap is closed as a measurement, and the measurement is a mismatch.** The GR00T-native dump was
-run in the pinned Isaac-GR00T image on the same `RandomState(0)` 480x640x3 frame under the same six
-recipe values, and the two backends do **not** produce the same geometry:
+**This gap is CLOSED. The dump was run, it mismatched, and the mismatch has been fixed.** The
+GR00T-native dump was run in the pinned Isaac-GR00T image on the same `RandomState(0)` 480x640x3 frame
+under the same six recipe values. It first showed a divergence; the serving path was then changed to
+force the letterbox pad on, and a re-run shows agreement:
 
 | Backend | Measured output | Fidelity |
 |---|---|---|
-| LeRobot `processor_groot` (§1) | **`(256, 340, 3)`** uint8 | executed, exact |
-| Isaac-GR00T `image_augmentations` (below) | **`(256, 256, 3)`** uint8 | executed, exact |
+| LeRobot **serving** path (§1, pad forced) | **`(256, 256, 3)`** uint8, sha256 `c30150ec…` | executed, exact |
+| Isaac-GR00T `image_augmentations` (below) | **`(256, 256, 3)`** uint8, sha256 `c30150ec…` | executed, exact |
+| ~~LeRobot `processor_groot` as configured~~ (unpatched, kept as history) | ~~**`(256, 340, 3)`** uint8~~ | executed, exact |
 
-Criterion 5's *"identical shape"* clause is therefore **NOT satisfied**. Full evidence, provenance and
-root cause: **the "PAR-05 cross-backend comparison" section at the end of this document**. Requirement **PAR-05 is flagged for review** — its comparison has now been
-*performed*, which is what it asked for, but the comparison **failed**, so its `Complete` status rests
-on the LeRobot half only.
+Criterion 5's *"identical shape"* clause **is satisfied for the serving path** — and satisfied
+byte-for-byte, not merely shape-for-shape. Full evidence, provenance, root cause and the fix: **the
+"PAR-05 cross-backend comparison" section at the end of this document**.
 
-**What is no longer true about this section:** it was a one-sided record (T-06-29) and is now
-two-sided. What replaces the old open item is a *harder* one — a live geometry divergence that
-Phase 7's numerical parity gate must not be run against. The historical framing above is struck
-through rather than deleted, so the sequence (never attempted → attempted → mismatched) stays legible.
+**What is no longer true about this section:** it was a one-sided record (T-06-29), then a two-sided
+record of a divergence, and is now a two-sided record of agreement. Each framing is struck through
+rather than deleted, so the sequence (never attempted → attempted → mismatched → resolved) stays
+legible. **What replaces the old open item is not another open item but an ASSUMPTION**: the fix
+matches Isaac on the inference that Isaac's geometry is the training-time geometry, which was never
+confirmed against a training recipe. That assumption is recorded at the top of this document and in
+the last section; it is the thing to re-examine first if Phase 7's parity numbers disappoint.
 
-No live `gr00t-server` was used or started: that container remains `Exited` by standing decision, and
-the dump ran in a throwaway `docker run --rm --network none` container instead, with no GPU, no
+No live `gr00t-server` was used or started at any point: that container remains `Exited` by standing
+decision, and both dumps ran in throwaway `docker run --rm --network none` containers, with no GPU, no
 weights, no published port and no token.
 
 ### 2. Backbone-revision provenance is unestablished by design (assumption A6)
@@ -258,7 +324,7 @@ mechanism that carries it instead:
 | LRG-03 | Relative-vs-absolute is a semantic claim about decoding | Two robot states through one observation: the arm targets track the anchor while the gripper does not, measured against a same-state noise floor (06-01) |
 | LRG-04 | Horizon 16 is a config fact, and the emitted length is forced by three truncations | `infer_groot_n1_7_action_horizon(path, "new_embodiment") == 16` asserted at CONFIG level from two independent places, with the tag passed **explicitly** because inference returns `None` here (06-02, 06-06) |
 | LRG-06 | A **deployment-shape** risk (what the run command publishes), not a shape-of-data risk | §2 above: the publish-spec test with three synthetic non-vacuity proofs (06-05) |
-| SAFE-01 | Five serving-contract assertions are semantic, not dimensional | One pure validator over a frozen 16-field snapshot, with `SAFE-01/N`-prefixed errors proven to fire on twelve single-field mutations of the REAL checkpoint's snapshot (06-02); arming it on the real load path is 06-03's |
+| SAFE-01 | Five serving-contract assertions are semantic, not dimensional | One pure validator over a frozen **17**-field snapshot, with `SAFE-01/N`-prefixed errors proven to fire on **thirteen** single-field mutations of the REAL checkpoint's snapshot (06-02, +1 for the forced-pad gap closure); arming it on the real load path is 06-03's |
 
 ### 4. Recorded, non-blocking: `outputs/` is not gitignored
 
@@ -274,11 +340,13 @@ committed verdict has a live guard behind it rather than resting on a stale `.np
 ## References
 
 - `scripts/dump_preprocessed_image.py` — the PAR-05 LeRobot-side harness (keyless, GPU-free,
-  weight-free)
+  weight-free); measures BOTH the unpatched transform and the real built serving pipeline
 - `scripts/dump_gr00t_native_preprocessed_image.py` — the GR00T-native-side harness; runs inside
   `gr00t:latest` with no GPU, no weights, no network and no token, and verifies the image's revision by
   content digest before measuring anything
-- `tests/test_par05_image_geometry.py` — the always-running geometry gate (12 tests, never skips)
+- `policy_guard/groot_guard.py` — `serving_preprocessor_overrides()`, the ONE definition of the forced
+  letterbox pad, and the `SAFE-01/5` assertion that verifies it landed on the served pipeline
+- `tests/test_par05_image_geometry.py` — the always-running geometry gate (15 tests, never skips)
 - `scripts/build_gr00t_image.sh` — the `PIN=` the cross-backend measurement is recorded against
 - `tests/test_loopback_publish_spec.py` — the LRG-06 publish-spec guard (6 tests, never skips)
 - `README.md` — the documented `lerobot-policy` run command, under the LRG-06 anchor
@@ -345,8 +413,14 @@ and `3/4 checks passed`. An entry that has never been red is an entry that has n
 ### The healthy pass, verbatim
 
 ```
-INFO 2026-09-10 05:16:39 y/server.py:623 SAFE-01 guard: PASS | base_model_path=/checkpoints/model | embodiment_tag=new_embodiment | actions_per_chunk=16 | checkpoint_horizon=16 | decode_step=GrootN17ActionDecodeStep
+INFO 2026-09-10 06:44:54 y/server.py:685 SAFE-01 guard: PASS | base_model_path=/checkpoints/model | embodiment_tag=new_embodiment | actions_per_chunk=16 | checkpoint_horizon=16 | decode_step=GrootN17ActionDecodeStep | checkpoint_letter_box_transform=False | served_letter_box_transform=True
 ```
+
+The last two fields were added by the forced-pad gap closure and are the only pair on this line that
+**disagree by design**: the checkpoint declares the letterbox off and the serving path forces it on.
+Both are printed because either alone would be uninformative — the forced `True` alone could be a
+constant the guard prints without having read the pipeline, and the declared `False` alone says nothing
+about what the server does.
 
 One line, so a single `docker logs | grep` shows both **that** the guard ran and **what** it saw. A
 guard that passes silently is indistinguishable from a guard that never ran — that is D-05's stated
@@ -518,34 +592,50 @@ real constructed processors this plan.
 
 ---
 
-### Section 4.1 of `## Open gaps carried forward` is unchanged by this plan
+### ~~Section 4.1 of `## Open gaps carried forward` is unchanged by this plan~~ — SUPERSEDED TWICE
 
-The cross-container PAR-05 dump from the pinned Isaac-GR00T `23ace64f` image (assumption A8) was
+~~The cross-container PAR-05 dump from the pinned Isaac-GR00T `23ace64f` image (assumption A8) was
 **still not attempted** and remains a one-sided record, not a two-sided comparison. Plan 06-03 did not
 absorb it and does not mark it resolved: `gr00t-server` is `Exited` by standing decision for the
 remainder of Phase 6, so any GR00T-native-side comparison must go through the mock or dumped tensors.
-It stays open in `.planning/WINDOWS.md` (entry 17).
+It stays open in `.planning/WINDOWS.md` (entry 17).~~
+
+Accurate **as of plan 06-03** and kept as history. Superseded first by the A8-closing measurement (the
+dump ran in a throwaway `docker run --rm --network none` container without starting `gr00t-server`, so
+the stated blocker turned out not to be one), and then by the forced-pad gap closure, which resolved
+the divergence that measurement exposed. §4.1 above carries the current state; `.planning/WINDOWS.md`
+entry 17 is now `fixed`.
 
 ---
 
-## PAR-05 cross-backend comparison — **MISMATCH** (measured in-container)
+## PAR-05 cross-backend comparison — ~~**MISMATCH**~~ **RESOLVED: the serving path now MATCHES** (measured in-container)
 
-> **The two backends do NOT preprocess to the same geometry.** On byte-identical input and identical
+> **The two backends preprocess to the same geometry, byte for byte.** On byte-identical input and
+> identical recipe values, Isaac-GR00T produces **`(256, 256, 3)`** and Dum-E's LeRobot **serving**
+> path produces **`(256, 256, 3)`** — both hashing to `c30150ec…`. Criterion 5's *"identical shape"*
+> clause **is satisfied** for the serving path.
+>
+> ~~**The two backends do NOT preprocess to the same geometry.** On byte-identical input and identical
 > recipe values, LeRobot produces **`(256, 340, 3)`** and Isaac-GR00T produces **`(256, 256, 3)`**.
 > Criterion 5's *"identical shape"* clause is **not satisfied**, and PAR-05's `Complete` status rests
-> on the LeRobot half only.
+> on the LeRobot half only.~~ — the state this section recorded before the gap-closure fix below. Still
+> true of the **unpatched** upstream transform; no longer true of what the server serves.
 
-Closes assumption **A8** as a measurement. The preceding 06-03 note remains accurate *as of plan
-06-03* and is superseded here; §4.1 above is updated to match. Harness:
-`scripts/dump_gr00t_native_preprocessed_image.py` (**9/9 checks PASS, exit 0**), keyless gate:
-the last five tests in `tests/test_par05_image_geometry.py`.
+Closes assumption **A8** as a measurement, and closes the mismatch that measurement exposed. The
+preceding 06-03 note remains accurate *as of plan 06-03* and is superseded; §4.1 above is updated to
+match. Harnesses: `scripts/dump_gr00t_native_preprocessed_image.py` (**9/9 checks PASS, exit 0**, re-run
+after the fix) and `scripts/dump_preprocessed_image.py` (**9/9 checks PASS, exit 0**). Keyless gate: the
+last five tests in `tests/test_par05_image_geometry.py`. Live gate:
+`test_live_guard_pass_is_logged_on_the_real_load_path`, which measures the geometry **inside the shipped
+image**.
 
 ### The comparison
 
 | Backend | Harness | Effective pipeline | Measured output |
 |---|---|---|---|
-| LeRobot `lerobot==0.6.1` | `_transform_n1_7_image_for_vlm_albumentations` | resize-shortest-256 → center-crop-95% → resize-shortest-256 | **`(256, 340, 3)`** uint8 |
-| Isaac-GR00T `23ace64f` | `build_image_transformations_albumentations` (eval) | **letterbox-pad-to-square** → resize-shortest-256 → center-crop-95% → resize-shortest-256 | **`(256, 256, 3)`** uint8 |
+| **LeRobot serving path** `lerobot==0.6.1` | built pipeline → `_transform_n1_7_image_for_vlm_albumentations` | **letterbox-pad-to-square (FORCED)** → resize-shortest-256 → center-crop-95% → resize-shortest-256 | **`(256, 256, 3)`** uint8, `c30150ec…` |
+| Isaac-GR00T `23ace64f` | `build_image_transformations_albumentations` (eval) | **letterbox-pad-to-square** → resize-shortest-256 → center-crop-95% → resize-shortest-256 | **`(256, 256, 3)`** uint8, `c30150ec…` |
+| ~~LeRobot as configured~~ (unpatched, history) | `_transform_n1_7_image_for_vlm_albumentations` | resize-shortest-256 → center-crop-95% → resize-shortest-256 | ~~**`(256, 340, 3)`** uint8, `e8e4939b…`~~ |
 
 Both measured on the SAME frame: seed **0**, `numpy.random.RandomState(0)`, `480x640x3` uint8,
 sha256 `70eecaa5a18341fcf3e9d22091d94d92e9d4c5aef7e839ae94ff3d11fd6612ee`. **That the bytes are
@@ -557,7 +647,42 @@ The six recipe values are read from the same
 `checkpoints/GR00T-N1.7-3B-SO101/processor_config.json` on both sides (check 2, bind-mounted into the
 container), so neither side can be running a different recipe.
 
-### Root cause: one pipeline stage, gated on one side and unconditional on the other
+### The fix, and where it is injected
+
+**One stage changed, at the seam plan 06-01 established.** `docker/lerobot-policy/server.py` merges a
+third override into the same `make_pre_post_processors` call that already carries the device and
+rename-map overrides:
+
+```python
+preprocessor_overrides.update(serving_preprocessor_overrides())
+#  -> {"groot_n1_7_vlm_encode_v1": {"letter_box_transform": True}}
+```
+
+Four properties of that choice are load-bearing and were selected over the alternatives on purpose:
+
+| Property | Why it matters |
+|---|---|
+| It is **upstream's own public override seam** (`processor_groot.py:401-455`) | Not a monkeypatch, not a patched private function, not a vendored copy — the sanctioned mechanism this milestone is built around |
+| The value has **one definition**, `policy_guard.groot_guard.serving_preprocessor_overrides()` | The guard that asserts the served value and the server that injects it resolve to the same constant, so they cannot drift into two numbers. `policy_guard` is `COPY`-ed into the image, so this holds across the process boundary |
+| **Nothing is reimplemented** | Upstream documents its `cv2.INTER_AREA` resize and floored center crop as needing to stay bit-exact (`processor_groot.py:1394-1401`); a hand-rolled pad, resize or crop would have *manufactured* the mismatch this fix removes |
+| It **fails loudly** | An override key matching no step raises `KeyError` listing the available keys; an unknown field raises `TypeError` listing the available fields. A pinned-lerobot rename breaks the handshake instead of silently dropping the pad |
+
+**And the injection is verified rather than trusted.** `SAFE-01/5` now reads the **effective**
+`letter_box_transform` off the built `GrootN17VLMEncodeStep` — never re-derived from the checkpoint,
+which declares the opposite — and refuses the handshake with a named error if it is not `True`. That
+assertion is proven RED, not merely green:
+`tests/test_groot_guard.py::test_violation_5a2_served_letterbox_off_raises` and
+`test_snapshot_from_loaded_reads_the_served_letterbox_off_the_encode_step` drive the
+override-did-not-land case against a snapshot built from the real checkpoint. **Changing a guard's
+expected value is exactly the edit that can silently defang it**, so the inverted expectation was
+required to fail on a wrong geometry before it was allowed to pass on the right one.
+
+**bf16 is undisturbed**, re-measured on the rebuilt image after the change:
+`param_dtypes={'bfloat16': 3144016000}`, `cuda_allocated_MiB=6015.0` — identical to plan 06-01's
+recorded figures. The three precision knobs (`load_bf16=True`, the `transformers` `dtype`, and
+`GrootConfig.model_params_fp32=False`) are untouched.
+
+### Root cause of the original divergence: one pipeline stage, gated on one side and unconditional on the other
 
 - **LeRobot gates the pad on the flag.** `if letter_box_transform:` wraps the `cv2.copyMakeBorder`
   call (`processor_groot.py:1423-1433`). This checkpoint sets `letter_box_transform: false`, so no pad
@@ -569,19 +694,44 @@ container), so neither side can be running a different recipe.
   (`processing_gr00t_n1d7.py:171-172, 198`) — it is stored on the instance and never read. The frame
   is padded 480x640 → 640x640 first, so the output is square.
 
-**The cause is isolated to exactly that stage, by measurement — this is not an inference.** Isaac's
+**The cause was isolated to exactly that stage, by measurement — this is not an inference.** Isaac's
 eval output and LeRobot's output *with the pad forced on* are **byte-identical**:
 sha256 `c30150ec8d9d7ccb648aade0588aed2d18a356ab7f984a510dc57bb6c485927f` from both, across
 Python 3.10/3.12, numpy 1.26.4/2.2.6 and OpenCV 4.11.0/4.13.0. Every other stage — both `INTER_AREA`
-resizes and the floored 95% center crop — therefore agrees bit-for-bit between the backends. The
-LeRobot serving path's own output is a different artifact, sha256
-`e8e4939bac10afa7cced1edb739656e14deb1acbbd509b80dfcfd7810fd2ce5a`.
+resizes and the floored 95% center crop — therefore agrees bit-for-bit between the backends. **That is
+what made a one-stage fix sufficient**, and it is why forcing the pad was a config change rather than a
+pipeline rewrite. The UNPATCHED transform's output remains a different artifact, sha256
+`e8e4939bac10afa7cced1edb739656e14deb1acbbd509b80dfcfd7810fd2ce5a`, and that difference is asserted so
+"the fix changed something" is measured rather than claimed.
 
 **This does not upgrade the fidelity decision in §1.** The cross-container leg stays **shape only**: a
 future OpenCV build may legitimately move a pixel, and the bit-exactness above is recorded as an
 observation, not promoted to a contract.
 
-### Alternatives closed off, so the mismatch cannot be explained away
+### Which side was made to match, and the inference that decision rests on
+
+**Operator decision: match the old path. The LeRobot serving path always pads to square.**
+
+The reasoning: the checkpoint's weights were TRAINED by Isaac's code, so the geometry those weights
+actually learned on is Isaac's padded square. LeRobot's flag-honouring behaviour — which reads as more
+correct in isolation, since it obeys the checkpoint's own `processor_config.json` — is therefore the
+deviation from training-time behaviour, and before this fix it fed the policy a geometry it had never
+seen.
+
+**The inference boundary, recorded explicitly because it was accepted knowingly rather than proven:**
+*"training used Isaac's geometry"* is inferred from *"Isaac trained the checkpoint"*. **The actual
+training recipe was NOT read**, and no local artifact records it — the checkpoint's `config.json`
+carries `model_name` only. The operator chose to act on the inference rather than spend a step
+confirming it. **If Phase 7's parity work disappoints, this assumption is the first thing to
+re-examine.** It is not presented as settled fact here and must not be quietly upgraded to one.
+
+Recorded in code as well as prose, so it travels with the mechanism rather than only with the document:
+the module docstrings of `policy_guard/groot_guard.py`, `docker/lerobot-policy/server.py`,
+`scripts/dump_preprocessed_image.py`, `scripts/dump_gr00t_native_preprocessed_image.py` and
+`tests/test_par05_image_geometry.py` each state it, and both probe manifests carry it as an
+`inference_boundary` field.
+
+### Alternatives closed off, so the original mismatch could not be explained away
 
 | Alternative explanation | Ruled out by | Result |
 |---|---|---|
@@ -614,9 +764,10 @@ records that — and the 64-file content match is what stands in for it. That is
 
 ### How it was run (no GPU, no weights, no token, no server)
 
-`gr00t-server` was **not started** — it remains `Exited` by standing decision. The dump ran in a
-throwaway container, and the transform builder was called directly rather than through
-`Gr00tN1d7Processor`, whose `__init__` calls `build_processor` and would pull the Cosmos backbone:
+`gr00t-server` was **not started** — it remains `Exited` by standing decision. Both the original run and
+the post-fix re-run used a throwaway container, and the transform builder was called directly rather
+than through `Gr00tN1d7Processor`, whose `__init__` calls `build_processor` and would pull the Cosmos
+backbone:
 
 ```bash
 uv run python scripts/dump_gr00t_native_preprocessed_image.py --emit-expectations \
@@ -639,34 +790,57 @@ nothing, because under `docker run` it would leave root-owned files in the host 
 
 The GR00T-native **measurement** needs the 42.8 GB image and cannot run in CI. Rather than add a test
 that silently skips, the keyless gate pins the *LeRobot-side anchor* of the comparison — which is
-executable anywhere the suite runs:
+executable anywhere the suite runs, because the serving pipeline is built for real and its geometry read
+off the constructed step:
 
 | Test | What it pins |
 |---|---|
-| `test_gr00t_native_geometry_is_256x256x3_and_diverges_from_lerobot` | The recorded mismatch, in both directions: `GEOMETRY_MATCHES_LEROBOT is False` |
-| `test_lerobot_reproduces_the_gr00t_native_shape_only_with_the_pad_forced_on` | **Executed**: pad forced on → `(256, 256, 3)`; as configured → `(256, 340, 3)` |
-| `test_lerobot_with_the_pad_forced_on_reproduces_the_gr00t_native_bytes` | **Executed, byte-exact**: the cross-container digest is reproduced locally, plus the shared input digest |
-| `test_lerobot_gates_the_letterbox_pad_on_the_flag_this_checkpoint_sets_false` | **AST level**: every `copyMakeBorder` call sits inside the `if letter_box_transform:` branch |
+| `test_gr00t_native_geometry_is_256x256x3_and_the_serving_path_matches_it` | The recorded state in BOTH directions: `GEOMETRY_MATCHES_LEROBOT_SERVING is True` **and** `GEOMETRY_MATCHES_LEROBOT_UNPATCHED is False` |
+| `test_serving_path_on_480x640_is_256x256x3` | **Executed on the built pipeline**: the served geometry, measured off the constructed encode step |
+| `test_serving_pipeline_carries_the_forced_letterbox_pad` | **Executed**: the override landed, and only the pad moved — the other four settings are the checkpoint's |
+| `test_serving_letterbox_constant_matches_the_guards_definition` | The probe's pinned copy equals the guard's definition, and the override key matches a real step of the built pipeline |
+| `test_lerobot_reproduces_the_gr00t_native_shape_only_with_the_pad_forced_on` | **Executed**: served → `(256, 256, 3)`; as declared → `(256, 340, 3)`, so the agreement is DUE to the override rather than coincidental |
+| `test_lerobot_serving_path_reproduces_the_gr00t_native_bytes` | **Executed, byte-exact**: the cross-container digest reproduced locally, plus the shared input digest, plus the unpatched digest as a distinct artifact |
+| `test_lerobot_gates_the_letterbox_pad_on_the_flag_this_checkpoint_sets_false` | **AST level**: every `copyMakeBorder` call still sits inside the `if letter_box_transform:` branch — the fix feeds that branch `True`, it does not remove it, and a future upstream hoist would make the override a silent no-op |
 | `test_the_gr00t_native_measurement_records_which_image_it_came_from` | Image ID, package digest, file count, and the pin read back off the build wrapper |
+
+**And in the live (opt-in) suite:**
+`test_live_guard_pass_is_logged_on_the_real_load_path` asserts the PASS line reports
+`served_letter_box_transform=True` against `checkpoint_letter_box_transform=False`, then measures the
+geometry **inside the shipped image** via `docker exec` — `(256, 256, 3)`, sha256 `c30150ec…`, on the
+image's own numpy 2.2.6 — so the cross-backend agreement is a property of the container that serves, not
+only of the host venv.
 
 **What no test in this repo asserts:** Isaac's *unconditional* pad. Importing `gr00t` would skip
 everywhere, so that half is carried by the in-container probe and the source citation above. Recorded
 as a limitation rather than covered by a test that can never run.
 
-### Consequences (not resolved here — flagged)
+### Consequences
 
-1. **Phase 7's numerical parity gate must not be run against this divergence.** Comparing action
-   chunks between backends that see different pixels measures the preprocessing gap, not parity. This
-   is precisely why PAR-05 sits in Phase 6 rather than Phase 7.
-2. **PAR-05 needs review.** Its text demands verification *"by comparing dumped tensor shapes between
-   backends"*. The comparison has now been performed and **failed**; deciding what `Complete` should
-   mean is a requirements decision, deliberately not made by this gap closure.
-3. **Which side is "right" is NOT settled here, and the LeRobot side is not authoritative by
-   default.** The checkpoint's own `processor_config.json` sets `letter_box_transform: false`, which
-   LeRobot honours and Isaac ignores — but the checkpoint was *trained* by Isaac's code, so the
-   geometry it saw in training is Isaac's padded `(256, 256, 3)`. That points at LeRobot's
-   flag-honouring path being the deviation from training-time behaviour, which would be the more
-   consequential of the two readings. Establishing it needs the training recipe, not this probe.
+1. **Phase 7's numerical parity gate is now meaningful on this axis.** The two backends see the same
+   pixels — byte-identically, on the seed-0 frame — so a chunk comparison measures the policy rather
+   than the preprocessing gap. This is precisely why PAR-05 sat in Phase 6 rather than Phase 7. It
+   remains true that a parity comparison must re-verify the served geometry before trusting its
+   numbers; the live test above is the instrument for that.
+2. **PAR-05's verification is satisfied as its text asks.** Its text demands verification *"by
+   comparing dumped tensor shapes between backends"*. The comparison has now been performed and
+   **passes**, byte-for-byte. `REQUIREMENTS.md` is deliberately NOT edited by this gap closure — what
+   `Complete` should mean is a requirements decision, and this document is the evidence it would rest
+   on.
+3. ~~**Which side is "right" is NOT settled here, and the LeRobot side is not authoritative by
+   default.**~~ **Decided by the operator: match Isaac.** The full reasoning and the inference it rests
+   on are in *"Which side was made to match"* above. In short: the checkpoint's own
+   `processor_config.json` sets `letter_box_transform: false`, which LeRobot honours and Isaac ignores —
+   but the checkpoint was *trained* by Isaac's code, so the geometry it saw in training is Isaac's padded
+   `(256, 256, 3)`, and LeRobot's flag-honouring path was the deviation from training-time behaviour.
+   **Establishing that would still need the training recipe, which was never read.** The decision was
+   made on the inference, knowingly.
 4. **A related axis, checked only by grep and labelled as such:** the GR00T-native serving path
    (`gr00t/policy/gr00t_policy.py`, `server_client.py`, `eval/run_gr00t_server.py`) shows no camera
-   pre-resize, unlike LeRobot's C-3 placeholder-feature resize in §1. Not executed, not a verdict.
+   pre-resize, unlike LeRobot's C-3 placeholder-feature resize in §1. Not executed, not a verdict. Note
+   that C-3 is now shape-invisible on the served geometry (see §1's
+   `serving_corruption_shape_invisible`), so this axis matters slightly more than it did, not less.
+5. **Out of scope and deliberately untouched:** `policy/lerobot/features.py:67`'s comment still cites
+   the `(256, 340, 3)` verdict when explaining why the client sends 480x640 frames. `policy/` was
+   outside this gap closure's declared scope. The frame size it justifies is unchanged and correct; only
+   the parenthetical verdict it cites is stale.

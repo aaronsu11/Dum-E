@@ -20,9 +20,13 @@ independent blockers stack up, each confirmed by execution against the installed
    ``prepare_raw_observation``. Fixed by ``fixup_policy_features`` below.
 3. Same placeholder, silent variant: with a single camera actually NAMED
    ``camera``, ``resize_robot_observation_image`` pre-resizes the 480x640 frame to
-   the placeholder's 224x224 BEFORE the checkpoint's own geometry runs, which
-   turns PAR-05's correct ``(256, 340, 3)`` into ``(256, 256, 3)`` while every log
-   line looks healthy. Same fix.
+   the placeholder's 224x224 BEFORE the checkpoint's own geometry runs, destroying
+   the frame's aspect ratio while every log line looks healthy. Same fix — and note
+   that this corruption is now shape-INVISIBLE on the serving path, because the
+   forced letterbox pad below squares every input: a 224x224 frame and a 480x640
+   frame both emerge as ``(256, 256, 3)``, differing only in pixels. It is
+   PREVENTED (``fixup_policy_features`` runs before ``from_pretrained``, so the
+   placeholder branch never executes) rather than detected by a shape check.
 
 4. **Blocker 4 — fp32 weight storage, which does not fit the GPU.** This one was
    found by executing the load, not by reading, and it is why this module takes
@@ -108,6 +112,40 @@ the v1.0 Isaac-GR00T baseline, so Phase 7 compares bf16 against bf16 rather than
 bf16 against fp32. Do not "restore upstream defaults" here without re-opening
 that decision: fp32 does not fit this GPU at all.
 
+==================== SERVING IMAGE GEOMETRY: THE PAD IS FORCED ON ====================
+**The letterbox pad is forced ON for the serving path**, against the flag the
+checkpoint's own ``processor_config.json`` sets. Measured, not reasoned:
+
+* LeRobot honours the flag — ``if letter_box_transform:`` wraps its
+  ``cv2.copyMakeBorder`` (``processor_groot.py:1423-1433``) — and this checkpoint
+  sets it ``false``, so a 480x640 frame reached the VLM as ``(256, 340, 3)``.
+* Isaac-GR00T, which TRAINED these weights, pads unconditionally:
+  ``LetterBoxPad()`` is element 1 of both its albumentations pipelines
+  (``image_augmentations.py:420-487``) and it files ``letter_box_transform`` under
+  ``# Backward-compat params (stored but not actively used)``
+  (``processing_gr00t_n1d7.py:171-172, 198``). Its output is ``(256, 256, 3)``.
+* Forcing the pad ON in LeRobot makes its output **byte-identical** to Isaac's
+  (sha256 ``c30150ec…`` from both, across Python 3.10/3.12, numpy 1.26.4/2.2.6 and
+  OpenCV 4.11.0/4.13.0). Every other stage already agreed bit-for-bit, so the pad
+  gating was the WHOLE divergence.
+
+The injection is upstream's own public step-override seam, in the SAME
+``make_pre_post_processors`` call that already carries the device and rename-map
+overrides — see ``policy_guard.groot_guard.serving_preprocessor_overrides``, which
+owns the one definition of the value, and ``SAFE-01/5``, which reads the EFFECTIVE
+value back off the built step and refuses the handshake if the override did not
+land. No monkeypatch, no hand-rolled resize or crop: upstream documents its
+``cv2.INTER_AREA`` resize and floored center crop as needing to stay bit-exact
+(``processor_groot.py:1394-1401``), so a copy would manufacture the mismatch this
+removes.
+
+**THE INFERENCE THIS RESTS ON, recorded because it was accepted knowingly.** "The
+weights were trained on Isaac's padded square" is INFERRED from "Isaac trained this
+checkpoint". The training recipe itself was **not read** — no local artifact records
+it. The operator chose to act on the inference rather than confirm it. If Phase 7's
+parity work disappoints, this is the FIRST assumption to re-examine. It is not a
+settled fact and must not be written up as one.
+
 ==================== STATED FALLBACK, TAKEN ====================
 The plan's primary shape was ``super().SendPolicyInstructions()`` followed by a
 post-load feature fixup. That shape cannot inject precision, because by the time
@@ -188,7 +226,9 @@ from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 from policy_guard.groot_guard import (
     EXPECTED_HORIZON,
     EXPECTED_TAG,
+    SERVING_LETTER_BOX_TRANSFORM,
     assert_groot_serving_contract,
+    serving_preprocessor_overrides,
     snapshot_from_loaded,
 )
 
@@ -197,6 +237,7 @@ __all__ = [
     "EXPECTED_TAG",
     "SEED_ENV_VAR",
     "SERVING_DTYPE",
+    "SERVING_LETTER_BOX_TRANSFORM",
     "DumEGrootPolicy",
     "DumEGrootPolicyServer",
     "fixup_policy_features",
@@ -526,14 +567,28 @@ class DumEGrootPolicyServer(PolicyServer):
         # Same public call upstream makes at policy_server.py:152-163, including
         # the rename_observations_processor override, so the pipelines are built
         # against the corrected features and env_action_dim is 6 rather than 132.
+        #
+        # ---- THE IMAGE-GEOMETRY INJECTION ----
+        # A THIRD override rides the same call: the letterbox pad, forced ON. See the
+        # SERVING IMAGE GEOMETRY block in the module docstring for the measurement,
+        # and `serving_preprocessor_overrides` for why the value lives in
+        # policy_guard rather than here. It is merged rather than restated so the
+        # value the SAFE-01 guard asserts and the value injected here cannot become
+        # two numbers. An override key that no longer matches a step raises KeyError
+        # listing the available keys, and an unknown field raises TypeError listing
+        # the available fields (processor_groot.py:428-450) — so a pinned-lerobot
+        # rename fails at the handshake, loudly, instead of silently dropping the pad
+        # and serving a geometry the weights never saw.
         device_override = {"device": self.device}
+        preprocessor_overrides = {
+            "device_processor": device_override,
+            "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+        }
+        preprocessor_overrides.update(serving_preprocessor_overrides())
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=pretrained_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
+            preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": device_override},
         )
 
@@ -620,14 +675,24 @@ class DumEGrootPolicyServer(PolicyServer):
         # exists. Every value is read off the snapshot the assertions just ran
         # against, never re-derived, so the line cannot report something the guard
         # did not actually check.
+        #
+        # served_letter_box_transform is on this line rather than only in the guard
+        # because it is the ONE value here that the checkpoint's own configuration
+        # CONTRADICTS: the checkpoint declares False and the serving path forces True.
+        # An operator reading `docker logs` must be able to see which of the two is
+        # actually in effect without attaching a debugger, and a future reader must be
+        # able to tell the forced value apart from the declared one.
         self.logger.info(
             "SAFE-01 guard: PASS | base_model_path=%s | embodiment_tag=%s | "
-            "actions_per_chunk=%s | checkpoint_horizon=%s | decode_step=%s",
+            "actions_per_chunk=%s | checkpoint_horizon=%s | decode_step=%s | "
+            "checkpoint_letter_box_transform=%s | served_letter_box_transform=%s",
             snapshot.base_model_path,
             snapshot.embodiment_tag,
             snapshot.configured_actions_per_chunk,
             snapshot.checkpoint_horizon,
             snapshot.decode_step_type,
+            snapshot.letter_box_transform,
+            snapshot.served_letter_box_transform,
         )
         return services_pb2.Empty()
 

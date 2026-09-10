@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """The GR00T-NATIVE half of PAR-05: what geometry does Isaac-GR00T produce?
 
-**Recorded verdict, up front, and it is a MISMATCH.** On the SAME
-``RandomState(0)`` 480x640x3 uint8 frame and the SAME six recipe values from
+**Recorded verdict, up front: the two backends now AGREE — and the agreement was
+engineered, not discovered.** On the SAME ``RandomState(0)`` 480x640x3 uint8 frame
+and the SAME six recipe values from
 ``checkpoints/GR00T-N1.7-3B-SO101/processor_config.json``:
 
-===========================================  ==================
-LeRobot ``processor_groot`` (06-05)          ``(256, 340, 3)``
-Isaac-GR00T ``image_augmentations`` (here)   ``(256, 256, 3)``
-===========================================  ==================
+=================================================  ==================  =======
+Isaac-GR00T ``image_augmentations`` (here, eval)    ``(256, 256, 3)``   —
+Dum-E's LeRobot **SERVING** path (pad FORCED on)    ``(256, 256, 3)``   MATCH
+LeRobot's UNPATCHED transform (pad gated off)       ``(256, 340, 3)``   history
+=================================================  ==================  =======
 
-The two backends do **not** preprocess to the same geometry, so PAR-05's
-"identical shape" clause is **not** satisfied. This module is deliberately built
-so that fact cannot be quietly lost: :data:`GEOMETRY_MATCHES_LEROBOT` is ``False``
-and check 7 FAILS if a future measurement matches, because a stale "known
-mismatch" is as dangerous as an unrecorded one.
+The match is byte-exact, not merely shape-exact: both hash to
+:data:`GR00T_NATIVE_EVAL_OUTPUT_SHA256`.
 
-**Where the divergence comes from** (both sides read, not guessed):
+**HISTORY, kept because the fix only makes sense against it.** This probe's first
+run recorded a MISMATCH: LeRobot ``(256, 340, 3)`` vs Isaac ``(256, 256, 3)``.
+That reading is still true of the UNPATCHED upstream transform
+(:data:`LEROBOT_UNPATCHED_OUTPUT_SHA256`, and
+:data:`GEOMETRY_MATCHES_LEROBOT_UNPATCHED` is still ``False``). What changed is
+Dum-E's serving path, which now forces the pad on.
+
+**Where the divergence came from** (both sides read, not guessed):
 
 - LeRobot gates the letterbox pad on the flag: ``if letter_box_transform:`` wraps
   the ``cv2.copyMakeBorder`` call (``processor_groot.py:1423-1433``), and this
-  checkpoint sets ``letter_box_transform: false``, so **no pad happens** and the
-  480x640 aspect ratio survives to the output.
+  checkpoint sets ``letter_box_transform: false``, so no pad happened and the
+  480x640 aspect ratio survived to the output.
 - Isaac-GR00T applies ``LetterBoxPad()`` **unconditionally** as step 1 of both the
   train and eval albumentations pipelines
   (``gr00t/model/gr00t_n1d7/image_augmentations.py:420-487``), and its
@@ -30,19 +36,36 @@ mismatch" is as dangerous as an unrecorded one.
   (``processing_gr00t_n1d7.py:171-172, 198``). The frame is padded to 640x640
   first, so the output is square.
 
-So the mismatch is not an interpolation or rounding difference that shape-only
-fidelity might be hiding — it is a whole pipeline stage that one backend runs and
-the other skips, and it changes the aspect ratio of every non-square camera frame.
+So it was never an interpolation or rounding difference that shape-only fidelity
+might have been hiding — it was a whole pipeline stage that one backend ran and the
+other skipped, changing the aspect ratio of every non-square camera frame.
 
-**And the cause is isolated to exactly that one stage, by measurement.** Isaac's
+**And the cause was isolated to exactly that one stage, by measurement.** Isaac's
 eval output hashes to :data:`GR00T_NATIVE_EVAL_OUTPUT_SHA256`, and LeRobot's own
-transform with the pad forced ON (``letter_box_transform=True``) hashes to the
-**same** value — **byte-identical across two Python versions (3.10 vs 3.12), two
-numpy majors (1.26.4 vs 2.2.6) and two OpenCV builds (4.11.0 vs 4.13.0)**. Every
-other stage — the ``INTER_AREA`` resizes, the floored 95% center crop — therefore
-agrees bit-for-bit between the backends. This is recorded as an *observation*, not
-as a new contract: §1's cross-container fidelity decision stays **shape-only**,
-because a future OpenCV build is still entitled to move a pixel.
+transform with the pad forced ON hashes to the **same** value — **byte-identical
+across two Python versions (3.10 vs 3.12), two numpy majors (1.26.4 vs 2.2.6) and
+two OpenCV builds (4.11.0 vs 4.13.0)**. Every other stage — the ``INTER_AREA``
+resizes, the floored 95% center crop — therefore agrees bit-for-bit between the
+backends, which is what made a one-stage fix sufficient. The bit-exactness is
+recorded as an *observation*, not promoted to a contract: §1's cross-container
+fidelity decision stays **shape-only**, because a future OpenCV build is still
+entitled to move a pixel.
+
+**WHICH SIDE WAS MADE TO MATCH, AND ON WHAT INFERENCE.** The operator's decision
+was to match Isaac: these weights were trained by Isaac's code, so the geometry
+they learned on is Isaac's padded square, and LeRobot's flag-honouring behaviour —
+which reads as more correct in isolation — was the deviation from training-time
+behaviour. **That is an INFERENCE, accepted knowingly.** "Training used Isaac's
+geometry" follows from "Isaac trained the checkpoint"; the actual training recipe
+was **not read**, and no local artifact records it. If Phase 7's parity work
+disappoints, this assumption is the first thing to re-examine. It is not settled
+fact and must not be written up as one.
+
+This module is deliberately built so the state cannot rot in either direction:
+check 9 FAILS if Isaac's geometry stops matching the recorded LeRobot SERVING
+shape, and also if it starts matching the recorded UNPATCHED shape — a stale
+"settled match" is a silent regression exactly as a stale "known mismatch" is a
+false alarm.
 
 **Posture, mirroring ``scripts/dump_preprocessed_image.py``:** no GPU, no weights,
 no network (run it with ``--network none``), no Hugging Face token, no hardware
@@ -111,6 +134,8 @@ from dump_preprocessed_image import (  # noqa: E402
     IMAGE_CROP_SIZE,
     IMAGE_TARGET_SIZE,
     RECIPE_KEYS,
+    SERVING_EXPECTED_SHAPE,
+    SERVING_LETTER_BOX_TRANSFORM,
     SHORTEST_IMAGE_EDGE,
     SOURCE_HEIGHT,
     SOURCE_WIDTH,
@@ -133,10 +158,20 @@ GR00T_NATIVE_EXPECTED_SHAPE = (256, 256, 3)
 #: cannot mistake the layout difference for the geometry difference.
 GR00T_NATIVE_EXPECTED_CHW_SHAPE = (3, 256, 256)
 
-#: **False, and that is the finding.** Isaac-GR00T's ``(256, 256, 3)`` is not
-#: LeRobot's ``(256, 340, 3)``. Check 7 fails if a measurement ever matches, so
-#: this cannot rot into a false alarm after an upstream fix.
-GEOMETRY_MATCHES_LEROBOT = False
+#: **True, and that is the finding.** Isaac-GR00T's ``(256, 256, 3)`` IS Dum-E's
+#: LeRobot SERVING geometry, because the serving path forces the letterbox pad on
+#: (``policy_guard.groot_guard.SERVING_LETTER_BOX_TRANSFORM``). Check 9 fails if a
+#: future measurement stops matching, so a stale "settled match" cannot hide a
+#: silent regression.
+GEOMETRY_MATCHES_LEROBOT_SERVING = True
+
+#: **False, and that is the HISTORY — kept, not deleted.** Isaac's geometry does not
+#: match what LeRobot's UNPATCHED transform produces for this checkpoint's own
+#: ``letter_box_transform: false``. This is the mismatch this probe originally
+#: recorded and the reason the serving path overrides the flag; check 9 fails if it
+#: ever becomes True, because then the override would be a no-op and the whole
+#: justification would need re-recording rather than silently rotting.
+GEOMETRY_MATCHES_LEROBOT_UNPATCHED = False
 
 #: The Isaac-GR00T revision the verdict is recorded against — the pin enforced by
 #: ``scripts/build_gr00t_image.sh`` (tag ``n1.7-release``).
@@ -157,21 +192,23 @@ GR00T_PACKAGE_DIGEST = "b18c8578c077cddf02705b80da815e5d838752cab9f391c19e4edca7
 GR00T_PACKAGE_PY_COUNT = 64
 
 #: sha256 of Isaac-GR00T's eval output bytes for the seed-0 frame, measured in
-#: ``gr00t:latest``. **LeRobot's own transform with ``letter_box_transform=True``
-#: produces this same digest**, which is what isolates the whole divergence to the
-#: pad gating rather than to interpolation or rounding.
-#: ``test_lerobot_with_the_pad_forced_on_reproduces_the_gr00t_native_bytes`` pins
-#: it keylessly. If a host OpenCV change ever moves it, that is a real
-#: within-LeRobot geometry change and must be RE-MEASURED in the image, never
-#: loosened to a tolerance.
+#: ``gr00t:latest``. **Dum-E's LeRobot SERVING path produces this same digest**,
+#: which is both the cross-backend agreement and what isolated the whole original
+#: divergence to the pad gating rather than to interpolation or rounding.
+#: ``test_lerobot_serving_path_reproduces_the_gr00t_native_bytes`` pins it
+#: keylessly. If a host OpenCV change ever moves it, that is a real within-LeRobot
+#: geometry change and must be RE-MEASURED in the image, never loosened to a
+#: tolerance.
 GR00T_NATIVE_EVAL_OUTPUT_SHA256 = (
     "c30150ec8d9d7ccb648aade0588aed2d18a356ab7f984a510dc57bb6c485927f"
 )
 
-#: sha256 of the LeRobot serving path's own output bytes (pad OFF, as this
-#: checkpoint configures it) for the same frame. Recorded alongside the value
-#: above so the two are visibly different artifacts, not two names for one dump.
-LEROBOT_EVAL_OUTPUT_SHA256 = (
+#: sha256 of the UNPATCHED LeRobot transform's output bytes (pad OFF, as this
+#: checkpoint DECLARES it) for the same frame. This is the HISTORY: the artifact
+#: the serving path used to produce and no longer does. Recorded alongside the
+#: value above so the two stay visibly different artifacts, and so "the fix
+#: changed something" is an assertion rather than a claim.
+LEROBOT_UNPATCHED_OUTPUT_SHA256 = (
     "e8e4939bac10afa7cced1edb739656e14deb1acbbd509b80dfcfd7810fd2ce5a"
 )
 
@@ -543,43 +580,54 @@ def main() -> int:
 
     # --- 8: the bytes, and what they isolate --------------------------------
     checks.start(
-        "The eval output bytes match the recorded digest (the same digest LeRobot's "
-        "pad-forced branch produces)"
+        "The eval output bytes match the recorded digest (the same digest Dum-E's LeRobot "
+        "SERVING path produces)"
     )
     native_sha = _sha256(native)
     if native_sha != GR00T_NATIVE_EVAL_OUTPUT_SHA256:
         checks.fail(
             "eval_output_bytes_recorded",
             f"observed {native_sha}, recorded {GR00T_NATIVE_EVAL_OUTPUT_SHA256} — the "
-            "bit-exactness that isolates the divergence to the pad gating no longer holds. "
-            "RE-MEASURE both backends and re-record; do not relax this to a tolerance",
+            "byte-level cross-backend agreement no longer holds. RE-MEASURE both backends "
+            "and re-record; do not relax this to a tolerance",
         )
     else:
         checks.ok(
             "eval_output_bytes_recorded",
-            f"{native_sha}: byte-identical to LeRobot's letter_box_transform=True output "
+            f"{native_sha}: byte-identical to the LeRobot SERVING path's output "
             "across cv2 4.11.0/4.13.0, numpy 1.26/2.2 and Python 3.10/3.12, so every stage "
-            "EXCEPT the pad gating agrees bit-for-bit",
+            "agrees bit-for-bit once the pad is forced on",
         )
 
-    # --- 9: the divergence itself, pinned ------------------------------------
+    # --- 9: the recorded state, pinned in BOTH directions -------------------
     checks.start(
-        f"The recorded cross-backend verdict still holds (match expected: {GEOMETRY_MATCHES_LEROBOT})"
+        f"The recorded cross-backend verdict still holds (serving match expected: "
+        f"{GEOMETRY_MATCHES_LEROBOT_SERVING}; unpatched match expected: "
+        f"{GEOMETRY_MATCHES_LEROBOT_UNPATCHED})"
     )
-    observed_match = tuple(native.shape) == tuple(EXPECTED_SHAPE)
-    if observed_match != GEOMETRY_MATCHES_LEROBOT:
+    observed_match = tuple(native.shape) == tuple(SERVING_EXPECTED_SHAPE)
+    observed_unpatched_match = tuple(native.shape) == tuple(EXPECTED_SHAPE)
+    if (
+        observed_match != GEOMETRY_MATCHES_LEROBOT_SERVING
+        or observed_unpatched_match != GEOMETRY_MATCHES_LEROBOT_UNPATCHED
+    ):
         checks.fail(
             "recorded_divergence_holds",
-            f"Isaac-GR00T {tuple(native.shape)} vs LeRobot {tuple(EXPECTED_SHAPE)}: match is "
-            f"{observed_match}, but this module records {GEOMETRY_MATCHES_LEROBOT}. Re-record "
-            "the verdict in docs/LEROBOT-SERVING-VERDICTS.md — a stale 'known mismatch' is a "
-            "false alarm and a stale 'settled match' is a silent regression",
+            f"Isaac-GR00T {tuple(native.shape)} vs LeRobot serving "
+            f"{tuple(SERVING_EXPECTED_SHAPE)} (match {observed_match}, recorded "
+            f"{GEOMETRY_MATCHES_LEROBOT_SERVING}) and vs LeRobot unpatched "
+            f"{tuple(EXPECTED_SHAPE)} (match {observed_unpatched_match}, recorded "
+            f"{GEOMETRY_MATCHES_LEROBOT_UNPATCHED}). Re-record the verdict in "
+            "docs/LEROBOT-SERVING-VERDICTS.md — a stale 'settled match' is a silent "
+            "regression and a stale 'known mismatch' is a false alarm",
         )
     else:
         checks.ok(
             "recorded_divergence_holds",
-            f"Isaac-GR00T {tuple(native.shape)} vs LeRobot {tuple(EXPECTED_SHAPE)}: "
-            f"geometry_match={observed_match}, as recorded",
+            f"Isaac-GR00T {tuple(native.shape)} MATCHES the LeRobot serving geometry "
+            f"{tuple(SERVING_EXPECTED_SHAPE)} (letter_box_transform forced to "
+            f"{SERVING_LETTER_BOX_TRANSFORM}) and still DIFFERS from the unpatched "
+            f"{tuple(EXPECTED_SHAPE)}, exactly as recorded",
         )
 
     if not observed_match:
@@ -587,14 +635,14 @@ def main() -> int:
             _red(
                 "\n"
                 + "!" * 72
-                + "\n!! PAR-05 CROSS-BACKEND GEOMETRY MISMATCH\n"
-                f"!!   LeRobot     : {tuple(EXPECTED_SHAPE)}\n"
-                f"!!   Isaac-GR00T : {tuple(native.shape)}\n"
-                "!! Same frame bytes, same six recipe values. Cause: Isaac applies\n"
-                "!! LetterBoxPad() unconditionally; LeRobot gates it on\n"
-                "!! letter_box_transform, which this checkpoint sets false.\n"
-                "!! Phase 7's numerical parity comparison is NOT meaningful until this\n"
-                "!! is resolved -- the two backends see different pixels.\n"
+                + "\n!! PAR-05 CROSS-BACKEND GEOMETRY MISMATCH HAS RETURNED\n"
+                f"!!   LeRobot serving (recorded) : {tuple(SERVING_EXPECTED_SHAPE)}\n"
+                f"!!   Isaac-GR00T   (measured)   : {tuple(native.shape)}\n"
+                "!! Same frame bytes, same six recipe values. The forced letterbox pad\n"
+                "!! in docker/lerobot-policy/server.py is what made these agree; check\n"
+                "!! whether it still lands (SAFE-01/5) before touching anything else.\n"
+                "!! Phase 7's numerical parity comparison is NOT meaningful while they\n"
+                "!! disagree -- the two backends would see different pixels.\n"
                 + "!" * 72
             )
         )
@@ -602,19 +650,35 @@ def main() -> int:
     manifest: dict[str, Any] = {
         "verdict": {
             "source_shape": [SOURCE_HEIGHT, SOURCE_WIDTH, 3],
-            "lerobot_shape": list(EXPECTED_SHAPE),
+            "lerobot_serving_shape": list(SERVING_EXPECTED_SHAPE),
+            "lerobot_unpatched_shape": list(EXPECTED_SHAPE),
             "gr00t_native_shape": _shape_of(native),
-            "geometry_match": bool(observed_match),
-            "recorded_geometry_match": GEOMETRY_MATCHES_LEROBOT,
+            "geometry_match_serving": bool(observed_match),
+            "recorded_geometry_match_serving": GEOMETRY_MATCHES_LEROBOT_SERVING,
+            "geometry_match_unpatched": bool(observed_unpatched_match),
+            "recorded_geometry_match_unpatched": GEOMETRY_MATCHES_LEROBOT_UNPATCHED,
             "gr00t_native_effective_pipeline": (
                 "letterbox-pad-to-square (UNCONDITIONAL) -> resize-shortest-edge-to-256 -> "
                 "center-crop-95% -> resize-shortest-edge-to-256"
             ),
-            "divergence_cause": (
+            "original_divergence_cause": (
                 "Isaac-GR00T's build_image_transformations_albumentations puts LetterBoxPad() "
                 "first in both pipelines and treats letter_box_transform as a stored-but-unused "
                 "backward-compat param; LeRobot's _transform_n1_7_image_for_vlm_albumentations "
                 "gates the pad on that flag, which this checkpoint sets false"
+            ),
+            "resolution": (
+                "Dum-E's serving path FORCES letter_box_transform=True at the config seam in "
+                "docker/lerobot-policy/server.py (one definition: "
+                "policy_guard.groot_guard.serving_preprocessor_overrides), so the served "
+                "geometry is Isaac's padded square. SAFE-01/5 reads the effective value off "
+                "the built step and refuses the handshake if the override did not land."
+            ),
+            "inference_boundary": (
+                "Matching Isaac rests on an INFERENCE accepted knowingly: 'training used "
+                "Isaac's geometry' follows from 'Isaac trained this checkpoint'. The training "
+                "recipe was NOT read and no local artifact records it. Re-examine this first "
+                "if Phase 7 parity disappoints; do not present it as settled fact."
             ),
         },
         "provenance": {
@@ -640,7 +704,7 @@ def main() -> int:
         },
         "eval_output_sha256": native_sha,
         "eval_output_sha256_recorded": GR00T_NATIVE_EVAL_OUTPUT_SHA256,
-        "lerobot_eval_output_sha256_recorded": LEROBOT_EVAL_OUTPUT_SHA256,
+        "lerobot_unpatched_output_sha256_recorded": LEROBOT_UNPATCHED_OUTPUT_SHA256,
         "eval_replay_identical": bool(np.array_equal(native, replay)),
         "environment": {
             "numpy": np.__version__,

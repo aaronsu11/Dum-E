@@ -55,6 +55,33 @@ That negative is DOCUMENTED, not silently omitted:
 asserts the field is identity on the real checkpoint and that this module reads no attribute
 of that name. It is never the guard's evidence.
 
+WHY THE SERVING PATH FORCES THE LETTERBOX PAD
+---------------------------------------------
+This checkpoint's ``processor_config.json`` sets ``letter_box_transform: false``, and
+LeRobot HONOURS that flag: ``if letter_box_transform:`` wraps its ``cv2.copyMakeBorder``
+call (``processor_groot.py:1423-1433``), so no pad runs and a 480x640 frame reaches the
+VLM as ``(256, 340, 3)``. Isaac-GR00T, which TRAINED these weights, puts ``LetterBoxPad()``
+first in **both** its albumentations pipelines unconditionally and files
+``letter_box_transform`` under ``# Backward-compat params (stored but not actively used)``
+(``image_augmentations.py:420-487``, ``processing_gr00t_n1d7.py:171-172, 198``) — so it pads
+480x640 -> 640x640 and produces ``(256, 256, 3)``.
+
+Measured, not reasoned: forcing the pad ON in LeRobot makes its output BYTE-IDENTICAL to
+Isaac's (sha256 ``c30150ec…`` from both, across Python 3.10/3.12, numpy 1.26.4/2.2.6 and
+OpenCV 4.11.0/4.13.0). Both ``INTER_AREA`` resizes and the floored 95% crop already agree
+bit-for-bit, so the pad gating is the WHOLE of the divergence.
+
+**The serving path therefore forces the pad on** (:data:`SERVING_LETTER_BOX_TRANSFORM`),
+injected as an upstream step override at the seam in ``docker/lerobot-policy/server.py``,
+and ``SAFE-01/5`` below asserts it landed on the step that will actually run.
+
+**THE INFERENCE THIS RESTS ON, stated because it was accepted knowingly and never proven.**
+"The weights were trained on Isaac's padded square" is INFERRED from "Isaac trained this
+checkpoint". The actual training recipe was **not read** — no local artifact records it —
+and the operator chose to act on the inference rather than spend a step confirming it. If
+Phase 7's parity work disappoints, this assumption is the FIRST thing to re-examine. Do not
+present it as settled fact, and do not quietly upgrade it to one.
+
 THE WRONG KNOBS
 ---------------
 ``GrootConfig.use_relative_actions`` (PLURAL, ``configuration_groot.py:330-336``) and
@@ -110,10 +137,39 @@ EXPECTED_TAG = "new_embodiment"
 #: (``processor_groot.py:1453-1454``).
 EXPECTED_CROP_FRACTION = 0.95
 
-#: ``processor_kwargs.shortest_image_edge``. The effective geometry is
-#: resize-shortest-edge-to-256 -> center-crop-95% -> resize-shortest-edge-to-256, giving
-#: (256, 340, 3) for a 480x640 frame. 224 is the placeholder-path corruption this catches.
+#: ``processor_kwargs.shortest_image_edge``. On the SERVING path the effective geometry is
+#: letterbox-pad-to-square -> resize-shortest-edge-to-256 -> center-crop-95% ->
+#: resize-shortest-edge-to-256, giving **(256, 256, 3)** for a 480x640 frame. Without the
+#: forced pad the same three stages give (256, 340, 3) — that is what the UNPATCHED upstream
+#: function does as this checkpoint configures it, and it is why the pad is forced (see the
+#: module docstring). 224 would be the placeholder-path pre-resize.
 EXPECTED_SHORTEST_IMAGE_EDGE = 256
+
+#: ``processor_kwargs.letter_box_transform`` as THIS checkpoint DECLARES it. Asserted as a
+#: drift catcher, not as a correctness claim about the pad: every recorded geometry number —
+#: the two shapes, both output digests — is measured against a checkpoint declaring False, so
+#: a checkpoint that declared True would invalidate the recorded verdict even though its
+#: geometry would still come out square. See :data:`SERVING_LETTER_BOX_TRANSFORM`.
+EXPECTED_CHECKPOINT_LETTER_BOX_TRANSFORM = False
+
+#: **What the SERVING path must actually DO, and it is the opposite of the flag above.** The
+#: pad is FORCED ON so the model sees the padded square Isaac's code produced at training
+#: time. Injected at the config seam in ``docker/lerobot-policy/server.py`` via
+#: :func:`serving_preprocessor_overrides`; verified here by ``SAFE-01/5`` against the step
+#: that will actually run. The inference this rests on is stated in the module docstring and
+#: must not be upgraded to a fact.
+SERVING_LETTER_BOX_TRANSFORM = True
+
+#: Registry name of the pipeline step that applies the image geometry
+#: (``@ProcessorStepRegistry.register(name=...)`` on ``GrootN17VLMEncodeStep``,
+#: ``processor_groot.py:2039``). The registry name is used rather than the class name because
+#: upstream's own override matcher prefers it — ``PolicyProcessorPipeline.from_pretrained``
+#: matches registered steps by registry name ONLY, so a registry-named override keeps working
+#: if this checkpoint is ever converted and reloaded from a serialized pipeline
+#: (``processor_groot.py:405-415``). An unmatched key RAISES ``KeyError`` listing the
+#: available keys, so a rename fails loudly at handshake rather than silently dropping the
+#: pad.
+VLM_ENCODE_STEP_KEY = "groot_n1_7_vlm_encode_v1"
 
 #: The relative-aware decode step. Its alternative, ``GrootActionUnpackUnnormalizeStep``, is
 #: installed only when the checkpoint's stats are unusable and is deliberately stubbed for
@@ -167,11 +223,34 @@ class GrootGuardSnapshot:
     stats_non_empty: bool
     use_percentiles: bool
     letter_box_transform: bool
+    served_letter_box_transform: bool
     crop_fraction: float | None
     shortest_image_edge: int | None
     use_albumentations: bool
     preprocessor_training: bool
     encode_step_training: bool
+
+
+def serving_preprocessor_overrides() -> dict[str, dict[str, Any]]:
+    """The image-geometry override the serving path MUST apply, as ONE definition.
+
+    Returned as an upstream ``preprocessor_overrides`` fragment so
+    ``docker/lerobot-policy/server.py`` can merge it into the same
+    ``make_pre_post_processors`` call that already carries the device and rename-map
+    overrides. That is upstream's own public override seam
+    (``processor_groot.py:401-455``), not a monkeypatch: ``letter_box_transform`` is a real
+    ``init`` field of ``GrootN17VLMEncodeStep``, an unknown FIELD raises ``TypeError``
+    listing the available fields, and an unknown STEP KEY raises ``KeyError`` listing the
+    available steps. A hand-rolled pad or a patched private function would instead have to
+    reproduce upstream's ``cv2.INTER_AREA`` resize and floored center crop, which upstream
+    documents as needing to stay bit-exact (``processor_groot.py:1394-1401``) — i.e. it would
+    manufacture the very mismatch this override removes.
+
+    It lives HERE rather than in the server module on purpose: the guard below is what
+    verifies the override landed, so the value asserted and the value injected resolve to one
+    definition and cannot drift into two.
+    """
+    return {VLM_ENCODE_STEP_KEY: {"letter_box_transform": SERVING_LETTER_BOX_TRANSFORM}}
 
 
 def assert_groot_serving_contract(snapshot: GrootGuardSnapshot) -> None:
@@ -273,13 +352,28 @@ def assert_groot_serving_contract(snapshot: GrootGuardSnapshot) -> None:
         )
 
     # --- SAFE-01/5: image geometry and eval-mode determinism -----------------
-    if snapshot.letter_box_transform:
+    if snapshot.letter_box_transform != EXPECTED_CHECKPOINT_LETTER_BOX_TRANSFORM:
         raise ValueError(
-            f"SAFE-01/5 letter_box_transform is {snapshot.letter_box_transform!r}; this "
-            f"checkpoint requires False (crop-then-resize, not letterbox). The letterbox "
-            f"branch yields a 256x256 frame where this checkpoint's recipe yields 256x340, "
-            f"so the model would see a geometry it was not trained on. Refusing to serve "
-            f"the wrong image geometry."
+            f"SAFE-01/5 the checkpoint DECLARES letter_box_transform="
+            f"{snapshot.letter_box_transform!r}, expected "
+            f"{EXPECTED_CHECKPOINT_LETTER_BOX_TRANSFORM!r}. Every recorded geometry number — "
+            f"both output shapes and both output digests — was measured against a checkpoint "
+            f"declaring {EXPECTED_CHECKPOINT_LETTER_BOX_TRANSFORM!r}, and the serving path's "
+            f"forced pad was justified against that reading. A checkpoint that declares "
+            f"otherwise has a different image recipe, so the recorded verdict no longer "
+            f"describes it. Refusing to serve against a geometry verdict that was measured "
+            f"on a different recipe; RE-MEASURE both backends and re-record."
+        )
+    if snapshot.served_letter_box_transform != SERVING_LETTER_BOX_TRANSFORM:
+        raise ValueError(
+            f"SAFE-01/5 the SERVED image pipeline has letter_box_transform="
+            f"{snapshot.served_letter_box_transform!r}, expected "
+            f"{SERVING_LETTER_BOX_TRANSFORM!r}: the letterbox pad was NOT forced onto the "
+            f"step that will actually run, so a 480x640 frame reaches the VLM as "
+            f"(256, 340, 3) instead of the padded square (256, 256, 3) Isaac's code produced "
+            f"when it trained these weights. The override in "
+            f"docker/lerobot-policy/server.py did not land — most likely the step's registry "
+            f"name moved. Refusing to serve a geometry the weights were not trained on."
         )
     if (
         snapshot.crop_fraction != EXPECTED_CROP_FRACTION
@@ -292,10 +386,10 @@ def assert_groot_serving_contract(snapshot: GrootGuardSnapshot) -> None:
             f"shortest_image_edge={snapshot.shortest_image_edge} "
             f"(want {EXPECTED_SHORTEST_IMAGE_EDGE}), "
             f"use_albumentations={snapshot.use_albumentations} (want True). The effective "
-            f"recipe is resize-shortest-edge-to-256 -> center-crop-95% -> "
-            f"resize-shortest-edge-to-256; any of these three moving changes what the VLM "
-            f"sees. Refusing to serve a preprocessing path the checkpoint was not trained "
-            f"with."
+            f"serving recipe is letterbox-pad-to-square -> resize-shortest-edge-to-256 -> "
+            f"center-crop-95% -> resize-shortest-edge-to-256; any of these three moving "
+            f"changes what the VLM sees. Refusing to serve a preprocessing path the "
+            f"checkpoint was not trained with."
         )
     if snapshot.preprocessor_training or snapshot.encode_step_training:
         raise ValueError(
@@ -344,12 +438,19 @@ def snapshot_from_checkpoint_dir(
     config = GrootConfig(base_model_path=str(path))
     common = _snapshot_common(config, path, configured_actions_per_chunk)
     return GrootGuardSnapshot(
-        # The config-only site does NOT validate these three. There is no processor object
-        # on this path, so a decode step and two training flags simply do not exist yet;
-        # they are the post-load site's job. They are set to their passing values on
-        # purpose, and pretending otherwise would make this preflight look stronger than it
-        # is. If you need them checked, you need snapshot_from_loaded.
+        # The config-only site does NOT validate these FOUR. There is no processor object
+        # on this path, so a decode step, two training flags and the SERVED letterbox value
+        # simply do not exist yet; they are the post-load site's job. They are set to their
+        # passing values on purpose, and pretending otherwise would make this preflight look
+        # stronger than it is. If you need them checked, you need snapshot_from_loaded.
+        #
+        # served_letter_box_transform is the newest member of that set and the easiest to
+        # misread: the override that forces the pad is applied when the PIPELINE is built,
+        # which happens inside the request handler, so there is nothing here to read it off.
+        # Setting it to the passing value keeps this site honest about being config-only
+        # rather than silently reporting a serving fact it cannot observe.
         decode_step_type=EXPECTED_DECODE_STEP,
+        served_letter_box_transform=SERVING_LETTER_BOX_TRANSFORM,
         preprocessor_training=False,
         encode_step_training=False,
         **common,
@@ -394,6 +495,7 @@ def snapshot_from_loaded(
             stats_non_empty=False,
             use_percentiles=False,
             letter_box_transform=False,
+            served_letter_box_transform=False,
             crop_fraction=None,
             shortest_image_edge=None,
             use_albumentations=False,
@@ -408,6 +510,13 @@ def snapshot_from_loaded(
     encode_step = _require_step(preprocessor, "letter_box_transform", "GrootN17VLMEncodeStep")
     return GrootGuardSnapshot(
         decode_step_type=_decode_step_type(postprocessor),
+        # The EFFECTIVE letterbox value, read off the step that will actually transform
+        # frames — never re-derived from the checkpoint, which declares the opposite. This is
+        # what turns "the server applies the override" from an intention into an assertion:
+        # if the override in docker/lerobot-policy/server.py stopped landing (a moved registry
+        # name, a dropped kwarg), this reads False and SAFE-01/5 refuses the handshake instead
+        # of silently serving the unpadded (256, 340, 3) geometry.
+        served_letter_box_transform=bool(encode_step.letter_box_transform),
         # `training` is a make_*_processors kwarg set from dataset_meta
         # (`processor_groot.py:1225, 1266` — `training=dataset_meta is not None`), NOT a
         # torch module flag, and policy_server passes no dataset_meta, so it is False on the

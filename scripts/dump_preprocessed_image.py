@@ -1,16 +1,51 @@
 #!/usr/bin/env python3
 """Settle PAR-05 offline: what geometry does THIS checkpoint's image recipe produce?
 
-**Recorded verdict, up front: a 480x640x3 uint8 frame becomes exactly
-``(256, 340, 3)`` uint8** under the checkpoint's own recipe. The effective
-pipeline is *resize-shortest-edge-to-256 -> center-crop-95% ->
-resize-shortest-edge-to-256*.
+**TWO verdicts, and keeping them apart is the whole point of this module.** Both
+are true, both are measured, and collapsing them loses the reason the serving path
+is configured the way it is:
+
+============================================  ==================  =========================
+What                                          A 480x640x3 frame   Constant
+becomes
+============================================  ==================  =========================
+The UNPATCHED upstream transform, run as       ``(256, 340, 3)``   :data:`EXPECTED_SHAPE`
+this checkpoint configures it
+(``letter_box_transform: false``)
+**Dum-E's SERVING path**, with the letterbox   ``(256, 256, 3)``   :data:`SERVING_EXPECTED_SHAPE`
+pad FORCED on
+============================================  ==================  =========================
+
+The unpatched pipeline is *resize-shortest-edge-to-256 -> center-crop-95% ->
+resize-shortest-edge-to-256*. The serving pipeline is that, with
+*letterbox-pad-to-square* in front of it.
+
+**Why the serving path overrides the checkpoint's own flag.** Isaac-GR00T, which
+trained these weights, applies ``LetterBoxPad()`` UNCONDITIONALLY and treats
+``letter_box_transform`` as a stored-but-unused backward-compat parameter, so the
+geometry the weights were trained on is the padded square. LeRobot honours the flag
+and therefore produced a geometry Isaac never emitted. Forcing the pad on makes
+LeRobot's output BYTE-IDENTICAL to Isaac's
+(:data:`SERVING_OUTPUT_SHA256`), which is what isolates the whole divergence to
+that one stage. Full record: ``docs/LEROBOT-SERVING-VERDICTS.md``.
+
+**The inference this rests on, stated because it was accepted knowingly and never
+proven:** "the weights were trained on Isaac's padded square" is INFERRED from
+"Isaac trained this checkpoint". The training recipe itself was **not read** — no
+local artifact records it. If Phase 7's parity work disappoints, this is the first
+assumption to re-examine. It is not a settled fact.
 
 This probe needs **no GPU, no weights, no network, no Hugging Face token and no
 hardware**. It calls the module-level pure function
 ``lerobot.policies.groot.processor_groot._transform_n1_7_image_for_vlm_albumentations``
 directly — no model load, no ``PolicyServer`` subclass, no monkeypatch — which is
-what makes PAR-05 reachable at all under this phase's compose-only posture.
+what makes PAR-05 reachable at all under this phase's compose-only posture. The
+serving-path measurement goes one step further and BUILDS the real preprocessor
+pipeline (``make_pre_post_processors``, with the server's own override fragment),
+then reads the five geometry settings off the constructed ``GrootN17VLMEncodeStep``
+and calls the same transform the step itself calls — so the number reported is the
+served configuration's, not a restatement of it. That build is still weight-free
+and network-free: the step's Qwen processor is lazy and is never touched.
 
 It is deliberately LOUD. A shape that does not match the pinned expectation
 **FAILS** with a non-zero exit; it is never printed as an interesting
@@ -42,6 +77,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -71,10 +107,25 @@ PROCESSOR_CONFIG = CHECKPOINT_DIR / "processor_config.json"
 # cannot silently drift away from the checkpoint on disk.
 
 #: processor_config.json: processor_kwargs.letter_box_transform.
-#: False -> this checkpoint does NOT take the letterbox branch. The branch is
-#: real and reachable (it yields (256, 256, 3)); it is simply not this
-#: checkpoint's path, which is half of why the ROADMAP's framing is stale.
+#: False -> the checkpoint DECLARES no letterbox, and the unpatched upstream
+#: transform honours that. Kept pinned as a checkpoint FACT (check 1 re-reads it),
+#: and deliberately NOT the value the serving path uses — see
+#: :data:`SERVING_LETTER_BOX_TRANSFORM`.
 LETTER_BOX_TRANSFORM = False
+
+#: **What Dum-E's SERVING path forces instead**, overriding the flag above so the
+#: model sees the padded square Isaac's code produced at training time.
+#:
+#: This is a PINNED COPY, not the definition. The definition is
+#: ``policy_guard.groot_guard.SERVING_LETTER_BOX_TRANSFORM``, which
+#: ``docker/lerobot-policy/server.py`` injects at the config seam;
+#: ``test_serving_letterbox_constant_matches_the_guards_definition`` asserts the two
+#: agree on every suite run. It is copied rather than imported because this module is
+#: ALSO imported inside the ``gr00t:latest`` container by
+#: ``scripts/dump_gr00t_native_preprocessed_image.py``, where ``policy_guard`` (and
+#: the ``lerobot`` it imports at module scope) do not exist — an import here would
+#: make the cross-backend probe unrunnable.
+SERVING_LETTER_BOX_TRANSFORM = True
 
 #: processor_config.json: processor_kwargs.crop_fraction. Because this is SET
 #: (not None), it takes precedence over ``image_crop_size`` — see below.
@@ -118,35 +169,74 @@ RECIPE_KEYS = (
 
 # --- Expected geometry, pinned as exact integers ------------------------------
 
-#: **THE PAR-05 VERDICT.** A 480x640x3 uint8 frame through the checkpoint's own
-#: recipe. Exact integers, no tolerance: the pipeline is a deterministic
-#: crop-then-resize, so an approximate match would let a real preprocessing
-#: shift pass.
+#: **What the UNPATCHED upstream transform produces**, run exactly as this
+#: checkpoint configures it (pad off). A 480x640x3 uint8 frame. Exact integers, no
+#: tolerance: the pipeline is a deterministic crop-then-resize, so an approximate
+#: match would let a real preprocessing shift pass.
+#:
+#: **This is no longer the serving path's output** — see
+#: :data:`SERVING_EXPECTED_SHAPE`. It is kept, pinned and asserted because it is
+#: what makes the forced pad a real change rather than a no-op, and because a
+#: silent move in upstream's resize/crop arithmetic must still go red somewhere.
 #:
 #: The ROADMAP's "341x256-crop vs 256x256-letterbox" framing is STALE, and
 #: REQUIREMENTS.md:50 already records it as a misread. Both halves of that
-#: framing are real but neither is the answer: 256x341 is the INTERMEDIATE after
-#: the first resize-shortest-edge of a 480x640 frame, and 256x256 is the
-#: LETTERBOX branch this checkpoint does not take.
+#: framing are real but neither described the answer at the time: 256x341 is the
+#: INTERMEDIATE after the first resize-shortest-edge of a 480x640 frame, and
+#: 256x256 was the letterbox branch this checkpoint's own config declines — which
+#: the serving path now takes anyway, for the reason in the module docstring.
 EXPECTED_SHAPE = (256, 340, 3)
 
-#: What the C-3 corruption produces instead. The reason a shape-only
-#: cross-container comparison is genuinely discriminating here rather than
-#: merely convenient: the corruption CHANGES the shape.
+#: **THE SERVING-PATH VERDICT, and the one Phase 7 must use.** The same frame
+#: through the pipeline Dum-E's ``lerobot-policy`` server actually builds, with the
+#: letterbox pad forced on. Byte-identical to Isaac-GR00T's own eval output
+#: (:data:`SERVING_OUTPUT_SHA256`), which is the whole point of forcing it.
+SERVING_EXPECTED_SHAPE = (256, 256, 3)
+
+#: sha256 of the SERVING path's output bytes for the seed-0 frame. Equal, by
+#: measurement, to Isaac-GR00T's ``GR00T_NATIVE_EVAL_OUTPUT_SHA256`` — recorded as
+#: an independent literal here so that equality stays an ASSERTION rather than
+#: becoming a definition (two names for one constant could not disagree, and a
+#: comparison that cannot fail is not a comparison).
+SERVING_OUTPUT_SHA256 = "c30150ec8d9d7ccb648aade0588aed2d18a356ab7f984a510dc57bb6c485927f"
+
+#: What the C-3 corruption produces under the UNPATCHED transform. On that path the
+#: corruption CHANGES the shape, which is what made a shape-only cross-container
+#: comparison discriminating rather than merely convenient.
+#:
+#: **On the SERVING path it no longer does, and that is recorded rather than
+#: quietly dropped.** The forced pad squares every input, so a 224x224-corrupted
+#: frame and a correct 480x640 frame both emerge as ``(256, 256, 3)`` and differ
+#: only in pixels (check 8 measures exactly that). What carries C-3 now is
+#: PREVENTION, not detection: ``fixup_policy_features`` sets ``input_features``
+#: before ``from_pretrained``, so the ``(3, 224, 224)`` placeholder branch — guarded
+#: by ``config is None`` (``modeling_groot.py:247-261``) — never runs at all.
 EXPECTED_CORRUPTED_SHAPE = (256, 256, 3)
 
 #: The source frame size, taken from ``scripts/test_live_policy_server.py``'s
-#: ``_synthetic_observation(height=480, width=640)`` rather than invented — the
-#: (256, 340, 3) verdict is measured AT 480x640 and does not generalize to
-#: another aspect ratio.
+#: ``_synthetic_observation(height=480, width=640)`` rather than invented — BOTH
+#: verdicts are measured AT 480x640 and neither generalizes to another aspect ratio.
+#: The unpatched ``(256, 340, 3)`` obviously depends on it, since the output width
+#: tracks the input aspect. The serving ``(256, 256, 3)`` is square for ANY input,
+#: which makes it look aspect-independent and is exactly why the frame size is pinned
+#: here: the padded square's CONTENT — how much of the frame is image and how much is
+#: zero padding — still depends entirely on 480x640, and that is what the VLM sees.
 SOURCE_HEIGHT = 480
 SOURCE_WIDTH = 640
 
 #: The edge ``from_pretrained``'s placeholder feature squares every camera to.
 PLACEHOLDER_EDGE = 224
 
-#: The four case names recorded in the manifest and dumped to the .npz.
-CASE_NAMES = ("checkpoint_recipe", "placeholder_corrupted", "square_256", "letterbox")
+#: The five case names recorded in the manifest and dumped to the .npz.
+#: ``serving_path`` is the one that matters for Phase 7; ``checkpoint_recipe`` is the
+#: unpatched baseline kept so the difference between them stays visible.
+CASE_NAMES = (
+    "checkpoint_recipe",
+    "serving_path",
+    "placeholder_corrupted",
+    "square_256",
+    "letterbox",
+)
 
 
 def _green(s: str) -> str:
@@ -274,6 +364,119 @@ def transform_checkpoint_recipe(frame: np.ndarray, **overrides: Any) -> np.ndarr
     return _transform_n1_7_image_for_vlm_albumentations(frame, **kwargs)
 
 
+#: The five geometry settings the encode step forwards to the transform it calls
+#: (``processor_groot.py:2109-2118``). Read off the BUILT step by
+#: :func:`serving_geometry_settings` rather than restated, so a measurement of the
+#: "served" geometry cannot silently become a measurement of this file's opinion.
+SERVING_GEOMETRY_FIELDS = (
+    "image_crop_size",
+    "image_target_size",
+    "shortest_image_edge",
+    "crop_fraction",
+    "letter_box_transform",
+)
+
+
+def build_serving_preprocessor(checkpoint_dir: Path = CHECKPOINT_DIR) -> Any:
+    """Build the REAL preprocessor pipeline the ``lerobot-policy`` server builds.
+
+    Same public builder, same three override fragments — including the geometry
+    override imported from ``policy_guard.groot_guard``, so this measures the
+    server's configuration rather than a copy of it. Still weight-free, GPU-free and
+    network-free: ``GrootN17VLMEncodeStep``'s Qwen processor is lazy (``_proc`` is
+    ``init=False``, built only on first ``.proc`` access) and nothing here touches it.
+
+    ``policy_guard`` is imported INSIDE the function on purpose. This module is also
+    imported inside the ``gr00t:latest`` container by
+    ``scripts/dump_gr00t_native_preprocessed_image.py``, where neither
+    ``policy_guard`` nor ``lerobot`` exists; a module-scope import would make the
+    cross-backend probe unrunnable.
+    """
+    from lerobot.configs.types import FeatureType, PolicyFeature
+    from lerobot.policies import make_pre_post_processors
+    from lerobot.policies.groot.configuration_groot import GrootConfig
+    from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
+
+    from policy_guard.groot_guard import EXPECTED_TAG, serving_preprocessor_overrides
+
+    config = GrootConfig(
+        base_model_path=str(checkpoint_dir),
+        embodiment_tag=EXPECTED_TAG,
+        model_params_fp32=False,
+    )
+    # The same feature fixup ``docker/lerobot-policy/server.py`` applies before the
+    # load: without it ``validate_features`` inserts a 132-wide action feature and the
+    # pipeline is not the served one.
+    config.input_features = {
+        f"{OBS_IMAGES}.{cam}": PolicyFeature(
+            type=FeatureType.VISUAL, shape=(3, SOURCE_HEIGHT, SOURCE_WIDTH)
+        )
+        for cam in ("wrist", "front")
+    }
+    config.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(6,))
+    config.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,))}
+    config.device = "cpu"
+
+    overrides: dict[str, Any] = {
+        "device_processor": {"device": "cpu"},
+        "rename_observations_processor": {"rename_map": {}},
+    }
+    overrides.update(serving_preprocessor_overrides())
+    preprocessor, _postprocessor = make_pre_post_processors(
+        config,
+        pretrained_path=str(checkpoint_dir),
+        preprocessor_overrides=overrides,
+        postprocessor_overrides={"device_processor": {"device": "cpu"}},
+    )
+    return preprocessor
+
+
+def serving_encode_step(preprocessor: Any) -> Any:
+    """The built pipeline's image step, located by the marker the guard locates it by.
+
+    Raises rather than returning ``None``: a "served geometry" measured off a step
+    that could not be found would be a fabricated number.
+    """
+    candidates = [
+        step for step in preprocessor.steps if hasattr(step, "letter_box_transform")
+    ]
+    if not candidates:
+        raise RuntimeError(
+            "no step of the built preprocessor carries `letter_box_transform`, so the "
+            "SERVED image geometry cannot be read off the pipeline that will run it. "
+            "The pinned lerobot release reshaped the processor pipeline; fix this "
+            "against the new shape rather than measuring a stand-in."
+        )
+    return candidates[-1]
+
+
+def serving_geometry_settings(preprocessor: Any) -> dict[str, Any]:
+    """The five geometry settings, READ OFF the built step (never restated)."""
+    step = serving_encode_step(preprocessor)
+    return {name: getattr(step, name) for name in SERVING_GEOMETRY_FIELDS}
+
+
+def transform_as_served(frame: np.ndarray, settings: dict[str, Any]) -> np.ndarray:
+    """Run ``frame`` through the transform with the SERVED settings.
+
+    ``settings`` comes from :func:`serving_geometry_settings`, i.e. off the built
+    step, and this calls the very function the step calls with the very arguments it
+    forwards (``processor_groot.py:2109-2118``). So this is the served pipeline's
+    geometry, not a reimplementation of it — and nothing here re-derives a resize or a
+    crop, which upstream documents as needing to stay bit-exact
+    (``processor_groot.py:1394-1401``).
+
+    ``crop_position`` is deliberately not passed: it defaults to ``None``, the
+    deterministic CENTER crop, which is what the serving path takes
+    (``training`` is False and ``predict_action_chunk`` is ``@torch.no_grad()``).
+    """
+    from lerobot.policies.groot.processor_groot import (
+        _transform_n1_7_image_for_vlm_albumentations,
+    )
+
+    return _transform_n1_7_image_for_vlm_albumentations(frame, **settings)
+
+
 def transform_after_placeholder_resize(frame: np.ndarray) -> np.ndarray:
     """Reproduce the C-3 corruption, then run the checkpoint recipe on it.
 
@@ -288,8 +491,22 @@ def transform_after_placeholder_resize(frame: np.ndarray) -> np.ndarray:
     function ``prepare_raw_observation`` calls, over a uint8 HWC tensor built the
     same way (``torch.tensor(lerobot_obs[key])``) — not a hand-written resize.
 
-    Why this corruption is CATCHABLE by a shape check: it lands on
-    ``(256, 256, 3)``, not ``(256, 340, 3)``.
+    Under the UNPATCHED transform this corruption is CATCHABLE by a shape check: it
+    lands on ``(256, 256, 3)``, not ``(256, 340, 3)``. Under the SERVING path it is
+    NOT — the forced pad squares every input, so correct and corrupted frames share a
+    shape and differ only in pixels. Check 7 measures both halves of that; C-3 is
+    carried by prevention (``fixup_policy_features``), not by this shape.
+    """
+    return transform_checkpoint_recipe(placeholder_squared(frame))
+
+
+def placeholder_squared(frame: np.ndarray) -> np.ndarray:
+    """The C-3 pre-resize ALONE: a 480x640 frame squared to 224x224, HWC uint8.
+
+    Split out from :func:`transform_after_placeholder_resize` so the same corruption
+    can be fed to either geometry — the unpatched transform (where it changes the
+    output shape) or the serving pipeline (where it no longer does). One
+    implementation, so the two comparisons cannot diverge in how they corrupt.
     """
     import torch
     from lerobot.async_inference.helpers import resize_robot_observation_image
@@ -298,8 +515,7 @@ def transform_after_placeholder_resize(frame: np.ndarray) -> np.ndarray:
         torch.tensor(frame), (3, PLACEHOLDER_EDGE, PLACEHOLDER_EDGE)
     )
     # (C, H, W) back to the HxWx3 uint8 frame the checkpoint transform accepts.
-    hwc = np.ascontiguousarray(squared.permute(1, 2, 0).to(torch.uint8).numpy())
-    return transform_checkpoint_recipe(hwc)
+    return np.ascontiguousarray(squared.permute(1, 2, 0).to(torch.uint8).numpy())
 
 
 # --- Dump writing ------------------------------------------------------------
@@ -344,6 +560,12 @@ def _shape_of(array: np.ndarray) -> list[int]:
     return [int(n) for n in array.shape]
 
 
+def _sha256(array: np.ndarray) -> str:
+    """sha256 over an array's raw bytes. Same helper the GR00T-native probe uses, so
+    the two containers hash identically rather than nearly-identically."""
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -359,7 +581,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    checks = Checks(total=6)
+    checks = Checks(total=9)
 
     # --- 1: the pinned recipe still equals the checkpoint on disk ------------
     checks.start("Pinned recipe constants match the checkpoint's processor_config.json")
@@ -392,15 +614,26 @@ def main() -> int:
         0, 255, (SHORTEST_IMAGE_EDGE, SHORTEST_IMAGE_EDGE, 3), dtype=np.uint8
     )
 
+    # The SERVING pipeline, built for real, with its geometry read off the step that
+    # would transform frames. Weight-free and network-free (the step's Qwen processor
+    # is lazy); this is what makes the "serving path" numbers below measurements of
+    # the server's configuration rather than of this file's opinion.
+    preprocessor = build_serving_preprocessor()
+    served = serving_geometry_settings(preprocessor)
+
     outputs: dict[str, np.ndarray] = {
         "checkpoint_recipe": transform_checkpoint_recipe(frame),
+        "serving_path": transform_as_served(frame, served),
         "placeholder_corrupted": transform_after_placeholder_resize(frame),
         "square_256": transform_checkpoint_recipe(square),
         "letterbox": transform_checkpoint_recipe(frame, letter_box_transform=True),
     }
 
-    # --- 2: the verdict itself ----------------------------------------------
-    checks.start(f"480x{SOURCE_WIDTH} through the checkpoint recipe is {EXPECTED_SHAPE}")
+    # --- 2: the UNPATCHED baseline ------------------------------------------
+    checks.start(
+        f"480x{SOURCE_WIDTH} through the UNPATCHED transform, as the checkpoint "
+        f"configures it, is {EXPECTED_SHAPE}"
+    )
     got = outputs["checkpoint_recipe"]
     if tuple(got.shape) != EXPECTED_SHAPE or got.dtype != np.uint8:
         checks.fail(
@@ -412,10 +645,77 @@ def main() -> int:
     else:
         checks.ok(
             "checkpoint_recipe_shape",
-            f"observed {tuple(got.shape)} {got.dtype} (exact integers, no tolerance)",
+            f"observed {tuple(got.shape)} {got.dtype} (exact integers, no tolerance); "
+            "this is NOT the serving path's geometry — see check 4",
         )
 
-    # --- 3: the corruption it must be distinguished from --------------------
+    # --- 3: the override reached the step that will run ---------------------
+    checks.start(
+        "The built serving pipeline's image step carries the FORCED letterbox pad, and "
+        "its other four geometry settings are the checkpoint's"
+    )
+    expected_served = {
+        "image_crop_size": IMAGE_CROP_SIZE,
+        "image_target_size": IMAGE_TARGET_SIZE,
+        "shortest_image_edge": SHORTEST_IMAGE_EDGE,
+        "crop_fraction": CROP_FRACTION,
+        "letter_box_transform": SERVING_LETTER_BOX_TRANSFORM,
+    }
+    served_disagreements = [
+        f"{key}: built step has {served[key]!r}, expected {expected_served[key]!r}"
+        for key in SERVING_GEOMETRY_FIELDS
+        if served[key] != expected_served[key]
+    ]
+    if served_disagreements:
+        checks.fail(
+            "serving_override_landed",
+            "the serving pipeline is not configured as the server configures it, so every "
+            "'serving path' number below would describe something else. "
+            + "; ".join(served_disagreements)
+            + ". If letter_box_transform is False, the override in "
+            "docker/lerobot-policy/server.py did not land (most likely the step's registry "
+            "name moved) and the server would feed the VLM an unpadded frame",
+        )
+    else:
+        checks.ok(
+            "serving_override_landed",
+            "read off the built step: "
+            + ", ".join(f"{key}={served[key]!r}" for key in SERVING_GEOMETRY_FIELDS)
+            + f" — the checkpoint DECLARES letter_box_transform={on_disk['letter_box_transform']!r} "
+            "and the serving path overrides it on purpose",
+        )
+
+    # --- 4: THE SERVING-PATH VERDICT, shape and bytes -----------------------
+    checks.start(
+        f"480x{SOURCE_WIDTH} through the SERVING pipeline is {SERVING_EXPECTED_SHAPE} and "
+        f"hashes to Isaac-GR00T's own eval digest"
+    )
+    serving = outputs["serving_path"]
+    serving_sha = _sha256(serving)
+    if tuple(serving.shape) != SERVING_EXPECTED_SHAPE or serving.dtype != np.uint8:
+        checks.fail(
+            "serving_path_shape",
+            f"observed {tuple(serving.shape)} {serving.dtype}, expected "
+            f"{SERVING_EXPECTED_SHAPE} uint8 — the served geometry is NOT the padded square "
+            "Isaac's code produced at training time",
+        )
+    elif serving_sha != SERVING_OUTPUT_SHA256:
+        checks.fail(
+            "serving_path_shape",
+            f"shape is right but the BYTES are not: observed {serving_sha}, recorded "
+            f"{SERVING_OUTPUT_SHA256} (which is Isaac-GR00T's own eval output digest). The "
+            "cross-backend agreement no longer holds byte-for-byte. RE-MEASURE both "
+            "backends and re-record; do not relax this to a tolerance",
+        )
+    else:
+        checks.ok(
+            "serving_path_shape",
+            f"observed {tuple(serving.shape)} {serving.dtype}, sha256 {serving_sha}: "
+            f"byte-identical to Isaac-GR00T's eval output, and a different artifact from "
+            f"the unpatched {tuple(got.shape)}",
+        )
+
+    # --- 5: the corruption it must be distinguished from --------------------
     checks.start(f"The C-3 placeholder pre-resize lands on {EXPECTED_CORRUPTED_SHAPE}")
     corrupted = outputs["placeholder_corrupted"]
     if tuple(corrupted.shape) != EXPECTED_CORRUPTED_SHAPE or corrupted.dtype != np.uint8:
@@ -430,8 +730,11 @@ def main() -> int:
             f"observed {tuple(corrupted.shape)} {corrupted.dtype}",
         )
 
-    # --- 4: the corruption is discriminable --------------------------------
-    checks.start("The correct output and the corrupted output are NOT equal")
+    # --- 6: the corruption is discriminable ON THE UNPATCHED PATH ----------
+    checks.start(
+        "The UNPATCHED output and the corrupted output are NOT equal (the historical "
+        "shape-only rationale)"
+    )
     if tuple(got.shape) == tuple(corrupted.shape) and np.array_equal(got, corrupted):
         checks.fail(
             "corruption_discriminable",
@@ -442,10 +745,50 @@ def main() -> int:
     else:
         checks.ok(
             "corruption_discriminable",
-            f"{tuple(got.shape)} != {tuple(corrupted.shape)}; a shape check catches it",
+            f"{tuple(got.shape)} != {tuple(corrupted.shape)}; a shape check catches it on "
+            "the unpatched path — check 7 records that it does NOT on the serving path",
         )
 
-    # --- 5: image_crop_size is inert, by measurement -----------------------
+    # --- 7: the honest consequence of the forced pad -----------------------
+    # Recorded as a MEASUREMENT rather than as prose, because it is a real cost of
+    # the operator's decision and the kind of fact a later reader would otherwise
+    # inherit as a false reassurance: the C-3 corruption becomes shape-INVISIBLE once
+    # every input is padded square. What carries C-3 now is prevention
+    # (fixup_policy_features runs before from_pretrained, so the placeholder branch
+    # never executes), not this shape.
+    checks.start(
+        "On the SERVING path the C-3 corruption shares the correct output's SHAPE but "
+        "differs in BYTES (recorded cost of the forced pad)"
+    )
+    corrupted_served = transform_as_served(placeholder_squared(frame), served)
+    shapes_equal = tuple(corrupted_served.shape) == tuple(serving.shape)
+    bytes_equal = shapes_equal and np.array_equal(corrupted_served, serving)
+    serving_corruption_shape_invisible = bool(shapes_equal and not bytes_equal)
+    if bytes_equal:
+        checks.fail(
+            "serving_corruption_shape_invisible",
+            "the corrupted and correct SERVING outputs are byte-identical, which would "
+            "mean the C-3 pre-resize is undetectable by ANY comparison rather than merely "
+            "by a shape check — re-examine fixup_policy_features before serving",
+        )
+    elif not shapes_equal:
+        checks.fail(
+            "serving_corruption_shape_invisible",
+            f"the corrupted serving output is {tuple(corrupted_served.shape)} against "
+            f"{tuple(serving.shape)} for the correct one. That is BETTER than recorded, not "
+            "worse — but the recorded cost of the forced pad is now stale and "
+            "docs/LEROBOT-SERVING-VERDICTS.md must be re-recorded rather than left claiming "
+            "a weakness that no longer exists",
+        )
+    else:
+        checks.ok(
+            "serving_corruption_shape_invisible",
+            f"both are {tuple(serving.shape)} and they differ in bytes: the forced pad "
+            "squares every input, so C-3 is no longer catchable by a shape check and is "
+            "carried by PREVENTION (fixup_policy_features) instead",
+        )
+
+    # --- 8: image_crop_size is inert, by measurement -----------------------
     checks.start("image_crop_size is inert while crop_fraction is set")
     widened = transform_checkpoint_recipe(frame, image_crop_size=[999, 999])
     crop_size_inert = bool(
@@ -465,38 +808,68 @@ def main() -> int:
             "configuration on this checkpoint",
         )
 
-    # --- 6: replay-identical under the serving configuration ---------------
-    checks.start("Two invocations on the same frame are byte-identical")
+    # --- 9: replay-identical, on BOTH geometries ---------------------------
+    checks.start("Two invocations on the same frame are byte-identical (unpatched AND served)")
     replay = transform_checkpoint_recipe(frame)
-    if not np.array_equal(got, replay):
+    serving_replay = transform_as_served(frame, served)
+    replay_identical = bool(np.array_equal(got, replay))
+    serving_replay_identical = bool(np.array_equal(serving, serving_replay))
+    if not (replay_identical and serving_replay_identical):
         checks.fail(
             "replay_identical",
-            "two invocations differ — the serving path should take the deterministic "
-            "CENTER crop, not the train-time random crop",
+            f"two invocations differ (unpatched identical={replay_identical}, served "
+            f"identical={serving_replay_identical}) — the serving path should take the "
+            "deterministic CENTER crop, not the train-time random crop",
         )
     else:
         checks.ok(
             "replay_identical",
-            "exact array equality across two invocations (center crop, not random crop)",
+            "exact array equality across two invocations of each geometry (center crop, "
+            "not random crop)",
         )
 
     manifest: dict[str, Any] = {
         "verdict": {
             "source_shape": [SOURCE_HEIGHT, SOURCE_WIDTH, 3],
             "expected_shape": list(EXPECTED_SHAPE),
+            "serving_expected_shape": list(SERVING_EXPECTED_SHAPE),
             "expected_corrupted_shape": list(EXPECTED_CORRUPTED_SHAPE),
-            "effective_pipeline": (
+            "unpatched_effective_pipeline": (
                 "resize-shortest-edge-to-256 -> center-crop-95% -> "
                 "resize-shortest-edge-to-256"
+            ),
+            "serving_effective_pipeline": (
+                "letterbox-pad-to-square (FORCED) -> resize-shortest-edge-to-256 -> "
+                "center-crop-95% -> resize-shortest-edge-to-256"
+            ),
+            "serving_letter_box_transform": SERVING_LETTER_BOX_TRANSFORM,
+            "checkpoint_letter_box_transform": on_disk["letter_box_transform"],
+            "why_the_pad_is_forced": (
+                "Isaac-GR00T trained these weights and applies LetterBoxPad() "
+                "unconditionally (image_augmentations.py:420-487), treating "
+                "letter_box_transform as a stored-but-unused backward-compat param "
+                "(processing_gr00t_n1d7.py:171-172, 198). LeRobot honours the flag, so "
+                "it produced a geometry Isaac never emitted. Forcing the pad makes the "
+                "outputs byte-identical."
+            ),
+            "inference_boundary": (
+                "'the weights were trained on Isaac's padded square' is INFERRED from "
+                "'Isaac trained this checkpoint'. The training recipe was NOT read and no "
+                "local artifact records it. Re-examine this first if Phase 7 parity "
+                "disappoints."
             ),
             "stale_roadmap_framing": (
                 "'341x256-crop vs 256x256-letterbox' is a misread (REQUIREMENTS.md:50): "
                 "256x341 is the intermediate after the first resize-shortest-edge, and "
-                "256x256 is the letterbox branch this checkpoint does not take"
+                "256x256 was the letterbox branch this checkpoint's config declines — "
+                "which the serving path now takes anyway"
             ),
         },
         "recipe": on_disk,
         "recipe_source": str(PROCESSOR_CONFIG.relative_to(REPO_ROOT)),
+        "served_geometry_settings": {
+            key: served[key] for key in SERVING_GEOMETRY_FIELDS
+        },
         "seed": int(args.seed),
         "cases": {
             name: {
@@ -505,10 +878,19 @@ def main() -> int:
             }
             for name in CASE_NAMES
         },
+        "serving_output_sha256": serving_sha,
+        "serving_output_sha256_recorded": SERVING_OUTPUT_SHA256,
+        "serving_corruption_shape_invisible": serving_corruption_shape_invisible,
         "crop_size_inert": crop_size_inert,
-        "replay_identical": bool(np.array_equal(got, replay)),
+        "replay_identical": replay_identical,
+        "serving_replay_identical": serving_replay_identical,
     }
     manifest["cases"]["checkpoint_recipe"]["input_shape"] = [
+        SOURCE_HEIGHT,
+        SOURCE_WIDTH,
+        3,
+    ]
+    manifest["cases"]["serving_path"]["input_shape"] = [
         SOURCE_HEIGHT,
         SOURCE_WIDTH,
         3,

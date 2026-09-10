@@ -25,6 +25,20 @@ The same is true of the horizon: ``test_chunk_length_sixteen_is_not_horizon_evid
 documents that an emitted chunk length of 16 proves nothing, because three independent
 truncations force 16 regardless of configuration.
 
+**SAFE-01/5's letterbox expectation was INVERTED, and the inversion is proven RED.** The
+guard used to require ``letter_box_transform`` False. It now requires two different things
+of two different values: the CHECKPOINT must still declare ``False`` (a drift catcher — every
+recorded geometry number was measured against that declaration), and the SERVED pipeline must
+carry ``True``, because Isaac-GR00T padded to a square when it trained these weights and
+LeRobot's flag-honouring path fed the model a geometry Isaac never emitted. Changing a guard's
+expected value is exactly the edit that can silently defang it, so
+``test_violation_5a2_served_letterbox_off_raises`` and
+``test_snapshot_from_loaded_reads_the_served_letterbox_off_the_encode_step`` prove the new
+assertion fires on a wrong geometry rather than merely passing on the right one. **The
+"trained on the padded square" half is an INFERENCE accepted knowingly** — it follows from
+"Isaac trained this checkpoint", the training recipe was never read, and no local artifact
+records it.
+
 Every test is hermetic: it reads only the real checkpoint's sidecar JSONs and the pinned
 constants in ``policy_guard/groot_guard.py``, and needs no serial port, no camera, no
 network, no GPU and no weights. **Nothing here may skip** — a skipped guard test is a
@@ -49,14 +63,18 @@ sys.path.insert(0, str(REPO_ROOT))
 # Import the pinned values rather than restating them: the guard and its tests must share
 # ONE source of truth, or a drift in one silently satisfies the other.
 from policy_guard.groot_guard import (  # noqa: E402
+    EXPECTED_CHECKPOINT_LETTER_BOX_TRANSFORM,
     EXPECTED_CROP_FRACTION,
     EXPECTED_DECODE_STEP,
     EXPECTED_HORIZON,
     EXPECTED_SHORTEST_IMAGE_EDGE,
     EXPECTED_TAG,
     NO_DECODE_STEP,
+    SERVING_LETTER_BOX_TRANSFORM,
+    VLM_ENCODE_STEP_KEY,
     GrootGuardSnapshot,
     assert_groot_serving_contract,
+    serving_preprocessor_overrides,
     snapshot_from_checkpoint_dir,
     snapshot_from_loaded,
 )
@@ -65,7 +83,7 @@ REAL_CHECKPOINT = REPO_ROOT / "checkpoints" / "GR00T-N1.7-3B-SO101"
 
 GUARD_SOURCE = REPO_ROOT / "policy_guard" / "groot_guard.py"
 
-#: The twelve single-field mutations of the REAL snapshot, one per assertion the guard
+#: The thirteen single-field mutations of the REAL snapshot, one per assertion the guard
 #: makes, shared by the individual violation tests' intent and by the programmatic
 #: message-consistency gate below so the two cannot drift apart.
 VIOLATION_MUTATIONS: tuple[tuple[str, object], ...] = (
@@ -79,6 +97,11 @@ VIOLATION_MUTATIONS: tuple[tuple[str, object], ...] = (
     ("stats_non_empty", False),
     ("use_percentiles", False),
     ("letter_box_transform", True),
+    # The forced pad NOT landing on the served pipeline. This is the mutation that
+    # keeps SAFE-01/5's updated expectation from being a rubber stamp: the assertion
+    # was changed from "the pad must be off" to "the pad must be forced on", and an
+    # assertion that has only ever been GREEN on the right value has never been tested.
+    ("served_letter_box_transform", False),
     ("crop_fraction", None),
     ("preprocessor_training", True),
 )
@@ -135,7 +158,13 @@ def test_real_checkpoint_snapshot_passes_the_guard():
     assert snapshot.use_relative_action is True
     assert snapshot.use_percentiles is True
     assert snapshot.stats_non_empty is True
-    assert snapshot.letter_box_transform is False
+    # The checkpoint DECLARES the letterbox off; the serving path forces it ON. Both
+    # are asserted, because the guard's whole job at SAFE-01/5 is that they disagree in
+    # exactly this direction. A config-only snapshot cannot observe the served value, so
+    # it is set to the passing value by construction and documented as such — the live
+    # proof is tests/test_lerobot_serving_live.py.
+    assert snapshot.letter_box_transform is EXPECTED_CHECKPOINT_LETTER_BOX_TRANSFORM is False
+    assert snapshot.served_letter_box_transform is SERVING_LETTER_BOX_TRANSFORM is True
     assert snapshot.crop_fraction == EXPECTED_CROP_FRACTION == 0.95
     assert snapshot.shortest_image_edge == EXPECTED_SHORTEST_IMAGE_EDGE == 256
     assert snapshot.use_albumentations is True
@@ -224,11 +253,49 @@ def test_violation_4b_percentiles_off_raises():
     assert "q01" in str(excinfo.value)
 
 
-def test_violation_5a_letterbox_transform_on_raises():
+def test_violation_5a_checkpoint_declaring_letterbox_on_raises():
+    """A checkpoint that DECLARES the pad on invalidates the recorded verdict.
+
+    Not a correctness claim about the pad — the geometry would still come out square.
+    It is a DRIFT claim: every recorded geometry number (both shapes, both digests, the
+    cross-backend agreement) was measured against a checkpoint declaring False, and the
+    forced-pad decision was justified against that reading. A checkpoint declaring
+    otherwise has a different image recipe, so the verdict must be re-measured rather
+    than assumed to carry over.
+    """
     bad = dataclasses.replace(real_snapshot(), letter_box_transform=True)
     with pytest.raises(ValueError, match=r"^SAFE-01/5 ") as excinfo:
         assert_groot_serving_contract(bad)
-    assert "True" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "True" in message
+    assert "DECLARES" in message
+    assert "RE-MEASURE" in message
+
+
+def test_violation_5a2_served_letterbox_off_raises():
+    """THE TEETH OF THE UPDATED ASSERTION: the pad NOT forced is a refusal.
+
+    SAFE-01/5's letterbox expectation was inverted by this fix — from "the pad must be
+    off" to "the pad must be forced on for the served pipeline". Proving the new
+    expectation goes GREEN on the right value proves nothing; this test proves it goes
+    RED on the wrong one, against a snapshot built from the REAL checkpoint with exactly
+    one field mutated.
+
+    The failure this catches is specific and silent: if the override in
+    ``docker/lerobot-policy/server.py`` stopped landing (a moved step registry name, a
+    dropped kwarg), the server would happily serve ``(256, 340, 3)`` — a geometry the
+    weights never saw — with every log line looking healthy.
+    """
+    bad = dataclasses.replace(real_snapshot(), served_letter_box_transform=False)
+    with pytest.raises(ValueError, match=r"^SAFE-01/5 ") as excinfo:
+        assert_groot_serving_contract(bad)
+    message = str(excinfo.value)
+    assert "False" in message
+    assert "SERVED" in message
+    # The message must name BOTH geometries, so an operator learns what the server was
+    # about to feed the VLM and what it should have fed it.
+    assert "(256, 340, 3)" in message
+    assert "(256, 256, 3)" in message
 
 
 def test_violation_5b_wrong_crop_fraction_or_shortest_edge_raises():
@@ -301,7 +368,12 @@ def test_snapshot_from_loaded_never_leaves_decode_step_type_empty():
         training = False
 
     class EncodeLike:
-        letter_box_transform = False
+        # True, not False: this stands in for the SERVED pipeline, whose pad the
+        # server forces on. A stand-in carrying the checkpoint's declared False
+        # would be a stand-in for a pipeline the server never builds, and it would
+        # make the healthy assertion below fail for the right reason at the wrong
+        # place (SAFE-01/5's served-value check, which test_violation_5a2 owns).
+        letter_box_transform = True
         training = False
 
     class GrootN17ActionDecodeStep:  # name is the assertion
@@ -345,6 +417,90 @@ def test_snapshot_from_loaded_never_leaves_decode_step_type_empty():
     assert unset_path.decode_step_type != ""
     with pytest.raises(ValueError, match=r"^SAFE-01/1 "):
         assert_groot_serving_contract(unset_path)
+
+
+def test_snapshot_from_loaded_reads_the_served_letterbox_off_the_encode_step():
+    """``served_letter_box_transform`` comes from the PIPELINE, not the checkpoint.
+
+    The distinction is the whole mechanism: the checkpoint declares ``false``, so if
+    this field were derived from ``processor_config.json`` it would read ``False`` on a
+    correctly-serving server and the guard would refuse every healthy handshake. It must
+    be read off the built step, and it must track that step rather than a constant.
+
+    Both directions are driven, against the SAME real config, so neither answer can be
+    a coincidence: a step with the pad forced ON passes, and a step with the pad OFF —
+    i.e. the override silently not landing — is REFUSED by SAFE-01/5.
+    """
+    from lerobot.policies.groot.configuration_groot import GrootConfig
+
+    class Pipeline:
+        def __init__(self, steps, name="stand-in"):
+            self.steps = steps
+            self.name = name
+
+    class PackLike:
+        state_dropout_prob = 0.2
+        training = False
+
+    class EncodeLike:
+        def __init__(self, letter_box_transform):
+            self.letter_box_transform = letter_box_transform
+            self.training = False
+
+    class GrootN17ActionDecodeStep:  # name is the assertion
+        env_action_dim = 6
+
+    config = GrootConfig(base_model_path=str(REAL_CHECKPOINT))
+    postprocessor = Pipeline([GrootN17ActionDecodeStep()])
+
+    forced = snapshot_from_loaded(
+        config,
+        Pipeline([PackLike(), EncodeLike(letter_box_transform=True)]),
+        postprocessor,
+        configured_actions_per_chunk=EXPECTED_HORIZON,
+    )
+    assert forced.served_letter_box_transform is True
+    # The checkpoint still declares the opposite — that is what makes the line above
+    # evidence that the pipeline, not the sidecar, was read.
+    assert forced.letter_box_transform is False
+    assert assert_groot_serving_contract(forced) is None
+
+    dropped = snapshot_from_loaded(
+        config,
+        Pipeline([PackLike(), EncodeLike(letter_box_transform=False)]),
+        postprocessor,
+        configured_actions_per_chunk=EXPECTED_HORIZON,
+    )
+    assert dropped.served_letter_box_transform is False
+    with pytest.raises(ValueError, match=r"^SAFE-01/5 "):
+        assert_groot_serving_contract(dropped)
+
+
+def test_serving_preprocessor_overrides_is_a_single_definition():
+    """The override fragment the server merges is one value, shaped for upstream's seam.
+
+    Asserted rather than assumed because it is the seam the whole fix rides on: the key
+    must be the step's REGISTRY name (upstream's ``from_pretrained`` matcher accepts only
+    registry names), and the field must be a real ``init`` field of the step, or the
+    override would raise at handshake time instead of applying.
+    """
+    from dataclasses import fields
+
+    from lerobot.policies.groot.processor_groot import GrootN17VLMEncodeStep
+
+    assert serving_preprocessor_overrides() == {
+        VLM_ENCODE_STEP_KEY: {"letter_box_transform": SERVING_LETTER_BOX_TRANSFORM}
+    }
+    assert getattr(GrootN17VLMEncodeStep, "_registry_name", None) == VLM_ENCODE_STEP_KEY, (
+        "the registry name moved, so the override key would match no step and "
+        "_apply_groot_step_overrides would raise KeyError at every handshake"
+    )
+    init_fields = {f.name for f in fields(GrootN17VLMEncodeStep) if f.init}
+    assert "letter_box_transform" in init_fields, (
+        "letter_box_transform is no longer an init field of GrootN17VLMEncodeStep, so "
+        "the override would raise TypeError; re-derive the injection against the new shape "
+        "rather than reaching for a monkeypatch"
+    )
 
 
 # --- Documented negatives: mechanisms proven non-discriminating ---------------
@@ -441,10 +597,10 @@ def test_every_message_names_its_assertion_id_and_the_observed_value():
 
     A message that omits the observed value forces an operator into the source to learn
     what actually went wrong, which is exactly what the ``policy/factory.py:57-62`` idiom
-    exists to prevent. Driving all twelve mutations from one table also means an emptied or
+    exists to prevent. Driving all thirteen mutations from one table also means an emptied or
     reworded message goes red here even if its own violation test only matched the prefix.
     """
-    assert len(VIOLATION_MUTATIONS) == 12
+    assert len(VIOLATION_MUTATIONS) == 13
 
     for field_name, value in VIOLATION_MUTATIONS:
         bad = dataclasses.replace(real_snapshot(), **{field_name: value})

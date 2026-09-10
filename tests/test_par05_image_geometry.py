@@ -26,15 +26,39 @@ that is proven here by MEASUREMENT — a byte-identical output against
 ``crop_fraction is None`` (``processor_groot.py:1453-1454``), so it is dead
 configuration a future reader must not waste time tuning.
 
+**The cross-backend comparison PAR-05 actually asks for is now measured, and it
+is a MISMATCH.** Isaac-GR00T produces ``(256, 256, 3)`` on the same frame bytes
+under the same six recipe values, because it applies its letterbox pad
+unconditionally while LeRobot gates that pad on ``letter_box_transform: false``.
+The last section of this module pins that finding; the measurement itself lives in
+``scripts/dump_gr00t_native_preprocessed_image.py`` and
+``docs/LEROBOT-SERVING-VERDICTS.md`` §4.1.
+
+**Honest limit on what CI can re-run, stated rather than papered over.** The
+GR00T-native *measurement* needs the 42.8 GB ``gr00t`` image and cannot run here.
+What runs here instead is not a placeholder: LeRobot's own transform with the pad
+forced ON reproduces the GR00T-native output **byte-for-byte**, so the recorded
+cross-container digest is pinned by an executable local computation rather than by
+a comment. What no test in this repo asserts is Isaac's *unconditional* pad — that
+half is carried by the in-container probe (9/9 checks, image ID and revision
+verified by content hash) and by the source citation in its docstring. There is
+deliberately **no** test that imports ``gr00t``: it would skip everywhere, and a
+test that can never run is worse than this note.
+
 Every test is hermetic: it reads only the checkpoint's ``processor_config.json``
-and the pinned constants in ``scripts/dump_preprocessed_image.py``, and needs no
-GPU, no weights, no network, no Hugging Face token and no hardware. **Nothing
-here may skip** — an absent checkpoint ``processor_config.json`` calls
-``pytest.fail`` naming the path, because a geometry test that skips is a silent
-pass on the one fact Phase 7's parity numbers rest on.
+and the pinned constants in ``scripts/dump_preprocessed_image.py`` and
+``scripts/dump_gr00t_native_preprocessed_image.py``, and needs no GPU, no weights,
+no network, no Hugging Face token, no Docker image and no hardware. **Nothing here
+may skip** — an absent checkpoint ``processor_config.json`` calls ``pytest.fail``
+naming the path, because a geometry test that skips is a silent pass on the one
+fact Phase 7's parity numbers rest on.
 """
 
+import ast
+import hashlib
+import inspect
 import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +89,18 @@ from dump_preprocessed_image import (  # noqa: E402
     synthetic_frame,
     transform_after_placeholder_resize,
     transform_checkpoint_recipe,
+)
+from dump_gr00t_native_preprocessed_image import (  # noqa: E402
+    GEOMETRY_MATCHES_LEROBOT,
+    GR00T_IMAGE_ID,
+    GR00T_NATIVE_EXPECTED_CHW_SHAPE,
+    GR00T_NATIVE_EXPECTED_SHAPE,
+    GR00T_NATIVE_EVAL_OUTPUT_SHA256,
+    GR00T_PACKAGE_DIGEST,
+    GR00T_PACKAGE_PY_COUNT,
+    GR00T_PIN,
+    LEROBOT_EVAL_OUTPUT_SHA256,
+    SHARED_INPUT_FRAME_SHA256,
 )
 
 # The four shape assertions below spell their expected tuples as LOCAL LITERALS
@@ -237,3 +273,160 @@ def test_recipe_constants_match_the_checkpoint_processor_config():
     # The frame size the verdict was measured AT is part of the contract: the
     # (256, 340, 3) result does not generalize to another aspect ratio.
     assert (SOURCE_HEIGHT, SOURCE_WIDTH) == (480, 640)
+
+
+# --- The cross-backend comparison: a recorded MISMATCH ------------------------
+#
+# PAR-05 asks for a comparison "between backends", and this is that comparison's
+# LeRobot-side anchor. The GR00T-native number was measured in `gr00t:latest`
+# (image ID pinned below, Isaac-GR00T revision proven by a 64-file content
+# digest) by `scripts/dump_gr00t_native_preprocessed_image.py`, 9/9 checks, and
+# it does NOT match. These tests exist so the mismatch cannot decay in either
+# direction: not into a forgotten note, and not into a stale alarm after a fix.
+
+
+def _sha256(array: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
+
+
+def test_gr00t_native_geometry_is_256x256x3_and_diverges_from_lerobot():
+    """THE MISMATCH: Isaac-GR00T gives (256, 256, 3) where LeRobot gives (256, 340, 3).
+
+    Local literals again, for the same reason the four cases above use them: the
+    literal IS the recorded finding, and asserting only against the imported
+    constant would pass for whatever that constant drifted to.
+
+    This is a *measured* divergence on identical input bytes under identical
+    recipe values — not a difference of configuration, and not a rounding
+    artifact. It means criterion 5's "identical shape" clause is **NOT**
+    satisfied, and Phase 7's numerical parity comparison is not meaningful until
+    it is resolved: the two backends see different pixels.
+    """
+    assert GR00T_NATIVE_EXPECTED_SHAPE == (256, 256, 3)
+    assert EXPECTED_SHAPE == (256, 340, 3)
+    assert GR00T_NATIVE_EXPECTED_SHAPE != EXPECTED_SHAPE
+    # The divergence is the recorded state, asserted as such rather than implied
+    # by the two constants merely differing.
+    assert GEOMETRY_MATCHES_LEROBOT is False
+    # The serving call site's CHW layout carries the same H/W, so the layout
+    # difference cannot be mistaken for the geometry difference.
+    assert GR00T_NATIVE_EXPECTED_CHW_SHAPE == (3, 256, 256)
+    assert GR00T_NATIVE_EXPECTED_CHW_SHAPE[1:] == GR00T_NATIVE_EXPECTED_SHAPE[:2]
+
+
+def test_lerobot_reproduces_the_gr00t_native_shape_only_with_the_pad_forced_on():
+    """EXECUTED locally: LeRobot matches Isaac only when the letterbox pad is forced.
+
+    The load-bearing half of the diagnosis, and the reason this file can pin a
+    cross-container measurement without the 42.8 GB image: forcing
+    ``letter_box_transform=True`` on the LeRobot side reproduces the
+    GR00T-native shape, while the checkpoint's own configuration (pad off) does
+    not. That is what identifies the pad gating — not interpolation, not the crop
+    fraction, not ``image_crop_size`` — as the whole of the divergence.
+    """
+    frame = synthetic_frame(0)
+    pad_forced = transform_checkpoint_recipe(frame, letter_box_transform=True)
+    as_configured = transform_checkpoint_recipe(frame)
+    assert tuple(pad_forced.shape) == GR00T_NATIVE_EXPECTED_SHAPE
+    assert tuple(as_configured.shape) != GR00T_NATIVE_EXPECTED_SHAPE
+    assert tuple(as_configured.shape) == (256, 340, 3)
+
+
+def test_lerobot_with_the_pad_forced_on_reproduces_the_gr00t_native_bytes():
+    """The digests, exactly: Isaac's output and LeRobot's pad-forced output are equal.
+
+    Byte-level, no tolerance. Measured across Python 3.10 vs 3.12, numpy 1.26.4
+    vs 2.2.6 and OpenCV 4.11.0 vs 4.13.0, so every stage EXCEPT the pad gating
+    agrees bit-for-bit between the two backends.
+
+    **This does not upgrade the cross-container fidelity contract.**
+    ``docs/LEROBOT-SERVING-VERDICTS.md`` §1 keeps that leg at *shape only*,
+    because a future OpenCV build may legitimately move a pixel. What is asserted
+    here is the WITHIN-LeRobot exact-equality contract that section already
+    states — the expected digest simply happens to be the value measured in the
+    other container, which is what makes the recorded cross-container number
+    verifiable here rather than merely quoted. If a host OpenCV upgrade turns
+    this red, the response is to RE-MEASURE both backends and re-record, never to
+    replace this with a tolerance.
+    """
+    frame = synthetic_frame(0)
+    # The precondition of the whole comparison: both containers hashed the same
+    # input bytes. Asserted here too, so a numpy RandomState stream change could
+    # not silently invalidate the cross-container claim.
+    assert _sha256(frame) == SHARED_INPUT_FRAME_SHA256
+    assert _sha256(transform_checkpoint_recipe(frame, letter_box_transform=True)) == (
+        GR00T_NATIVE_EVAL_OUTPUT_SHA256
+    )
+    # And the serving path's own output is a genuinely different artifact, not a
+    # second name for the same dump.
+    assert _sha256(transform_checkpoint_recipe(frame)) == LEROBOT_EVAL_OUTPUT_SHA256
+    assert LEROBOT_EVAL_OUTPUT_SHA256 != GR00T_NATIVE_EVAL_OUTPUT_SHA256
+
+
+def test_lerobot_gates_the_letterbox_pad_on_the_flag_this_checkpoint_sets_false():
+    """The MECHANISM of the divergence on the LeRobot side, proven at AST level.
+
+    Isaac-GR00T puts ``LetterBoxPad()`` unconditionally at the head of both its
+    albumentations pipelines and documents ``letter_box_transform`` as a
+    "backward-compat param (stored but not actively used)". LeRobot instead wraps
+    its ``cv2.copyMakeBorder`` in ``if letter_box_transform:`` — so with the flag
+    false, LeRobot skips a stage Isaac always runs.
+
+    Asserted structurally rather than by grep: **every** ``copyMakeBorder`` call
+    in the function must sit inside that conditional. A future refactor that
+    hoisted the pad out of the branch would change this checkpoint's geometry
+    silently, and it would go red here.
+    """
+    from lerobot.policies.groot.processor_groot import (
+        _transform_n1_7_image_for_vlm_albumentations,
+    )
+
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(_transform_n1_7_image_for_vlm_albumentations))
+    )
+
+    def pad_calls(node) -> int:
+        return sum(
+            1
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "copyMakeBorder"
+        )
+
+    gated = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "letter_box_transform"
+    ]
+    assert len(gated) == 1, "expected exactly one `if letter_box_transform:` branch"
+    assert pad_calls(tree) >= 1, "no copyMakeBorder call found — the pad moved or was removed"
+    # Every pad call in the function is inside the flag's branch.
+    assert pad_calls(gated[0]) == pad_calls(tree)
+    # And the checkpoint really does set that flag false, so the branch is skipped.
+    assert _on_disk_recipe()["letter_box_transform"] is False
+
+
+def test_the_gr00t_native_measurement_records_which_image_it_came_from():
+    """Provenance is part of the verdict, not a footnote.
+
+    ``gr00t:latest`` carries no ``.git``, no ``gr00t.__version__``, no OCI
+    revision label and no recorded build arg, so the Isaac-GR00T revision cannot
+    be read off the image. It was established by CONTENT instead: all
+    ``GR00T_PACKAGE_PY_COUNT`` ``.py`` files of the installed ``gr00t`` package
+    digest to ``GR00T_PACKAGE_DIGEST``, identical to the clone at ``GR00T_PIN``
+    (the commit ``scripts/build_gr00t_image.sh`` enforces). These constants are
+    pinned so the recorded measurement can never be re-attributed to a different
+    image by editing prose.
+    """
+    assert GR00T_PIN == "23ace64f17aa5015259b8609d371eb61a357c776"
+    assert GR00T_IMAGE_ID.startswith("sha256:")
+    assert len(GR00T_IMAGE_ID.removeprefix("sha256:")) == 64
+    assert len(GR00T_PACKAGE_DIGEST) == 64
+    assert GR00T_PACKAGE_PY_COUNT == 64
+    # The build wrapper's pin and the verdict's pin are ONE value, not two that
+    # can drift: read it back off the wrapper rather than trusting the copy.
+    wrapper = (REPO_ROOT / "scripts" / "build_gr00t_image.sh").read_text(encoding="utf-8")
+    assert f'PIN="{GR00T_PIN}"' in wrapper

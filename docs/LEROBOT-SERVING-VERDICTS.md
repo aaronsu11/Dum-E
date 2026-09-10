@@ -1,8 +1,11 @@
 # LeRobot Serving Verdicts
 
-**Status:** PAR-05 **resolved** by executed evidence (§1). LRG-06 **enforced** by a committed test
-(§2). The ROADMAP's Phase 6 criteria carry six recorded corrections (§3) and three named open gaps
-(§4). Standing engineering resolution — not a changelog entry.
+**Status:** PAR-05's **LeRobot side** is resolved by executed evidence (§1); its **cross-backend
+comparison has since been run and MISMATCHED** — LeRobot `(256, 340, 3)` vs Isaac-GR00T
+`(256, 256, 3)` (last section), so PAR-05 is **flagged for review** and criterion 5's "identical
+shape" clause is **not satisfied**. LRG-06 **enforced** by a committed test (§2). The ROADMAP's Phase 6
+criteria carry six recorded corrections (§3) and three named open gaps (§4), of which gap 1 (A8) is now
+closed as a measurement. Standing engineering resolution — not a changelog entry.
 
 This document records what Phase 6 settled about serving the fine-tuned
 `checkpoints/GR00T-N1.7-3B-SO101` checkpoint through LeRobot: the checkpoint's real preprocessed
@@ -12,8 +15,10 @@ and the gaps that stayed open. It is the resolution referenced by requirements *
 **LRG-06**.
 
 Figures are cited by the harness that computes them so the document and the code cannot drift apart
-silently. The harness for §1 is `scripts/dump_preprocessed_image.py`; the always-running gates are
-`tests/test_par05_image_geometry.py` (§1) and `tests/test_loopback_publish_spec.py` (§2).
+silently. The harness for §1 is `scripts/dump_preprocessed_image.py` and for the cross-backend
+comparison `scripts/dump_gr00t_native_preprocessed_image.py`; the always-running gates are
+`tests/test_par05_image_geometry.py` (§1 and the comparison's LeRobot-side anchor) and
+`tests/test_loopback_publish_spec.py` (§2).
 
 ---
 
@@ -205,22 +210,30 @@ in-container half is plan 06-03's and is appended below when measured.
 
 Named explicitly so none of them disappears into a summary.
 
-### 1. The cross-container PAR-05 dump was never attempted (assumption A8)
+### 1. ~~The cross-container PAR-05 dump was never attempted~~ — RUN, and it MISMATCHED (assumption A8)
 
-Dumping the **pinned Isaac-GR00T `23ace64f` image's** own transform output on the same synthetic
-frame and comparing shapes was never run. It is carried as an explicit `backstop`, not quietly
-omitted.
+**This gap is closed as a measurement, and the measurement is a mismatch.** The GR00T-native dump was
+run in the pinned Isaac-GR00T image on the same `RandomState(0)` 480x640x3 frame under the same six
+recipe values, and the two backends do **not** produce the same geometry:
 
-**What this means, stated precisely:** the LeRobot side is nonetheless **fully settled at
-`(256, 340, 3)` by executed evidence**. What does not exist is the *comparison*. This section is a
-**one-sided record, not a two-sided comparison**, and the LeRobot-side dump must not be presented as
-one (T-06-29). If the pinned image is later available, the procedure is: run the same
-`RandomState(0)` 480x640 frame through its own transform, dump `.npy`, and compare shapes against
-`outputs/par05/manifest.json`'s `checkpoint_recipe` entry.
+| Backend | Measured output | Fidelity |
+|---|---|---|
+| LeRobot `processor_groot` (§1) | **`(256, 340, 3)`** uint8 | executed, exact |
+| Isaac-GR00T `image_augmentations` (below) | **`(256, 256, 3)`** uint8 | executed, exact |
 
-The comparison also cannot be run against a live `gr00t-server`: that container is `Exited` by
-standing decision for the remainder of Phase 6, so any GR00T-native-side comparison must go through
-the mock or dumped tensors.
+Criterion 5's *"identical shape"* clause is therefore **NOT satisfied**. Full evidence, provenance and
+root cause: **the "PAR-05 cross-backend comparison" section at the end of this document**. Requirement **PAR-05 is flagged for review** — its comparison has now been
+*performed*, which is what it asked for, but the comparison **failed**, so its `Complete` status rests
+on the LeRobot half only.
+
+**What is no longer true about this section:** it was a one-sided record (T-06-29) and is now
+two-sided. What replaces the old open item is a *harder* one — a live geometry divergence that
+Phase 7's numerical parity gate must not be run against. The historical framing above is struck
+through rather than deleted, so the sequence (never attempted → attempted → mismatched) stays legible.
+
+No live `gr00t-server` was used or started: that container remains `Exited` by standing decision, and
+the dump ran in a throwaway `docker run --rm --network none` container instead, with no GPU, no
+weights, no published port and no token.
 
 ### 2. Backbone-revision provenance is unestablished by design (assumption A6)
 
@@ -260,8 +273,13 @@ committed verdict has a live guard behind it rather than resting on a stale `.np
 
 ## References
 
-- `scripts/dump_preprocessed_image.py` — the PAR-05 harness (keyless, GPU-free, weight-free)
-- `tests/test_par05_image_geometry.py` — the always-running geometry gate (7 tests, never skips)
+- `scripts/dump_preprocessed_image.py` — the PAR-05 LeRobot-side harness (keyless, GPU-free,
+  weight-free)
+- `scripts/dump_gr00t_native_preprocessed_image.py` — the GR00T-native-side harness; runs inside
+  `gr00t:latest` with no GPU, no weights, no network and no token, and verifies the image's revision by
+  content digest before measuring anything
+- `tests/test_par05_image_geometry.py` — the always-running geometry gate (12 tests, never skips)
+- `scripts/build_gr00t_image.sh` — the `PIN=` the cross-backend measurement is recorded against
 - `tests/test_loopback_publish_spec.py` — the LRG-06 publish-spec guard (6 tests, never skips)
 - `README.md` — the documented `lerobot-policy` run command, under the LRG-06 anchor
 - `docker/lerobot-policy/entrypoint.py` — the five-check refuse-to-start preflight and the
@@ -507,3 +525,148 @@ The cross-container PAR-05 dump from the pinned Isaac-GR00T `23ace64f` image (as
 absorb it and does not mark it resolved: `gr00t-server` is `Exited` by standing decision for the
 remainder of Phase 6, so any GR00T-native-side comparison must go through the mock or dumped tensors.
 It stays open in `.planning/WINDOWS.md` (entry 17).
+
+---
+
+## PAR-05 cross-backend comparison — **MISMATCH** (measured in-container)
+
+> **The two backends do NOT preprocess to the same geometry.** On byte-identical input and identical
+> recipe values, LeRobot produces **`(256, 340, 3)`** and Isaac-GR00T produces **`(256, 256, 3)`**.
+> Criterion 5's *"identical shape"* clause is **not satisfied**, and PAR-05's `Complete` status rests
+> on the LeRobot half only.
+
+Closes assumption **A8** as a measurement. The preceding 06-03 note remains accurate *as of plan
+06-03* and is superseded here; §4.1 above is updated to match. Harness:
+`scripts/dump_gr00t_native_preprocessed_image.py` (**9/9 checks PASS, exit 0**), keyless gate:
+the last five tests in `tests/test_par05_image_geometry.py`.
+
+### The comparison
+
+| Backend | Harness | Effective pipeline | Measured output |
+|---|---|---|---|
+| LeRobot `lerobot==0.6.1` | `_transform_n1_7_image_for_vlm_albumentations` | resize-shortest-256 → center-crop-95% → resize-shortest-256 | **`(256, 340, 3)`** uint8 |
+| Isaac-GR00T `23ace64f` | `build_image_transformations_albumentations` (eval) | **letterbox-pad-to-square** → resize-shortest-256 → center-crop-95% → resize-shortest-256 | **`(256, 256, 3)`** uint8 |
+
+Both measured on the SAME frame: seed **0**, `numpy.random.RandomState(0)`, `480x640x3` uint8,
+sha256 `70eecaa5a18341fcf3e9d22091d94d92e9d4c5aef7e839ae94ff3d11fd6612ee`. **That the bytes are
+identical is itself a check, not an assumption** (check 3): the two interpreters run numpy 2.2.6 on
+Python 3.12 and numpy 1.26.4 on Python 3.10, and the probe fails without the expected digest — a
+comparison of two independently generated frames would not be a comparison at all.
+
+The six recipe values are read from the same
+`checkpoints/GR00T-N1.7-3B-SO101/processor_config.json` on both sides (check 2, bind-mounted into the
+container), so neither side can be running a different recipe.
+
+### Root cause: one pipeline stage, gated on one side and unconditional on the other
+
+- **LeRobot gates the pad on the flag.** `if letter_box_transform:` wraps the `cv2.copyMakeBorder`
+  call (`processor_groot.py:1423-1433`). This checkpoint sets `letter_box_transform: false`, so no pad
+  runs and the 4:3 aspect ratio survives to the output.
+- **Isaac-GR00T pads unconditionally.** `LetterBoxPad()` is element 1 of **both** the train and eval
+  albumentations pipelines (`gr00t/model/gr00t_n1d7/image_augmentations.py:420-487`), and
+  `Gr00tN1d7Processor` lists `letter_box_transform` under
+  `# Backward-compat params (stored but not actively used)`
+  (`processing_gr00t_n1d7.py:171-172, 198`) — it is stored on the instance and never read. The frame
+  is padded 480x640 → 640x640 first, so the output is square.
+
+**The cause is isolated to exactly that stage, by measurement — this is not an inference.** Isaac's
+eval output and LeRobot's output *with the pad forced on* are **byte-identical**:
+sha256 `c30150ec8d9d7ccb648aade0588aed2d18a356ab7f984a510dc57bb6c485927f` from both, across
+Python 3.10/3.12, numpy 1.26.4/2.2.6 and OpenCV 4.11.0/4.13.0. Every other stage — both `INTER_AREA`
+resizes and the floored 95% center crop — therefore agrees bit-for-bit between the backends. The
+LeRobot serving path's own output is a different artifact, sha256
+`e8e4939bac10afa7cced1edb739656e14deb1acbbd509b80dfcfd7810fd2ce5a`.
+
+**This does not upgrade the fidelity decision in §1.** The cross-container leg stays **shape only**: a
+future OpenCV build may legitimately move a pixel, and the bit-exactness above is recorded as an
+observation, not promoted to a contract.
+
+### Alternatives closed off, so the mismatch cannot be explained away
+
+| Alternative explanation | Ruled out by | Result |
+|---|---|---|
+| "The eval/train branch was picked wrongly" | check 6 — the **train** pipeline was measured too | `(256, 256, 3)`: the random-vs-center crop changes WHERE, not HOW BIG |
+| "The layouts differ, not the geometry" | check 5 — the real serving call site `apply_with_replay` | `(3, 256, 256)` `torch.uint8`: CHW layout, **same H/W** |
+| "The GR00T side is nondeterministic" | check 7 — two eval invocations | byte-identical (`numpy.array_equal`) |
+| "The recipes differ" | check 2 — six values re-read from the checkpoint | `letter_box_transform=False, crop_fraction=0.95, image_crop_size=[230, 230], image_target_size=[256, 256], shortest_image_edge=256, use_albumentations=True` |
+| "The frames differ" | check 3 — input sha256 | identical across both interpreters |
+
+### Provenance: which image, and is it the pin?
+
+**The `23ace64f` pin is PROVEN, but by content — not by anything the image says about itself.**
+`gr00t:latest` carries **no `.git`, no `gr00t.__version__`, no OCI revision label and no recorded
+build arg** (all four recorded as data in the manifest's `version_markers`), so its revision cannot be
+read off the image. What was done instead:
+
+| Evidence | Value |
+|---|---|
+| Image used | `gr00t:latest`, ID `sha256:e263056fffe7a60a7f48b6309a8b8f2fb3ea9f8f2afa9c94a0105ed5b7d2eeaf`, created 2026-06-15 |
+| `gr00t` package digest, in-image and in clone | **`b18c8578c077cddf02705b80da815e5d838752cab9f391c19e4edca7a6e74a40`** over **64** `.py` files — identical |
+| Clone state | `/home/aaron/Projects/Isaac-GR00T` at HEAD `23ace64f17aa5015259b8609d371eb61a357c776`, `git diff --quiet 23ace64f -- gr00t` clean |
+| `pyproject.toml` / `uv.lock` | byte-identical between image and clone (`9d67b119…` / `ad705311…`) |
+| Pin source | `scripts/build_gr00t_image.sh`'s `PIN=`, asserted against the recorded constant by `test_the_gr00t_native_measurement_records_which_image_it_came_from` |
+
+**Stated precisely, so Phase 7 does not over-read it:** the preprocessing source that produced this
+measurement is byte-identical to revision `23ace64f`, and so is the dependency lock. What is *not*
+established is that the image was **built** by the pin-enforcing wrapper — no build arg or label
+records that — and the 64-file content match is what stands in for it. That is a stronger claim than
+"unverified" and a weaker one than a signed provenance record; it is recorded as neither.
+
+### How it was run (no GPU, no weights, no token, no server)
+
+`gr00t-server` was **not started** — it remains `Exited` by standing decision. The dump ran in a
+throwaway container, and the transform builder was called directly rather than through
+`Gr00tN1d7Processor`, whose `__init__` calls `build_processor` and would pull the Cosmos backbone:
+
+```bash
+uv run python scripts/dump_gr00t_native_preprocessed_image.py --emit-expectations \
+    --package-dir ../Isaac-GR00T/gr00t          # -> the two expectation digests
+
+docker run --rm --network none \
+  -v "$PWD/scripts:/probe/scripts:ro" \
+  -v "$PWD/checkpoints/GR00T-N1.7-3B-SO101/processor_config.json:/probe/processor_config.json:ro" \
+  --entrypoint python gr00t:latest /probe/scripts/dump_gr00t_native_preprocessed_image.py \
+    --recipe-json /probe/processor_config.json \
+    --expect-frame-sha256 70eecaa5a18341fcf3e9d22091d94d92e9d4c5aef7e839ae94ff3d11fd6612ee \
+    --expect-package-digest b18c8578c077cddf02705b80da815e5d838752cab9f391c19e4edca7a6e74a40
+```
+
+`--network none` (the albumentations version-check warning it produces is expected), no `--gpus`, no
+published port, no `HF_TOKEN`, `--rm`. `outputs/` was not written to: `--outdir` defaults to writing
+nothing, because under `docker run` it would leave root-owned files in the host tree.
+
+### What runs in CI, and what honestly cannot
+
+The GR00T-native **measurement** needs the 42.8 GB image and cannot run in CI. Rather than add a test
+that silently skips, the keyless gate pins the *LeRobot-side anchor* of the comparison — which is
+executable anywhere the suite runs:
+
+| Test | What it pins |
+|---|---|
+| `test_gr00t_native_geometry_is_256x256x3_and_diverges_from_lerobot` | The recorded mismatch, in both directions: `GEOMETRY_MATCHES_LEROBOT is False` |
+| `test_lerobot_reproduces_the_gr00t_native_shape_only_with_the_pad_forced_on` | **Executed**: pad forced on → `(256, 256, 3)`; as configured → `(256, 340, 3)` |
+| `test_lerobot_with_the_pad_forced_on_reproduces_the_gr00t_native_bytes` | **Executed, byte-exact**: the cross-container digest is reproduced locally, plus the shared input digest |
+| `test_lerobot_gates_the_letterbox_pad_on_the_flag_this_checkpoint_sets_false` | **AST level**: every `copyMakeBorder` call sits inside the `if letter_box_transform:` branch |
+| `test_the_gr00t_native_measurement_records_which_image_it_came_from` | Image ID, package digest, file count, and the pin read back off the build wrapper |
+
+**What no test in this repo asserts:** Isaac's *unconditional* pad. Importing `gr00t` would skip
+everywhere, so that half is carried by the in-container probe and the source citation above. Recorded
+as a limitation rather than covered by a test that can never run.
+
+### Consequences (not resolved here — flagged)
+
+1. **Phase 7's numerical parity gate must not be run against this divergence.** Comparing action
+   chunks between backends that see different pixels measures the preprocessing gap, not parity. This
+   is precisely why PAR-05 sits in Phase 6 rather than Phase 7.
+2. **PAR-05 needs review.** Its text demands verification *"by comparing dumped tensor shapes between
+   backends"*. The comparison has now been performed and **failed**; deciding what `Complete` should
+   mean is a requirements decision, deliberately not made by this gap closure.
+3. **Which side is "right" is NOT settled here, and the LeRobot side is not authoritative by
+   default.** The checkpoint's own `processor_config.json` sets `letter_box_transform: false`, which
+   LeRobot honours and Isaac ignores — but the checkpoint was *trained* by Isaac's code, so the
+   geometry it saw in training is Isaac's padded `(256, 256, 3)`. That points at LeRobot's
+   flag-honouring path being the deviation from training-time behaviour, which would be the more
+   consequential of the two readings. Establishing it needs the training recipe, not this probe.
+4. **A related axis, checked only by grep and labelled as such:** the GR00T-native serving path
+   (`gr00t/policy/gr00t_policy.py`, `server_client.py`, `eval/run_gr00t_server.py`) shows no camera
+   pre-resize, unlike LeRobot's C-3 placeholder-feature resize in §1. Not executed, not a verdict.

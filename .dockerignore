@@ -19,3 +19,12 @@
 *
 
 !docker/lerobot-policy/
+
+# Admitted by plan 06-03, which added `COPY policy_guard/ /app/policy_guard/` to
+# docker/lerobot-policy/Dockerfile so the SAFE-01 guard has ONE implementation
+# across the process boundary instead of a second copy inside the image. This
+# entry is the explicit decision the header above demands: it admits ~20 KB of
+# first-party Python (two files, one of them 0 bytes) and no secret — `.env`
+# stays denied by the `*` above, and `policy_guard/` holds no credential, no
+# checkpoint and no build artifact.
+!policy_guard/

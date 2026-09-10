@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Container entrypoint: five-check refuse-to-start preflight, then serve the Dum-E subclass.
+"""Container entrypoint: six-check refuse-to-start preflight, then serve the Dum-E subclass.
 
 Deliberately LOUD, and it **never skips quietly**. A preflight that shrugs at a
 missing mount is a silent pass, which is the exact failure this instrument exists
@@ -10,12 +10,14 @@ SO101 fine-tune while every log line said the run was fine, and the arm would
 move confidently to the wrong place.
 
 So an absent or wrong checkpoint mount, a non-raw checkpoint, an action horizon
-that is not the checkpoint's real 16, a missing or mismatched pinned backbone
-snapshot (an EMPTY ``--backbone-revision`` included), and a processor build that
-cannot reach its ``HF_HUB_OFFLINE=1`` cache ALL print a red ``FAIL:`` naming the
-observed value and refuse to serve. "Refuse to serve" is literal, not a log
-line: ``main`` returns BEFORE the gRPC server is constructed and before
-``add_insecure_port``, so a failed check can never reach a listening socket.
+that is not the checkpoint's real 16, a violation of ANY of SAFE-01's five
+serving-contract conditions that a config-only snapshot can see, a missing or
+mismatched pinned backbone snapshot (an EMPTY ``--backbone-revision`` included),
+and a processor build that cannot reach its ``HF_HUB_OFFLINE=1`` cache ALL print
+a red ``FAIL:`` naming the observed value and refuse to serve. "Refuse to serve"
+is literal, not a log line: ``main`` returns BEFORE the gRPC server is
+constructed and before ``add_insecure_port``, so a failed check can never reach a
+listening socket.
 
 ``--preflight-only`` runs exactly those checks and returns their verdict without
 constructing the server, so an operator can exercise the refusal path without
@@ -23,8 +25,12 @@ starting anything. It calls the SAME ``run_preflight`` body the serving path
 calls — there is deliberately no second copy of the checks, because a parallel
 copy would make the flag prove nothing about the real startup.
 
-None of the five checks loads policy weights: every one is config-only or
+None of the six checks loads policy weights: every one is config-only or
 processor-only, so the preflight costs no 12.6 GB weight load and no GPU memory.
+That is what makes SAFE-01's "refuses to **start** with a named, specific error"
+literally true rather than "refuses on the first request": the guard's
+config-visible conditions are settled before a single one of the 12.6 GB of
+shards is read.
 
 ==================== WHY NOT upstream's serve() ====================
 ``lerobot.async_inference.policy_server.serve`` is ``@draccus.wrap()``-decorated
@@ -55,16 +61,22 @@ from lerobot.policies.groot.configuration_groot import (
 from lerobot.policies.groot.processor_groot import GrootN17VLMEncodeStep
 from lerobot.transport import services_pb2_grpc
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# EXPECTED_HORIZON / EXPECTED_TAG are imported rather than restated: server.py is
-# the one place in the image that owns those two numbers, and check 3 below must
-# assert the value the SERVER will actually load with.
-from server import (  # noqa: E402
+# EXPECTED_HORIZON / EXPECTED_TAG are IMPORTED, never restated as literals. They
+# come from ``policy_guard.groot_guard`` — the same module check 6 below calls, the
+# same module ``server.py`` imports them from, and the same module
+# ``tests/test_lerobot_upstream_surface.py`` pins them against. One definition, so
+# the guard, this preflight, the server and the test cannot drift to four
+# different numbers. ``policy_guard`` resolves because the Dockerfile copies it to
+# ``/app/policy_guard/`` and sets ``ENV PYTHONPATH=/app``.
+from policy_guard.groot_guard import (
     EXPECTED_HORIZON,
     EXPECTED_TAG,
-    DumEGrootPolicyServer,
-    fixup_policy_features,
+    assert_groot_serving_contract,
+    snapshot_from_checkpoint_dir,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from server import DumEGrootPolicyServer, fixup_policy_features  # noqa: E402
 
 #: Where the fine-tuned checkpoint is bind-mounted read-only at run time. It is
 #: NOT baked into the image (D-07), so the mount path is part of the run
@@ -86,9 +98,9 @@ BACKBONE_MODEL = "nvidia/Cosmos-Reason2-2B"
 BACKBONE_CACHE_DIRNAME = "models--nvidia--Cosmos-Reason2-2B"
 
 #: How many numbered checks the preflight prints. It is stated once here so the
-#: ``[n/TOTAL]`` prefixes and the harness agree; plan 06-03 raises it to 6 when
-#: it fills the SAFE-01 call site marked below.
-TOTAL_CHECKS = 5
+#: ``[n/TOTAL]`` prefixes and the harness agree. Raised 5 -> 6 by plan 06-03 when
+#: it filled the SAFE-01 call site below.
+TOTAL_CHECKS = 6
 
 
 def _green(s: str) -> str:
@@ -151,7 +163,7 @@ def _cached_backbone_revisions() -> tuple[Path, list[str]]:
 
 
 def run_preflight(checkpoint_path: str, backbone_revision: str) -> int:
-    """Five loud checks. Returns 0 to proceed, non-zero to refuse to start.
+    """Six loud checks. Returns 0 to proceed, non-zero to refuse to start.
 
     Short-circuits on the first FAIL: the later checks read the artifacts the
     earlier ones prove exist, so continuing past a failure would replace a
@@ -232,13 +244,64 @@ def run_preflight(checkpoint_path: str, backbone_revision: str) -> int:
         f"{observed_horizon}",
     )
 
-    # --- SAFE-01 guard call site (plan 06-03) ---
-    # Plan 06-03 adds the config-only GrootGuardSnapshot build plus the
-    # assert_groot_serving_contract call here, and the harness then renumbers to
-    # [n/6] (raise TOTAL_CHECKS). Deliberately NOT stubbed with a fake guard
-    # function: a placeholder comment is the whole contract.
+    # ==================== SAFE-01: THE CONFIG-ONLY CALL SITE ====================
+    # Plan 06-01 left a placeholder comment here; plan 06-03 filled it. This is
+    # D-04 option 3's PREFLIGHT site, and it is the reason SAFE-01's "refuses to
+    # START with a named, specific error" is literally true: it runs before the
+    # gRPC server exists and before any shard is read, so a wrong mount or a
+    # checkpoint whose own recipe contradicts the serving contract never gets as
+    # far as `add_insecure_port`.
+    #
+    # WHY THE TWO SITES PASS DIFFERENT VALUES FOR THE SAME ARGUMENT. There is no
+    # client here — no handshake has happened, `PolicyServerConfig` carries only
+    # host/port/fps/inference_latency/obs_queue_timeout and no checkpoint or
+    # horizon at all — so `configured_actions_per_chunk` is EXPECTED_HORIZON, i.e.
+    # this site validates the CHECKPOINT against the horizon we expect. The
+    # post-load site in `server.py` passes `self.actions_per_chunk`, the value the
+    # CLIENT actually sent, which is what catches D-11 config drift. Passing
+    # EXPECTED_HORIZON here is not a weaker version of that check; it is a
+    # different question (is the checkpoint what we think it is) asked earlier.
+    #
+    # AND WHY THIS SITE IS DELIBERATELY WEAKER, so nobody reads it as redundant:
+    # `snapshot_from_checkpoint_dir` cannot validate `decode_step_type` or either
+    # `training` flag — no processor object exists on a config-only path, so
+    # 06-02's builder sets those three to their PASSING values by construction and
+    # says so in a comment. Only the post-load site can see them. The two sites
+    # are unequal in strength on purpose; neither makes the other unnecessary.
+    #
+    # Position, recorded because the plan's own text pulls two ways: this check is
+    # the SIXTH check (TOTAL_CHECKS 5 -> 6) but it runs FOURTH, immediately after
+    # check 3. The plan asks for both "numbered check 6" and "keeping the
+    # forced-processor-build check last so a cache miss is still the final gate",
+    # and those cannot both be literal. Ordering follows the stated REASON: this
+    # check is config-only and belongs with the cheap checkpoint checks it
+    # short-circuits alongside, and 06-06's processor build stays the final gate
+    # rather than being reordered.
+    checks.start(f"SAFE-01 serving contract for {checkpoint_path!r} (config-only)")
+    try:
+        snapshot = snapshot_from_checkpoint_dir(checkpoint_path, EXPECTED_HORIZON)
+        assert_groot_serving_contract(snapshot)
+    except ValueError as exc:
+        checks.fail(
+            "safe01_serving_contract",
+            f"{exc} [SAFE-01 preflight, config-only, against {checkpoint_path!r}]",
+        )
+        return checks.report()
+    checks.ok(
+        "safe01_serving_contract",
+        f"SAFE-01/1..5 hold config-only: embodiment_tag="
+        f"{snapshot.embodiment_tag!r}, checkpoint_horizon={snapshot.checkpoint_horizon}, "
+        f"use_relative_action={snapshot.use_relative_action}, "
+        f"use_percentiles={snapshot.use_percentiles}, "
+        f"stats_non_empty={snapshot.stats_non_empty}, "
+        f"crop_fraction={snapshot.crop_fraction}, "
+        f"shortest_image_edge={snapshot.shortest_image_edge}, "
+        f"letter_box_transform={snapshot.letter_box_transform} "
+        f"(decode_step_type and the two training flags are NOT validated here — "
+        f"post-load site only)",
+    )
 
-    # ---- 4. the image carries the PINNED backbone snapshot ----
+    # ---- 5. the image carries the PINNED backbone snapshot ----
     checks.start(
         f"pinned {BACKBONE_MODEL} snapshot present in the image's HF hub cache "
         f"({backbone_revision or '<unset>'})"
@@ -281,7 +344,7 @@ def run_preflight(checkpoint_path: str, backbone_revision: str) -> int:
         f"{pinned_snapshot} exists and is non-empty (revisions on disk: {found_revisions})",
     )
 
-    # ---- 5. force the LAZY processor build, so an offline cache miss fails HERE ----
+    # ---- 6. force the LAZY processor build, so an offline cache miss fails HERE ----
     # Deliberately LAST: it is the final gate, run only after the cheap
     # config-level checks above have established that the mount is what it
     # claims. GrootN17VLMEncodeStep.proc is a lazily-built property

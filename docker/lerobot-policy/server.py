@@ -136,9 +136,11 @@ release. Treat it as an upstream inconsistency in 0.6.1, not as guidance.
 """
 
 import collections
+import os
 import pickle  # nosec B403 - the lerobot wire protocol is pickle in both directions
 import time
 
+import grpc
 import torch
 
 from lerobot.async_inference.constants import SUPPORTED_POLICIES
@@ -167,17 +169,59 @@ from lerobot.policies.groot.modeling_groot import GrootPolicy
 from lerobot.transport import services_pb2
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-#: The checkpoint's real action horizon, from ``new_embodiment``'s 16
-#: ``delta_indices``. NOT the ``GrootConfig`` default 40, and NOT the
-#: checkpoint's own ``config.json: action_horizon: 40`` — both are traps.
-EXPECTED_HORIZON: int = 16
+# ==================== SAFE-01: ONE implementation, TWO call sites ====================
+# ``policy_guard`` is Dum-E first-party source, COPIED into the image by
+# ``docker/lerobot-policy/Dockerfile`` (``COPY policy_guard/ /app/policy_guard/``,
+# with ``ENV PYTHONPATH=/app``) so this module and the Dum-E venv's keyless tests
+# import the SAME file. That single COPY is what makes "one implementation, two
+# call sites" true across the process boundary; a second copy of the assertions
+# inside the image would be exactly the "two code paths to keep in sync" cost
+# D-04 option 3 was warned about, and it would be able to drift.
+#
+# EXPECTED_HORIZON / EXPECTED_TAG are IMPORTED, not restated. They used to be
+# module-level literals here (plan 06-01) and ``entrypoint.py`` read them from
+# this module; now the guard, this server and the preflight all resolve to ONE
+# definition, so they cannot drift to three different numbers. The provenance of
+# each — why 40 is the well-lit wrong path, twice, and why the tag is a
+# load-bearing input rather than a label — is documented at the constants
+# themselves in ``policy_guard/groot_guard.py``.
+from policy_guard.groot_guard import (
+    EXPECTED_HORIZON,
+    EXPECTED_TAG,
+    assert_groot_serving_contract,
+    snapshot_from_loaded,
+)
 
-#: The only embodiment tag with 16 ``delta_indices``. The checkpoint carries
-#: nine tags; the other eight carry 40. Tag *inference* returns None for this
-#: checkpoint, so what saves the load is ``GrootConfig.embodiment_tag``
-#: defaulting to this value (``configuration_groot.py:288``). Passed EXPLICITLY
-#: below rather than relied on as a default, per D-11.
-EXPECTED_TAG: str = "new_embodiment"
+__all__ = [
+    "EXPECTED_HORIZON",
+    "EXPECTED_TAG",
+    "SEED_ENV_VAR",
+    "SERVING_DTYPE",
+    "DumEGrootPolicy",
+    "DumEGrootPolicyServer",
+    "fixup_policy_features",
+    "parameter_dtype_histogram",
+]
+
+#: Optional, DIAGNOSTIC-ONLY env var: when it holds an integer, this server seeds
+#: the ambient torch RNG in-process immediately before each inference call. When
+#: it is unset or empty NOTHING is seeded and the RNG is not touched at all, so
+#: the production path is byte-identical to plan 06-01's.
+#:
+#: **How any result obtained with it must be reported.** ``RemotePolicyConfig``
+#: has NO seed field (``async_inference/helpers.py:266-273`` — the six fields are
+#: ``policy_type``, ``pretrained_name_or_path``, ``lerobot_features``,
+#: ``actions_per_chunk``, ``device``, ``rename_map``), so no seed can travel over
+#: this wire. This one is set IN-PROCESS by Dum-E's own ``PolicyServer``
+#: subclass. Any determinism result obtained with it is therefore
+#: "**deterministic under an in-process seed set by Dum-E's own subclass**" and
+#: NEVER "the server honours a seed" — Phase 5 recorded
+#: ``seed_verdict: not-honored`` for the sibling GR00T-native server
+#: (05-02-SUMMARY.md, same-seed max|diff| 5.51 vs different-seed 4.63 with
+#: ``seed``/``random_seed``/``rng_seed`` all tried) and this project's classifier
+#: draws that distinction deliberately. Collapsing the two claims would fabricate
+#: a capability.
+SEED_ENV_VAR: str = "DUME_POLICY_SEED"
 
 #: Weight STORAGE dtype, forced at materialization. See the SERVING PRECISION
 #: block in the module docstring: this is a human-approved decision, it matches
@@ -185,6 +229,68 @@ EXPECTED_TAG: str = "new_embodiment"
 #: 11.47 GiB against a 12288 MiB card. Not a performance tweak — a fit
 #: requirement and a Phase 7 parity precondition.
 SERVING_DTYPE: torch.dtype = torch.bfloat16
+
+
+def _refuse(context, message: str):
+    """Abort the RPC with ``FAILED_PRECONDITION`` and the guard's own message.
+
+    ``FAILED_PRECONDITION`` is chosen deliberately, and the choice is load-bearing
+    on BOTH sides of the wire:
+
+    * **Semantics.** The request was well-formed and the client did nothing
+      malformed; the SERVER's state — the checkpoint it resolved, the horizon it
+      was told to serve with — is what is unacceptable. That is precisely
+      ``FAILED_PRECONDITION``'s meaning.
+    * **Retry behaviour.** ``policy/lerobot/session.py``'s ``RETRYABLE_CODES``
+      holds only ``UNAVAILABLE`` and ``DEADLINE_EXCEEDED``, so this status is NOT
+      retried: the client raises immediately, carrying THIS message. Aborting with
+      an "unavailable" or "unknown" status instead would either be retried three
+      times — burning the whole budget and then burying the server's own diagnosis
+      under a generic "unreachable" — or be indistinguishable from a transport
+      fault. The operator would debug the network instead of the checkpoint.
+
+    ``context.abort`` raises, so control never returns to the caller; the
+    ``return`` below exists only so a reader is not left wondering.
+    """
+    return context.abort(grpc.StatusCode.FAILED_PRECONDITION, message)
+
+
+def _maybe_seed_rng(logger) -> int | None:
+    """Seed the ambient torch RNG from :data:`SEED_ENV_VAR`, or do nothing at all.
+
+    Returns the seed applied, or ``None`` when the variable is unset or empty — in
+    which case NEITHER ``torch.manual_seed`` nor ``torch.cuda.manual_seed_all`` is
+    called and the RNG is not touched in any way. The production path must be
+    byte-identical to plan 06-01's; a diagnostic instrument that perturbs the path
+    it measures is worthless.
+
+    A malformed value RAISES rather than being ignored, following the
+    ``policy/factory.py:57-62`` idiom: a determinism instrument that silently does
+    nothing would let a NON-deterministic result be recorded as a seeded one,
+    which is threat T-06-16 exactly. The raise is logged at ERROR first because
+    this runs on the ``GetActions`` path, whose blanket ``except Exception ->
+    Empty()`` (``policy_server.py:214-266``) would otherwise turn it into a
+    successful RPC carrying zero bytes with no explanation in the log.
+    """
+    raw = os.environ.get(SEED_ENV_VAR)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        seed = int(raw)
+    except ValueError as exc:
+        message = (
+            f"{SEED_ENV_VAR}={raw!r} is not an integer, so no seed could be applied. "
+            f"Refusing to run the inference path with a determinism instrument that "
+            f"silently does nothing — a nondeterministic result would then be "
+            f"indistinguishable from a seeded one. Unset {SEED_ENV_VAR} to disable "
+            f"seeding, or set it to an integer."
+        )
+        logger.error(message)
+        raise ValueError(message) from exc
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return seed
 
 
 def fixup_policy_features(
@@ -462,7 +568,67 @@ class DumEGrootPolicyServer(PolicyServer):
             cuda_allocated_mib,
         )
 
-        # --- SAFE-01 guard call site (plan 06-03) ---
+        # ==================== SAFE-01 GUARD: THE POST-LOAD CALL SITE ====================
+        # This is the ONLY place in the system that sees the object which will
+        # actually run inference: upstream loads the policy INSIDE this request
+        # handler, so there is no earlier moment at which ``self.policy``,
+        # ``self.preprocessor`` and ``self.postprocessor`` exist. D-04 option 3's
+        # post-load site.
+        #
+        # ``self.actions_per_chunk`` is the CLIENT-supplied handshake value, not a
+        # re-read of the checkpoint. That is what makes this the D-11 config-drift
+        # catcher: the horizon is configurable, so it can be configured WRONG, and
+        # a client that asks for 40 must be refused rather than obeyed. Both 40s
+        # are traps and both are well lit — ``GrootConfig``'s own default
+        # ``chunk_size``/``n_action_steps`` are 40 and this checkpoint's own
+        # ``config.json`` advertises ``action_horizon: 40``.
+        #
+        # The snapshot build is INSIDE the try on purpose: ``snapshot_from_loaded``
+        # locates the pack step by ``state_dropout_prob``, the encode step by
+        # ``letter_box_transform`` and the decode step by ``env_action_dim``, and
+        # raises ``ValueError`` naming what it looked for if a pinned-lerobot
+        # pipeline reshape moved any of them. That is a refusal to serve for the
+        # same reason a failed assertion is, and it must reach the operator as one
+        # rather than as an un-named exception escaping a gRPC handler.
+        try:
+            snapshot = snapshot_from_loaded(
+                self.policy.config,
+                self.preprocessor,
+                self.postprocessor,
+                self.actions_per_chunk,
+            )
+            assert_groot_serving_contract(snapshot)
+        except ValueError as exc:
+            self.logger.error("SAFE-01 guard: REFUSED | %s", exc)
+            # Drop the un-validated policy BEFORE refusing. ``context.abort``
+            # terminates THIS RPC, but a client that ignores the abort and calls
+            # SendObservations/GetActions anyway must not be served from a policy
+            # the guard rejected — and ``GetActions``'s blanket
+            # ``except Exception -> Empty()`` would turn the resulting AttributeError
+            # into a SUCCESSFUL RPC carrying zero bytes, which
+            # policy/lerobot/session.py's zero-length guard names explicitly.
+            # There is deliberately NO path here that logs a violation and returns
+            # the reply: no warn-and-serve, and the ValueError is re-raised as an
+            # abort rather than caught and continued (T-06-13).
+            self.policy = None
+            _refuse(context, str(exc))
+
+        # ONE INFO line, so a single `docker logs | grep` shows BOTH that the guard
+        # ran and what it saw. A guard that passes SILENTLY is indistinguishable
+        # from a guard that never ran, which is D-05's stated failure mode and
+        # threat T-06-14 — the repudiation risk is the whole reason this line
+        # exists. Every value is read off the snapshot the assertions just ran
+        # against, never re-derived, so the line cannot report something the guard
+        # did not actually check.
+        self.logger.info(
+            "SAFE-01 guard: PASS | base_model_path=%s | embodiment_tag=%s | "
+            "actions_per_chunk=%s | checkpoint_horizon=%s | decode_step=%s",
+            snapshot.base_model_path,
+            snapshot.embodiment_tag,
+            snapshot.configured_actions_per_chunk,
+            snapshot.checkpoint_horizon,
+            snapshot.decode_step_type,
+        )
         return services_pb2.Empty()
 
     def _predict_action_chunk(self, observation_t) -> list[TimedAction]:
@@ -487,7 +653,27 @@ class DumEGrootPolicyServer(PolicyServer):
         observation = self.preprocessor(observation)
         self.last_processed_obs = observation_t
 
-        # --- SAFE-01 seeded-determinism hook (plan 06-03) ---
+        # ==================== SEEDED-DETERMINISM HOOK (opt-in, inert when unset) ====================
+        # Env-gated and DIAGNOSTIC. When DUME_POLICY_SEED is unset or empty this
+        # touches the RNG in no way, so the production path is byte-identical to
+        # plan 06-01's; see _maybe_seed_rng and SEED_ENV_VAR.
+        #
+        # It sits HERE, immediately before _get_action_chunk, because that is where
+        # the flow-matching sampler draws its initial noise from the ambient torch
+        # RNG (this checkpoint decodes over num_inference_timesteps: 4). Seeding
+        # earlier — at startup, or at handshake — would seed once and then let five
+        # successive calls advance the same generator, which measures RNG
+        # continuation rather than repeatability.
+        #
+        # REPORTING CONSTRAINT, restated at the call site because this is where a
+        # future reader will be tempted: RemotePolicyConfig has no seed field
+        # (helpers.py:266-273), so this seed is set IN-PROCESS by Dum-E's own
+        # PolicyServer subclass. Any result obtained with it is "deterministic under
+        # an in-process seed", NEVER "the server honours a seed" — Phase 5 recorded
+        # seed_verdict: not-honored for the sibling GR00T-native server and this
+        # project's classifier draws that distinction deliberately.
+        _maybe_seed_rng(self.logger)
+
         # 3. Inference. Truncates to the client-supplied actions_per_chunk.
         action_tensor = self._get_action_chunk(observation)
 

@@ -153,6 +153,36 @@ ENV HF_HUB_OFFLINE=1
 ENV DUME_BACKBONE_REVISION=${BACKBONE_REVISION}
 
 COPY docker/lerobot-policy/*.py /app/docker/lerobot-policy/
+
+# ==================== ONE IMPLEMENTATION, TWO CALL SITES ====================
+# This single COPY is what makes SAFE-01's "one implementation, two call sites"
+# true ACROSS THE PROCESS BOUNDARY. Both in-container call sites — the
+# config-only preflight in entrypoint.py and the post-load hook in server.py —
+# import `policy_guard.groot_guard` from here, and it is byte-identical to the
+# file `tests/test_groot_guard.py` exercises in the Dum-E venv, because it IS
+# that file.
+#
+# The alternative — restating the assertions inside the image — is precisely the
+# "two code paths to keep in sync" cost D-04 option 3 was warned about, and a
+# second copy could silently drift into passing where the first refused. There is
+# deliberately no second copy: an acceptance criterion asserts the in-container
+# module resolves to a path under /app/policy_guard/ (T-06-15).
+#
+# `policy_guard/__init__.py` is 0 bytes on purpose (06-02): importing it must not
+# pull a client-side dependency into the policy container, which is also why the
+# guard does NOT live in `shared/` (whose __init__ imports pydantic at module
+# scope). Adding this COPY also required re-admitting `policy_guard/` in the
+# repo-root `.dockerignore`, whose allowlist denies everything by default — that
+# friction is intended and the decision is recorded there.
+COPY policy_guard/ /app/policy_guard/
+
 WORKDIR /app
+# So both /app/docker/lerobot-policy/*.py and any process started with an
+# explicit script path (the CMD below, and `--preflight-only` invocations that
+# pass /app/docker/lerobot-policy/entrypoint.py) resolve `policy_guard` from
+# /app. WORKDIR alone is not sufficient: Python prepends the SCRIPT's directory
+# to sys.path, not the cwd, so without this the entrypoint would import
+# policy_guard only by accident of being run from /app.
+ENV PYTHONPATH=/app
 
 CMD ["python3", "/app/docker/lerobot-policy/entrypoint.py", "--host", "0.0.0.0", "--port", "8080"]

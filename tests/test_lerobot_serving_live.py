@@ -28,6 +28,26 @@ three independent truncations force 16 regardless of whether the config is right
 own ``valid_horizon`` truncation). The config-level horizon assertion belongs to
 plan 06-06.
 
+==================== TWO TESTS RECREATE THE CONTAINER. DELIBERATELY. ====================
+``test_live_five_seeded_repeats_return_identical_chunks`` needs
+``DUME_POLICY_SEED`` PRESENT in the server's environment and
+``test_live_no_seed_variable_means_no_seed_is_set`` needs it ABSENT, so no single
+container configuration lets both pass. Each therefore recreates
+``lerobot-policy-server`` into the configuration it needs, using the run command
+extracted from `README.md`'s LRG-06 anchor (so there is one source of truth for
+the publish spec and it is re-asserted loopback-only before being executed).
+
+The alternative — asserting a precondition and failing when the operator started
+the container the other way — would make the module unrunnable end to end, and
+skipping would be a silent pass on the determinism claim. Recreating is also what
+plan 06-03's own verify commands do; owning it here just means a plain
+``pytest tests/test_lerobot_serving_live.py`` proves everything in one run.
+
+The seeded test runs FIRST, so the module leaves the container in the unseeded
+PRODUCTION configuration. Every recreate costs a fresh handshake (~6 s once the
+shards are in page cache) because upstream reloads the weights on every handshake
+(D-01) — no state is lost that was worth keeping.
+
 Run it:
     bash scripts/build_lerobot_policy_image.sh
     docker run -d --gpus all -p 127.0.0.1:8080:8080 \
@@ -44,6 +64,7 @@ import time
 
 import numpy as np
 import pytest
+import torch
 
 from lerobot.async_inference.helpers import RemotePolicyConfig, TimedAction
 
@@ -79,6 +100,22 @@ EXPECTED_TAG = "new_embodiment"
 #: ``config.json`` advertises ``action_horizon: 40`` — so it is the value a copied
 #: config or a reasonable guess would actually supply.
 WRONG_ACTIONS_PER_CHUNK = 40
+
+#: The env var ``docker/lerobot-policy/server.py`` reads to decide whether to seed
+#: the ambient torch RNG in-process before each inference call. Its value is
+#: recorded in ``docs/LEROBOT-SERVING-VERDICTS.md`` alongside the result, because a
+#: determinism verdict that does not name the seed it used is not reproducible.
+SEED_ENV_VAR = "DUME_POLICY_SEED"
+
+#: The seed used for the determinism probe. Arbitrary; what matters is that it is
+#: FIXED and recorded.
+DETERMINISM_SEED = 1234
+
+#: How many repeats of one byte-identical observation the determinism probe sends.
+DETERMINISM_REPEATS = 5
+
+#: How long to wait for a freshly recreated container to answer ``Ready``.
+CONTAINER_READY_BUDGET_S = 240.0
 
 #: How long a refusal may take, end to end. Generous relative to the observed
 #: handshake (~6 s once the shards are in page cache) but far below what THREE
@@ -664,4 +701,252 @@ def test_live_wrong_actions_per_chunk_is_refused_with_safe01_2():
         assert tuple(timed.get_action().shape) == (EXPECTED_ACTION_DIM,), (
             f"post-refusal action {i} has shape {tuple(timed.get_action().shape)}, "
             f"expected ({EXPECTED_ACTION_DIM},)"
+        )
+
+
+# ==================== CRITERION 5: DETERMINISM, UNDER AN IN-PROCESS SEED ====================
+# The ROADMAP asks that "5 seeded repeats of one observation produce identical
+# chunks". Two independent facts make that unobtainable AS WRITTEN, and both are
+# re-verified rather than assumed:
+#
+# 1. ``RemotePolicyConfig`` has NO seed field at all
+#    (``async_inference/helpers.py:266-273`` — the six fields are ``policy_type``,
+#    ``pretrained_name_or_path``, ``lerobot_features``, ``actions_per_chunk``,
+#    ``device``, ``rename_map``). There is no seed to send over this wire.
+# 2. The checkpoint decodes with flow matching over ``num_inference_timesteps: 4``,
+#    whose initial noise is drawn from the ambient torch RNG INSIDE the server
+#    process.
+#
+# And Phase 5 already established that the sibling GR00T-native server does not
+# honour a seed (``seed_verdict: not-honored``, 05-02-SUMMARY.md: same-seed
+# max|diff| 5.51 vs different-seed 4.63, with ``seed``/``random_seed``/``rng_seed``
+# all tried).
+#
+# So the mechanism is an env-gated ``torch.manual_seed`` set IN-PROCESS by Dum-E's
+# own ``PolicyServer`` subclass, and the claim these two tests support is
+# "**deterministic under an in-process seed set by Dum-E's own PolicyServer
+# subclass**" — NEVER "the server honours a seed", and never evidence that a seed
+# travelled over the wire. This project built a classifier that distinguishes those
+# two claims; collapsing them would fabricate a capability.
+
+
+def _documented_run_command() -> str:
+    """The `README.md` LRG-06 run command, re-asserted loopback-only before use.
+
+    Extracted rather than restated so there is ONE source of truth for the publish
+    spec: a second hardcoded copy here could widen it to ``-p 8080:8080`` without
+    plan 06-05's guard ever noticing, which is threat T-06-26 exactly. Running
+    ``assert_loopback_only`` on the extracted text before executing it means this
+    module cannot start a container that is reachable off-host even if `README.md`
+    regresses.
+    """
+    from tests.test_loopback_publish_spec import (
+        README,
+        assert_loopback_only,
+        extract_run_block,
+    )
+
+    command = extract_run_block(README.read_text())
+    assert_loopback_only(command)
+    return command
+
+
+def _recreate_container(extra_env: dict[str, str] | None = None) -> None:
+    """Recreate ``lerobot-policy-server`` from the documented command, plus ``-e`` flags.
+
+    Waits for ``Ready`` and asserts the fresh container's preflight printed no
+    ``FAIL:`` and reached its listening socket, so a test never runs against a
+    container that refused to start (which would otherwise surface as a confusing
+    transport error rather than as the refusal it is).
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    command = _documented_run_command()
+    if extra_env:
+        flags = " ".join(f"-e {name}={value}" for name, value in extra_env.items())
+        # One replacement, at the head of the command, so the publish spec, the
+        # mount and the image name are untouched.
+        command = command.replace("docker run -d", f"docker run -d {flags}", 1)
+
+    subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["docker", "rm", "-f", CONTAINER_NAME],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    started = subprocess.run(  # noqa: S603 - the documented command, guarded above
+        ["bash", "-c", command],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert started.returncode == 0, (
+        f"the documented run command exited {started.returncode}: {started.stderr!r}"
+    )
+
+    probe = LeRobotPolicySession(SERVER_ADDRESS)
+    deadline = time.time() + CONTAINER_READY_BUDGET_S
+    try:
+        while time.time() < deadline:
+            if probe.ready():
+                break
+            time.sleep(2.0)
+        else:
+            log = _container_logs_since("1h")
+            pytest.fail(
+                f"{CONTAINER_NAME} did not answer Ready within "
+                f"{CONTAINER_READY_BUDGET_S}s of being recreated.\n  log:\n{log}"
+            )
+    finally:
+        probe.close()
+
+    log = _container_logs_since("1h")
+    assert "FAIL:" not in log, (
+        f"the recreated container's preflight printed a FAIL line, so it refused to "
+        f"start:\n{log}"
+    )
+    assert "DumEGrootPolicyServer started on" in log, (
+        f"the recreated container never reached its listening socket:\n{log}"
+    )
+
+
+@pytest.fixture
+def seeded_container():
+    """Recreate the container WITH ``DUME_POLICY_SEED`` set. Returns the seed."""
+    _recreate_container({SEED_ENV_VAR: str(DETERMINISM_SEED)})
+    return DETERMINISM_SEED
+
+
+@pytest.fixture
+def unseeded_container():
+    """Recreate the container with ``DUME_POLICY_SEED`` ABSENT from its environment."""
+    _recreate_container(None)
+
+
+def test_live_five_seeded_repeats_return_identical_chunks(seeded_container):
+    """Five repeats of ONE observation return byte-identical chunks (criterion 5).
+
+    The claim, in the exact form it is reported in
+    ``docs/LEROBOT-SERVING-VERDICTS.md``: **deterministic under an in-process seed
+    set by Dum-E's own ``PolicyServer`` subclass.**
+
+    This is NOT the claim that the server honours a seed, and it must never be
+    written up as one. ``RemotePolicyConfig`` has no seed field
+    (``async_inference/helpers.py:266-273``), so nothing about a seed travels over
+    this wire; the seed is applied in-process, immediately before
+    ``_get_action_chunk``, by ``docker/lerobot-policy/server.py``. Phase 5 recorded
+    ``seed_verdict: not-honored`` for the sibling GR00T-native server, and this
+    result neither overturns nor extends that verdict — they are different claims.
+
+    Comparison is EXACT: ``torch.equal`` per timestep, no tolerance of any kind. A
+    tolerance here would convert "identical" into "close", which is precisely the
+    hedge that lets a real nondeterminism regression pass a later parity gate.
+
+    If fewer than five chunks come back, that is a TRANSPORT finding rather than a
+    determinism finding: the server's ``observations_similar`` filter (atol=1 in
+    joint space, ``helpers.py:281-283``) drops a replayed identical observation, and
+    ``must_go=True`` on every observation is what defeats it. Check the container
+    log for ``has been filtered out`` before concluding anything about seeds.
+    """
+    printenv = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["docker", "exec", CONTAINER_NAME, "printenv", SEED_ENV_VAR],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert printenv.returncode == 0 and printenv.stdout.strip() == str(seeded_container), (
+        f"the positive control failed: {SEED_ENV_VAR} is not {seeded_container} inside "
+        f"{CONTAINER_NAME} (exit {printenv.returncode}, value {printenv.stdout.strip()!r}). "
+        f"Without it the server sets NO seed, and an identical-chunks result would be "
+        f"reported as seeded when it was not."
+    )
+
+    sess = LeRobotPolicySession(SERVER_ADDRESS)
+    try:
+        sess.connect(_specs())
+        # ONE observation object, reused — not rebuilt per call — so the five
+        # requests are byte-identical by construction rather than by coincidence.
+        observation = _synthetic_observation()
+        chunks = [sess.infer(observation) for _ in range(DETERMINISM_REPEATS)]
+    finally:
+        sess.close()
+
+    assert len(chunks) == DETERMINISM_REPEATS, (
+        f"expected {DETERMINISM_REPEATS} decoded chunks, got {len(chunks)}"
+    )
+    for i, chunk in enumerate(chunks):
+        assert len(chunk) == EXPECTED_HORIZON, (
+            f"repeat {i} returned {len(chunk)} actions, expected {EXPECTED_HORIZON}. "
+            f"Fewer means the server's similarity filter dropped a repeat — a transport "
+            f"finding, not a determinism finding. Check `docker logs` for "
+            f"'has been filtered out'."
+        )
+
+    reference = chunks[0]
+    mismatches = []
+    worst = 0.0
+    for i, chunk in enumerate(chunks[1:], start=1):
+        for step, (want, got) in enumerate(zip(reference, chunk, strict=True)):
+            want_action, got_action = want.get_action(), got.get_action()
+            if not torch.equal(want_action, got_action):
+                diff = float((want_action.double() - got_action.double()).abs().max())
+                worst = max(worst, diff)
+                mismatches.append((i, step, diff))
+
+    assert not mismatches, (
+        f"{len(mismatches)} of {DETERMINISM_REPEATS - 1} x {EXPECTED_HORIZON} timesteps "
+        f"differ from repeat 0 under a fixed in-process seed of {seeded_container}. "
+        f"Observed maximum absolute difference: {worst}. "
+        f"First five mismatches (repeat, timestep, max|diff|): {mismatches[:5]}. "
+        f"Do NOT widen a tolerance and do NOT weaken the claim to 'approximately "
+        f"identical' — record the number, name a non-deterministic CUDA kernel in the "
+        f"backbone or the flow-matching sampler as the leading candidates, and carry it "
+        f"forward as an open question for Phase 7's parity harness."
+    )
+
+
+def test_live_no_seed_variable_means_no_seed_is_set(unseeded_container):
+    """The determinism instrument is genuinely OPT-IN (the non-vacuity half).
+
+    Proves two things about the production path: the seed variable is genuinely
+    absent from the container's environment, and inference still returns a
+    well-formed chunk with it absent — so the instrument added for criterion 5 does
+    not perturb the path Phase 7 will measure.
+
+    It deliberately does NOT assert that unseeded repeats DIFFER. That would make
+    the test depend on nondeterminism actually manifesting on this GPU, which this
+    phase never established, and it would be flaky in the one direction a safety
+    suite must never be flaky: green when the mechanism is broken.
+    """
+    printenv = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["docker", "exec", CONTAINER_NAME, "printenv", SEED_ENV_VAR],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert printenv.returncode != 0, (
+        f"{SEED_ENV_VAR} is PRESENT in {CONTAINER_NAME}'s environment "
+        f"(value {printenv.stdout.strip()!r}), so the determinism instrument is not "
+        f"genuinely opt-in and the production path is not the one being measured here."
+    )
+
+    sess = LeRobotPolicySession(SERVER_ADDRESS)
+    try:
+        sess.connect(_specs())
+        actions = sess.infer(_synthetic_observation())
+    finally:
+        sess.close()
+
+    assert len(actions) == EXPECTED_HORIZON, (
+        f"with no seed set, inference returned {len(actions)} actions, expected "
+        f"{EXPECTED_HORIZON}"
+    )
+    for i, timed in enumerate(actions):
+        assert tuple(timed.get_action().shape) == (EXPECTED_ACTION_DIM,), (
+            f"unseeded action {i} has shape {tuple(timed.get_action().shape)}, expected "
+            f"({EXPECTED_ACTION_DIM},)"
         )

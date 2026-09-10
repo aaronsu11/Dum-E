@@ -272,3 +272,238 @@ committed verdict has a live guard behind it rather than resting on a stale `.np
 - `checkpoints/GR00T-N1.7-3B-SO101/processor_config.json` — the source of every recipe value in §1
 
 <!-- plan 06-03 appends its measured in-container sections below this line -->
+
+---
+
+## SAFE-01 wiring evidence (measured in-container)
+
+> **SAFE-01's five assertions run from two call sites against one shared pure function, and the
+> guard is proven WIRED rather than merely correct in isolation:** a deliberately wrong handshake
+> (`actions_per_chunk=40`) is **refused on the real load path** in **5.11 s**, with the guard's own
+> `SAFE-01/2` message reaching the client un-retried and the container log at ERROR level; and a
+> healthy handshake emits one `SAFE-01 guard: PASS` line naming the five values the guard actually
+> saw.
+
+Measured against the running `lerobot-policy` container (bf16, `cuda_allocated_MiB=6015.0`) by
+`tests/test_lerobot_serving_live.py`. The implementation is `policy_guard/groot_guard.py`, unmodified
+by this plan and imported by both sites.
+
+### Two call sites, deliberately unequal in strength
+
+| Site | File | What it can see | What it validates |
+|---|---|---|---|
+| **Preflight** (config-only, check 4 of 6) | `docker/lerobot-policy/entrypoint.py` | The bind-mounted checkpoint directory only. No policy, no processors, no GPU | SAFE-01/1, /2, /4 and the geometry half of /5 — against `EXPECTED_HORIZON`, because no client exists yet |
+| **Post-load** | `docker/lerobot-policy/server.py` | The loaded `GrootPolicy.config` plus the rebuilt preprocessor/postprocessor — the objects that will actually run inference | All five, against the **client-supplied** `self.actions_per_chunk` |
+
+Both are needed and neither is redundant:
+
+- The **preflight** is what makes SAFE-01's *"refuses to **START** with a named, specific error"*
+  literally true. `main()` returns before `grpc.server(...)` and before `add_insecure_port`, so a
+  refusal never reaches a listening socket — and it happens before a single one of the checkpoint's
+  12.6 GB of shards is read.
+- The **post-load** site is the only place that sees the served object at all, because upstream
+  constructs the policy *inside* the `SendPolicyInstructions` handler. It is also the only site that
+  can validate `decode_step_type` and the two processor `training` flags: on a config-only path no
+  processor object exists, so `snapshot_from_checkpoint_dir` sets those three to their passing values
+  **by construction** and says so in a comment. **The preflight is therefore deliberately weaker than
+  the post-load site**, and is documented that way rather than presented as equivalent coverage.
+
+The preflight check's own PASS line, verbatim, from the serving path:
+
+```
+[4/6] SAFE-01 serving contract for '/checkpoints/model' (config-only) ...
+  PASS: SAFE-01/1..5 hold config-only: embodiment_tag='new_embodiment', checkpoint_horizon=16,
+  use_relative_action=True, use_percentiles=True, stats_non_empty=True, crop_fraction=0.95,
+  shortest_image_edge=256, letter_box_transform=False (decode_step_type and the two training flags
+  are NOT validated here — post-load site only)
+```
+
+That check has been **red**, not merely written: against a directory that passes checks 1-3 (all
+three sidecars present, `is_raw_groot_n1_7_checkpoint` True, horizon 16) but whose
+`processor_config.json` sets `use_percentiles: false`, the preflight exits **1** with
+`FAIL: SAFE-01/4 use_percentiles is False; ... Refusing to unnormalize with the wrong statistic.`
+and `3/4 checks passed`. An entry that has never been red is an entry that has never been tested.
+
+### The healthy pass, verbatim
+
+```
+INFO 2026-09-10 05:16:39 y/server.py:623 SAFE-01 guard: PASS | base_model_path=/checkpoints/model | embodiment_tag=new_embodiment | actions_per_chunk=16 | checkpoint_horizon=16 | decode_step=GrootN17ActionDecodeStep
+```
+
+One line, so a single `docker logs | grep` shows both **that** the guard ran and **what** it saw. A
+guard that passes silently is indistinguishable from a guard that never ran — that is D-05's stated
+failure mode and threat T-06-14. `test_live_guard_pass_is_logged_on_the_real_load_path` asserts on
+this line through a `docker logs --since <microsecond RFC3339 stamp taken immediately before the
+connect>` window, so a stale line from an earlier handshake cannot satisfy it and the assertion
+cannot go vacuous after its first successful run.
+
+**This line also discharges what plan 06-02 could not.** `snapshot_from_loaded` locates the pack step
+by `state_dropout_prob`, the encode step by `letter_box_transform` and the decode step by
+`env_action_dim`; 06-02's coverage D7 is flagged `human_judgment: true` because those markers had only
+ever been exercised against minimal stand-ins. Here they run against the real constructed
+`GrootPolicy` and processor objects. An absent marker raises `ValueError` naming what it looked for,
+so `decode_step=GrootN17ActionDecodeStep` is **positive evidence that all three located correctly**,
+and both `training` flags read False on the real pipeline.
+
+### The refusal, verbatim
+
+Client side, with every handshake field correct except `actions_per_chunk=40`:
+
+```
+LeRobot policy server at 127.0.0.1:8080 rejected the call with gRPC status
+StatusCode.FAILED_PRECONDITION: "SAFE-01/2 configured actions_per_chunk=40 disagrees with the
+checkpoint's delta_indices (16). The horizon is configurable (D-11), so it can be configured wrong;
+refusing to obey a configured horizon the checkpoint cannot decode.". Not retried — a non-transient
+status is the server's own diagnosis, and three retries would only bury it under a generic
+'unreachable'.
+```
+
+Server side, same refusal, at ERROR level:
+
+```
+ERROR 2026-09-10 05:17:08 y/server.py:602 SAFE-01 guard: REFUSED | SAFE-01/2 configured actions_per_chunk=40 disagrees with the checkpoint's delta_indices (16). The horizon is configurable (D-11), so it can be configured wrong; refusing to obey a configured horizon the checkpoint cannot decode.
+```
+
+| Measurement | Value |
+|---|---|
+| Elapsed, client `connect()` to `RuntimeError` | **5.11 s** (budget 60 s) |
+| gRPC status chosen | `FAILED_PRECONDITION` |
+| Retries burned | **0** — the status is absent from `RETRYABLE_CODES` |
+| Recovery after refusal | a correct handshake immediately afterwards returns **16** actions of shape `(6,)` |
+
+`FAILED_PRECONDITION` is chosen deliberately on both counts. Semantically the request was well-formed
+and the *server's* state is what is unacceptable. Operationally,
+`policy/lerobot/session.py`'s `RETRYABLE_CODES` holds only `UNAVAILABLE` and `DEADLINE_EXCEEDED`, so
+this status raises on the first attempt carrying the server's own message. A retryable or
+transport-shaped status would instead have burned three handshake retries — each starting **another**
+concurrent multi-GB weight load — and then reported a generic unreachable error, sending the operator
+to debug the network instead of the checkpoint.
+
+**What the refusal does NOT do, stated so it is not overread:** it does not happen before the weights
+are read. The post-load site exists precisely because the policy is constructed inside the request
+handler, so a rejected handshake still costs one full load (~5 s here, page cache warm). The site
+that refuses before any shard is read is the preflight, and it is a different instrument answering a
+different question.
+
+**40 is the well-lit wrong path, twice over**, which is why it is the injected value rather than an
+arbitrary number: `GrootConfig`'s own `chunk_size`/`n_action_steps` defaults are 40, and this
+checkpoint's own `config.json` advertises `action_horizon: 40`. D-11 made the horizon configurable;
+this is the assertion that keeps a configurable horizon from being an *obeyable wrong* horizon.
+
+### Named non-discriminating mechanism: `GrootConfig.normalization_mapping`
+
+Recorded in the `tests/test_units_verdict.py` tradition — a mechanism proven not to discriminate is
+written down as such rather than quietly omitted.
+
+`GrootConfig.normalization_mapping` is **IDENTITY for `VISUAL`, `STATE` and `ACTION` by design** on
+every healthy launch, and upstream states it is not consulted at all
+(`configuration_groot.py:258-269`: GR00T normalizes state/action internally in its processor steps
+and the backbone's image processor handles images, so the policy does not use LeRobot's
+`NormalizerProcessorStep`). Reading it as the "normalization has fallen back to identity" signal —
+the ROADMAP's stated mechanism, correction 5 in §3 — is a **guaranteed false alarm**. The guard
+therefore **never reads it**, proven at AST level rather than by grep because the module docstring
+quotes upstream's reason at length.
+
+The three signals that carry SAFE-01/4 and SAFE-01/3 instead, all measured on the real checkpoint:
+
+| Signal | Observed | Why it discriminates |
+|---|---|---|
+| `decode_step_type` | `GrootN17ActionDecodeStep` | The legacy `GrootActionUnpackUnnormalizeStep` is installed **only** when the checkpoint's stats are unusable, and it collapses `(B,T,D)` chunks to a single timestep. Its presence in a live pipeline *is* the identity-normalization tell |
+| `stats_non_empty` | `True` | An empty stats table makes the decoder return normalized `[-1, 1]` actions while every log line looks healthy |
+| `use_percentiles` | `True` | This checkpoint normalizes with q01/q99; min/max would rescale every action |
+
+---
+
+## Determinism verdict (measured in-container)
+
+> **Five repeats of one byte-identical observation return byte-identical decoded chunks —
+> deterministic under an in-process seed set by Dum-E's own `PolicyServer` subclass.** Compared with
+> exact equality (`torch.equal` per timestep), no tolerance of any kind.
+
+### The measurement
+
+| | Value |
+|---|---|
+| Seed | `1234`, via `DUME_POLICY_SEED` |
+| Where the seed is applied | in-process, inside `DumEGrootPolicyServer._predict_action_chunk`, immediately before `_get_action_chunk` |
+| Repeats | 5, one reused observation object (byte-identical by construction, not by coincidence) |
+| Chunks returned | 5, each of length 16 |
+| Comparison method | `torch.equal` per timestep — **exact**, no `atol`, no `rtol`, no `approx` |
+| **Result** | **5/5 byte-identical**; 0 mismatching timesteps out of 4 x 16 |
+| Unseeded control (throwaway probe, same observation, same container recreated without the variable) | **0/4 identical**, max abs difference **14.61** |
+
+The unseeded control is what makes the seeded result discriminating rather than trivially true: with
+no seed set, five repeats of the *same* observation diverge by up to 14.61 in joint space, consistent
+with plan 06-01's measured same-state noise floor (mean `|delta|` per dimension
+`[1.1153, 1.5060, 2.3234, 1.4766, 1.0816, 5.3045]`, with one individual gripper pair reaching
+-10.06). The seed is what collapses that to exact equality.
+
+The mechanism is opt-in and proven inert when unused:
+`test_live_no_seed_variable_means_no_seed_is_set` asserts `DUME_POLICY_SEED` is genuinely **absent**
+from the container's environment (`docker exec printenv` exits non-zero) and that inference still
+returns a well-formed 16 x `(6,)` chunk. With the variable unset the server calls neither
+`torch.manual_seed` nor `torch.cuda.manual_seed_all` and does not touch the RNG at all, so the
+production path Phase 7 will measure is byte-identical to plan 06-01's. A **malformed** value raises,
+naming the variable and the offending value, rather than being silently ignored — a determinism
+instrument that silently does nothing would let a nondeterministic result be recorded as a seeded one
+(threat T-06-16).
+
+That test deliberately does **not** assert that unseeded repeats differ. The control number above was
+measured as a throwaway probe and recorded here precisely so it does not become a committed
+assertion: a test that depends on nondeterminism manifesting would be flaky in the one direction a
+safety suite must never be flaky — green when the mechanism is broken.
+
+### Why the criterion had to be reframed
+
+The ROADMAP asks that "5 seeded repeats of one observation produce identical chunks". Two independent
+facts make that unobtainable as written, both re-verified:
+
+1. **`RemotePolicyConfig` has no seed field at all** (`async_inference/helpers.py:266-273` — the six
+   fields are `policy_type`, `pretrained_name_or_path`, `lerobot_features`, `actions_per_chunk`,
+   `device`, `rename_map`). There is no seed to send over this wire.
+2. Decoding uses **flow matching over `num_inference_timesteps: 4`**, whose initial noise is drawn
+   from the ambient torch RNG **inside the server process**.
+
+This is correction 6 in §3, and this section is the in-container half it defers to.
+
+The **keyless eval-mode half** is independently discharged and is what makes the seeded probe
+meaningful rather than accidental. `training` is a constructor kwarg set from `dataset_meta`
+(`processor_groot.py:1225, 1266` — `training=dataset_meta is not None`), and `policy_server` passes no
+`dataset_meta`, so it is `False` on the serving path; both stochastic steps are *additionally* gated
+on `torch.is_grad_enabled()` (`processor_groot.py:2099` and `:1885`) while `predict_action_chunk` is
+decorated `@torch.no_grad()` (`modeling_groot.py:473`). Isaac's train-time random crop and this
+checkpoint's `state_dropout_prob: 0.2` are therefore **doubly** disabled. `SAFE-01/5` asserts both
+`training` flags are False, and the post-load site is the only one that can — verified against the
+real constructed processors this plan.
+
+### What this verdict does NOT say
+
+1. **It does not say the server honours a seed.** It does not, and cannot: `RemotePolicyConfig`
+   carries no seed field, so no seed can reach the server from a client. The seed here is set
+   in-process by Dum-E's own subclass, in code this repo owns.
+2. **It does not say the wire carries a seed.** Nothing about a seed travels over
+   `transport.AsyncInference` in either direction. `DUME_POLICY_SEED` is read from the container's
+   environment at inference time.
+3. **It does not overturn or extend Phase 5's `seed_verdict: not-honored`** for the sibling
+   GR00T-native N1.7 server (05-02: same-seed max `|diff|` 5.51 vs different-seed 4.63, with `seed`,
+   `random_seed` and `rng_seed` all tried). Those are *different claims about different things* — one
+   about whether a server honours a client-supplied seed, one about whether a process is repeatable
+   once its own RNG is fixed. This project's classifier draws that distinction deliberately and this
+   result must not be cited as collapsing it.
+4. **It does not license Phase 7 to assume a replayable seed** without setting one in-process itself.
+   The parity harness needs a seeded, in-process instrument; over this wire it has none, and plan
+   06-01 measured why — on the gripper dimension the per-call re-sampling noise (5.30) is several
+   times larger than the signal being asserted (1.28).
+5. **It does not extend to the image path**, which was already settled separately and by a different
+   mechanism: §1's `replay_identical` is exact array equality over the *transform*, with no sampler
+   involved.
+
+---
+
+### Section 4.1 of `## Open gaps carried forward` is unchanged by this plan
+
+The cross-container PAR-05 dump from the pinned Isaac-GR00T `23ace64f` image (assumption A8) was
+**still not attempted** and remains a one-sided record, not a two-sided comparison. Plan 06-03 did not
+absorb it and does not mark it resolved: `gr00t-server` is `Exited` by standing decision for the
+remainder of Phase 6, so any GR00T-native-side comparison must go through the mock or dumped tensors.
+It stays open in `.planning/WINDOWS.md` (entry 17).

@@ -76,6 +76,14 @@ class MockAsyncInferenceServicer(services_pb2_grpc.AsyncInferenceServicer):
         self.mode = mode
         self.last_specs = None
         self.last_observation = None
+        # Per-method CALL COUNTS, not just the last payload. The two handshake
+        # halves cost wildly different things on the real server — ``Ready`` flushes
+        # per-client state, ``SendPolicyInstructions`` reloads multi-GB weights
+        # (``policy_server.py:151``) — so "how many times was each called" is the
+        # only thing that can distinguish a cheap reset from an accidental reload,
+        # and a keyless test must be able to assert it without a GPU.
+        self.ready_calls = 0
+        self.handshake_calls = 0
         # Injection point for a NON-UNIFORM action vector, so a test can prove
         # the client's flat->named reindex maps dim i to joint i rather than
         # merely producing a six-wide dict. None means "zeros", the default
@@ -85,10 +93,15 @@ class MockAsyncInferenceServicer(services_pb2_grpc.AsyncInferenceServicer):
 
     def Ready(self, request, context):  # noqa: N802 - upstream's generated name
         """``Empty -> Empty``. Upstream also clears its shutdown event here."""
+        self.ready_calls += 1
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
         """``PolicySetup -> Empty``. ``request.data`` is a pickled RemotePolicyConfig."""
+        # Counted BEFORE the refuse branch: on the real server the weight load
+        # happens inside this handler, so "the handler was entered" is the fact that
+        # costs VRAM, whether or not it goes on to succeed.
+        self.handshake_calls += 1
         if self.mode == "refuse":
             # The shape a SAFE-01 guard refusal takes on the wire: an ABORT with
             # a specific, actionable message. FAILED_PRECONDITION is deliberately

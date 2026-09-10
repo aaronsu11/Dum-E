@@ -550,6 +550,25 @@ class DumEGrootPolicyServer(PolicyServer):
         )
 
         start = time.perf_counter()
+        # ---- RELEASE THE PREVIOUS POLICY BEFORE MATERIALIZING THE NEXT ONE ----
+        # Defence in depth for the same root cause as the client-side reset() fix:
+        # `from_pretrained` allocates and moves a NEW ~6 GB policy while the
+        # assignment target `self.policy` still strongly references the old one, so
+        # a second handshake from any client would hold two live copies — ~12 GB of
+        # the card's 12288 MiB before activations and fragmentation. Dropping the
+        # references (and the pipelines that hold their own references to the
+        # policy's config and steps) plus emptying the caching allocator's freed
+        # blocks makes that VRAM reclaimable BEFORE the new load, so a re-handshake
+        # costs wall clock rather than an OOM.
+        #
+        # This touches only the lifetime of the previous object; it does not touch
+        # any of the three bf16 knobs, which are injected below via `config` and
+        # DumEGrootPolicy._create_groot_model.
+        self.policy = None
+        self.preprocessor = None
+        self.postprocessor = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # DumEGrootPolicy, not get_policy_class(self.policy_type)'s GrootPolicy:
         # the subclass is what carries dtype/load_bf16 into the model load.
         self.policy = DumEGrootPolicy.from_pretrained(requested_path, config=config)

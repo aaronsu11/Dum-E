@@ -211,7 +211,7 @@ class LeRobotPolicySession:
         per container lifetime, so each ``connect()`` is one full ~12.6 GB weight
         load (minutes of wall clock on an RTX 3060).
         """
-        self._call(lambda: self._stub.Ready(services_pb2.Empty(), timeout=self._deadline_s))
+        self.probe_ready_or_raise()
         payload = pickle.dumps(specs)
         # HANDSHAKE_DEADLINE_S / HANDSHAKE_MAX_ATTEMPTS, NOT the per-inference
         # budget: the weight load happens inside this request handler, so a 15s
@@ -233,14 +233,41 @@ class LeRobotPolicySession:
             specs.device,
         )
 
+    def probe_ready_or_raise(self) -> None:
+        """Send ``Ready`` and NOTHING else — so no weight load can be triggered.
+
+        This is the CHEAP half of :meth:`connect`, split out because the two halves
+        cost wildly different things and only one of them is idempotent in practice:
+
+        * ``Ready`` calls upstream's ``_reset_server()``
+          (``policy_server.py:107-113``), which clears ``observation_queue`` and
+          ``_predicted_timesteps`` and leaves the loaded ``policy``,
+          ``preprocessor`` and ``postprocessor`` untouched. That is the ONLY
+          per-client server state a client can flush.
+        * ``SendPolicyInstructions`` is what reloads the weights
+          (``policy_server.py:151``) — one full multi-GB materialization per call.
+
+        RAISES rather than returning a bool, deliberately unlike :meth:`ready`.
+        The caller that needs this is ``LeRobotPolicyBackend.reset()`` at an
+        episode boundary, and a reset that quietly did nothing is exactly how
+        stale server-side per-client state survives into the next episode.
+
+        Raises:
+            RuntimeError: on a non-transient gRPC status, or an unreachable server
+                after ``MAX_ATTEMPTS`` attempts.
+        """
+        self._call(lambda: self._stub.Ready(services_pb2.Empty(), timeout=self._deadline_s))
+
     def ready(self) -> bool:
         """Return True if the server answered ``Ready``, False on any gRPC error.
 
         Mirrors ``BaseInferenceClient.ping``'s contract: a reachability probe
-        returns a bool rather than raising, so a caller can poll it.
+        returns a bool rather than raising, so a caller can poll it. Delegates to
+        :meth:`probe_ready_or_raise` so there is ONE ``Ready`` call site here, and
+        the polling and fail-loud contracts cannot drift apart.
         """
         try:
-            self._call(lambda: self._stub.Ready(services_pb2.Empty(), timeout=self._deadline_s))
+            self.probe_ready_or_raise()
             return True
         except (grpc.RpcError, RuntimeError):
             return False

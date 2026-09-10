@@ -173,16 +173,49 @@ class LeRobotPolicyBackend(IPolicyBackend):
         return self._session.ready()
 
     def reset(self) -> None:
-        """Rebuild the session and force a re-handshake on the next action.
+        """Rebuild the channel and flush the server's per-client observation state.
 
-        Safe to call when nothing is in flight. A rebuilt channel means no
-        half-open connection and no stale server-side ``last_processed_obs``
-        leaks between episodes.
+        **Deliberately does NOT clear ``_handshaken``.** Upstream reloads the
+        policy INSIDE ``SendPolicyInstructions`` (``policy_server.py:151``), so a
+        re-handshake is not a cheap re-ask of a finished question — it is one more
+        full multi-GB weight materialization on a GPU that is already holding one
+        (this phase measured ``cuda_allocated_MiB=6015`` on a 12288 MiB card, so
+        two live copies do not fit). ``scripts/run_pick_baseline.py`` calls this
+        between every scored attempt and ``shared``'s ``session()`` calls it on
+        entry, so a reload here is a per-episode OOM risk and a multi-minute stall,
+        not a one-off cost.
+
+        ``Ready`` alone is what this method actually needs: it calls upstream's
+        ``_reset_server()`` (``policy_server.py:107-113``), which clears
+        ``observation_queue`` and ``_predicted_timesteps`` and leaves the loaded
+        policy in place. It does NOT clear ``last_processed_obs`` — nothing a
+        client can send does — which is why every observation carries
+        ``must_go=True``; that flag short-circuits the similarity filter
+        ``last_processed_obs`` feeds (see ``session.py``'s ``infer``).
+
+        When there IS server-side state to flush — i.e. this backend has already
+        handshaken — the ``Ready`` RAISES on an unreachable or refusing server
+        rather than returning quietly, unlike :meth:`ping`. A reset that silently
+        did nothing is how stale per-client state survives into the next episode
+        and then reads as policy drift.
+
+        Before the first handshake the probe is SKIPPED, deliberately: there is no
+        per-client state on the server to flush yet, so there is nothing that can
+        go stale, and this backend connects lazily — ``IPolicyBackend.session()``
+        calls ``reset()`` on entry, and probing there would turn "the server is not
+        up yet" into a failure at scope entry instead of at the first
+        ``get_action()``, where the handshake's own error message is. The raise
+        condition is therefore exactly "we had state to flush and could not".
+
+        Raises:
+            RuntimeError: if a handshaken backend's server does not answer ``Ready``.
         """
         self._session.close()
         self._session = LeRobotPolicySession(f"{self._host}:{self._port}")
-        self._handshaken = False
         self._closed = False
+        if self._handshaken:
+            # Re-arm the server's per-episode state; keep the loaded weights.
+            self._session.probe_ready_or_raise()
 
     def close(self) -> None:
         """Release the gRPC channel. Idempotent.

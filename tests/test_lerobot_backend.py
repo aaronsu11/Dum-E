@@ -417,6 +417,83 @@ def test_lerobot_end_to_end_over_real_grpc_socket():
     assert sent.rename_map == {}
 
 
+def test_reset_re_readies_the_server_without_a_second_handshake():
+    """``reset()`` must NOT trigger a second ``SendPolicyInstructions`` (CR-01).
+
+    This is a VRAM-lifetime assertion wearing a call-count disguise, and the count
+    is the only part a keyless test can reach. On the real server the weight load
+    lives inside the ``SendPolicyInstructions`` handler
+    (``policy_server.py:151``), so every extra call is one more ~6 GB
+    materialization on a 12288 MiB card that is already holding one — while
+    ``Ready`` is what clears ``observation_queue`` and ``_predicted_timesteps``
+    (``policy_server.py:107-113``) and leaves the loaded policy alone.
+    ``run_pick_baseline.py`` calls ``reset()`` between every scored attempt, so the
+    difference is per-episode.
+
+    Driven across a reset with an inference on each side, so the assertion is that
+    the session is genuinely REUSABLE after the reset, not merely that a call was
+    skipped.
+    """
+    with grpc_mock("ok") as (port, server):
+        servicer = server.dume_servicer
+        with lerobot_backend(port) as backend:
+            backend.set_lang_instruction("pick up the banana")
+
+            # Before the first handshake there is no per-client server state to
+            # flush, so the probe is skipped and this backend stays lazily
+            # connecting -- IPolicyBackend.session() calls reset() on entry.
+            backend.reset()
+            assert servicer.ready_calls == 0
+            assert servicer.handshake_calls == 0
+
+            backend.get_action(_synthetic_observation())
+            assert servicer.handshake_calls == 1
+            ready_after_handshake = servicer.ready_calls
+            assert ready_after_handshake >= 1
+
+            backend.reset()
+
+            # The reset re-armed the server's per-client state ...
+            assert servicer.ready_calls == ready_after_handshake + 1, (
+                "reset() must send Ready — that is the only server-side per-client "
+                "state a client can flush"
+            )
+            # ... and did NOT pay for a second weight load.
+            assert servicer.handshake_calls == 1, (
+                f"reset() sent {servicer.handshake_calls} handshakes; a re-handshake "
+                "is one more multi-GB weight materialization on a GPU already "
+                "holding one (CR-01)"
+            )
+
+            # And the session still works, so the saving is not bought with a
+            # half-dead backend.
+            actions = backend.get_action(_synthetic_observation())
+            assert len(actions) == _ACTION_HORIZON
+            assert servicer.handshake_calls == 1
+
+
+def test_reset_raises_when_the_server_cannot_be_reached():
+    """A reset that could not flush server state RAISES rather than returning.
+
+    ``ping()``/``ready()`` deliberately return a bool so a caller can poll. This
+    method deliberately does not: it runs at an episode boundary, and a reset that
+    quietly did nothing is exactly how stale server-side per-client state survives
+    into the next episode and gets read as policy drift.
+    """
+    port = _free_port()
+    server = start_mock(port, "127.0.0.1", mode="ok")
+    try:
+        _wait_for_port(port)
+        with lerobot_backend(port) as backend:
+            backend.set_lang_instruction("pick up the banana")
+            backend.get_action(_synthetic_observation())
+            server.stop(grace=0)
+            with pytest.raises(RuntimeError, match="unreachable"):
+                backend.reset()
+    finally:
+        server.stop(grace=0)
+
+
 def test_decoded_dims_zero_to_four_are_arm_and_dim_five_is_gripper():
     """Dim i of the flat action maps to joint i — asserted, never assumed.
 

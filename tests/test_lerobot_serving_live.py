@@ -36,6 +36,7 @@ Run it:
     DUME_RUN_LIVE_LEROBOT_TESTS=1 uv run pytest tests/test_lerobot_serving_live.py -q
 """
 
+import datetime
 import os
 import socket
 import subprocess
@@ -72,6 +73,20 @@ EXPECTED_HORIZON = 16
 EXPECTED_ACTION_DIM = 6
 EXPECTED_TAG = "new_embodiment"
 
+#: The horizon deliberately injected into one handshake to prove the SAFE-01 guard
+#: is WIRED. 40 is the well-lit wrong path and it is lit twice — ``GrootConfig``'s
+#: own default ``chunk_size``/``n_action_steps`` are 40, and this checkpoint's own
+#: ``config.json`` advertises ``action_horizon: 40`` — so it is the value a copied
+#: config or a reasonable guess would actually supply.
+WRONG_ACTIONS_PER_CHUNK = 40
+
+#: How long a refusal may take, end to end. Generous relative to the observed
+#: handshake (~6 s once the shards are in page cache) but far below what THREE
+#: retried handshakes would cost, which is the thing being ruled out: a retried
+#: ``FAILED_PRECONDITION`` would burn the whole budget and then be reported as a
+#: generic "unreachable".
+REFUSAL_BUDGET_S = 60.0
+
 #: A language instruction is REQUIRED, not decorative. The LeRobot-side language
 #: key is "task" (``processor_groot.py:1547``); when it is absent
 #: ``prepare_n1_7_language_batch`` silently substitutes "Perform the task."
@@ -95,6 +110,59 @@ def _synthetic_observation(frames: dict | None = None, joint_value: float = 0.0)
     return obs
 
 
+def _specs(actions_per_chunk: int = EXPECTED_HORIZON) -> RemotePolicyConfig:
+    """The handshake payload. ``actions_per_chunk`` is the ONLY parameter.
+
+    Kept parameterized in exactly one field because plan 06-03's wiring proof
+    turns on injecting a WRONG horizon while every other field stays correct — if
+    the negative case built its own spec, it could differ in a second field and
+    the refusal would no longer be attributable to the horizon.
+
+    The default is 16, NOT the ``GrootConfig`` default 40 and NOT the checkpoint's
+    own ``config.json: action_horizon: 40`` — both are traps. This value is
+    client-supplied and truncates the chunk server-side
+    (``policy_server.py:328``).
+    """
+    return RemotePolicyConfig(
+        policy_type="groot",
+        pretrained_name_or_path=CHECKPOINT_MOUNT,
+        lerobot_features=build_lerobot_features(),
+        actions_per_chunk=actions_per_chunk,
+        device="cuda",
+        # Deliberately empty: rename_map feeds a processor step that runs AFTER
+        # the key lookup it would have to fix. See policy/lerobot/features.py.
+        rename_map={},
+    )
+
+
+def _utc_now_rfc3339() -> str:
+    """Now, as an RFC3339 UTC stamp with microseconds, for ``docker logs --since``.
+
+    Microseconds rather than whole seconds on purpose: a whole-second window can
+    admit a line emitted earlier in the SAME second by a previous handshake, which
+    is exactly the staleness the ``--since`` window exists to exclude. UTC because
+    ``docker logs --since`` interprets a trailing ``Z`` as UTC and the container's
+    own log timestamps are UTC, while this host is not.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def _container_logs_since(since: str) -> str:
+    """``docker logs --since <since> <container>``, stdout and stderr combined."""
+    completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        ["docker", "logs", "--since", since, CONTAINER_NAME],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"`docker logs --since {since} {CONTAINER_NAME}` exited "
+        f"{completed.returncode}: {completed.stderr!r}"
+    )
+    return completed.stdout + completed.stderr
+
+
 @pytest.fixture(scope="module")
 def session():
     """One handshake for the whole module.
@@ -104,20 +172,7 @@ def session():
     (``policy_server.py:151``), so each ``connect()`` is one full ~12.6 GB weight
     load costing minutes of wall clock on an RTX 3060.
     """
-    specs = RemotePolicyConfig(
-        policy_type="groot",
-        pretrained_name_or_path=CHECKPOINT_MOUNT,
-        lerobot_features=build_lerobot_features(),
-        # 16, NOT the GrootConfig default 40 and NOT the checkpoint's own
-        # config.json `action_horizon: 40` — both are traps. This value is
-        # client-supplied and truncates the chunk server-side
-        # (policy_server.py:328).
-        actions_per_chunk=EXPECTED_HORIZON,
-        device="cuda",
-        # Deliberately empty: rename_map feeds a processor step that runs AFTER
-        # the key lookup it would have to fix. See policy/lerobot/features.py.
-        rename_map={},
-    )
+    specs = _specs()
     sess = LeRobotPolicySession(SERVER_ADDRESS)
     sess.connect(specs)
     try:
@@ -420,3 +475,193 @@ def test_live_unreachable_server_raises_instead_of_hanging():
         f"took {elapsed:.1f}s to raise against a closed port; the bounded budget is "
         f"~45s and anything longer suggests wait-for-ready behaviour."
     )
+
+
+# ==================== SAFE-01 IS WIRED: THE FAIL-FIRST PROOF ON THE REAL PATH ====================
+# ``tests/test_container_contract.py:236-249`` states the non-vacuity standard this
+# section answers to: "an entry that has never been red is an entry that has never
+# been tested". ``tests/test_groot_guard.py``'s twelve keyless violation tests prove
+# the guard FUNCTION is correct; they cannot prove it RUNS on the object that serves
+# inference, which is D-05's stated failure mode verbatim — "keyless-only coverage
+# lets a fixture that misrepresents the real config shape pass while the live guard
+# never fires". The two tests below are the other half: one proves the guard ran and
+# what it saw, the other proves a deliberately mis-configured handshake is REFUSED
+# on the real load path.
+#
+# 40 is the injected wrong value, and it is chosen because it is the WELL-LIT wrong
+# path rather than an arbitrary number: ``GrootConfig``'s own default
+# ``chunk_size``/``n_action_steps`` are 40, and this checkpoint's own ``config.json``
+# advertises ``action_horizon: 40``. A horizon that plausible is exactly the one a
+# future operator or a copied config would supply, and D-11 made the horizon
+# configurable — so this is the assertion that keeps a configurable horizon from
+# being an OBEYABLE wrong horizon.
+#
+# Both tests drive the ALREADY-RUNNING container over the wire, and neither loads
+# weights in THIS process — proven at AST level rather than by substring, because
+# this module legitimately discusses upstream's per-handshake ``from_pretrained``
+# in prose: an AST walk over the module reports ZERO calls to it. Plan 06-03's
+# acceptance criterion phrases that as a whole-file grep; the grep counts prose,
+# so it is satisfied at its intent level the same discriminating way 06-06 handled
+# the identical collision.
+
+
+def test_live_guard_pass_is_logged_on_the_real_load_path():
+    """The SAFE-01 guard RAN on the object that serves inference (D-05 wiring proof).
+
+    This is the half keyless coverage cannot reach. A guard that is correct in
+    isolation and never invoked is indistinguishable, from the outside, from one
+    that is invoked and passes — which is why the pass is an observable log line
+    (threat T-06-14, repudiation) rather than silence.
+
+    It also discharges what plan 06-02 could not: ``snapshot_from_loaded`` locates
+    the pack step by ``state_dropout_prob``, the encode step by
+    ``letter_box_transform`` and the decode step by ``env_action_dim``, and 06-02's
+    coverage D7 is flagged ``human_judgment: true`` precisely because those markers
+    were only ever exercised against minimal stand-ins. Here they run against the
+    REAL constructed ``GrootPolicy``/processor objects: an absent marker raises
+    ``ValueError`` naming what it looked for, so a PASS line naming
+    ``GrootN17ActionDecodeStep`` is positive evidence that all three located.
+
+    The ``--since`` window is taken immediately BEFORE the connect. Without it the
+    assertion would be satisfiable by a line from any earlier handshake in this
+    container's history — i.e. it would go vacuous after its first successful run,
+    which is the failure mode a wiring proof least tolerates.
+    """
+    since = _utc_now_rfc3339()
+    sess = LeRobotPolicySession(SERVER_ADDRESS)
+    try:
+        sess.connect(_specs())
+    finally:
+        sess.close()
+
+    log = _container_logs_since(since)
+
+    assert "SAFE-01 guard: PASS" in log, (
+        "the literal 'SAFE-01 guard: PASS' is absent from the container log for the "
+        f"window opened at {since}, so the guard did NOT run on this handshake. A "
+        "guard that passes silently is indistinguishable from a guard that never "
+        f"ran — that is D-05's stated failure mode.\n  log window:\n{log}"
+    )
+    for expected in (CHECKPOINT_MOUNT, EXPECTED_TAG, str(EXPECTED_HORIZON)):
+        assert expected in log, (
+            f"the guard's PASS line does not report {expected!r}, so the values the "
+            f"guard actually saw are not observable to an operator (LRG-02)."
+            f"\n  log window:\n{log}"
+        )
+    assert "GrootN17ActionDecodeStep" in log, (
+        "the guard's PASS line does not name GrootN17ActionDecodeStep as the decode "
+        "step. Either the legacy GrootActionUnpackUnnormalizeStep was installed (which "
+        "SAFE-01/3 should have refused) or snapshot_from_loaded's env_action_dim marker "
+        f"no longer locates the decode step.\n  log window:\n{log}"
+    )
+
+
+def test_live_wrong_actions_per_chunk_is_refused_with_safe01_2():
+    """A deliberately wrong handshake is REFUSED on the real load path (SAFE-01, LRG-04).
+
+    The fail-first half. Every field of the handshake is correct except
+    ``actions_per_chunk``, which is 40 — so a refusal is attributable to the
+    horizon and nothing else.
+
+    Three things are asserted, because any one alone would be weak:
+
+    1. ``connect`` RAISES, and the raised message carries the guard's own
+       ``SAFE-01/2`` identifier together with BOTH numbers (40 asked for, 16 the
+       checkpoint decodes). A refusal that does not name the observed value is not
+       actionable.
+    2. It arrives PROMPTLY. ``FAILED_PRECONDITION`` is excluded from
+       ``policy/lerobot/session.py``'s ``RETRYABLE_CODES``, so the client must raise
+       on the first attempt rather than burning three handshake retries — each of
+       which would start ANOTHER concurrent multi-GB weight load — and then burying
+       the server's own diagnosis under a generic "unreachable".
+    3. The refusal does not WEDGE the server (threat T-06-18): a correct handshake
+       afterwards still yields 16 decoded actions.
+
+    Note what is deliberately NOT asserted: that the refusal happened before the
+    weights were read. It did not, and cannot — the post-load site exists precisely
+    because the policy is constructed inside this request handler, so a rejected
+    handshake still costs one full load. The site that refuses BEFORE any shard is
+    read is the entrypoint preflight, which is a different instrument.
+    """
+    since = _utc_now_rfc3339()
+    sess = LeRobotPolicySession(SERVER_ADDRESS)
+    started = time.time()
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            sess.connect(_specs(actions_per_chunk=WRONG_ACTIONS_PER_CHUNK))
+    finally:
+        sess.close()
+    elapsed = time.time() - started
+
+    message = str(excinfo.value)
+    assert "SAFE-01/2" in message, (
+        "the client-side error does not carry the guard's own 'SAFE-01/2' identifier, so "
+        "the operator cannot tell WHICH assertion refused: "
+        f"{message!r}"
+    )
+    for number in (str(WRONG_ACTIONS_PER_CHUNK), str(EXPECTED_HORIZON)):
+        assert number in message, (
+            f"the client-side error does not name {number}; a horizon refusal must report "
+            f"both the value asked for and the value the checkpoint decodes: {message!r}"
+        )
+    # The refusal must have arrived through the session's NON-RETRYABLE branch, not
+    # through its retry-exhaustion branch. Asserted by each branch's own
+    # distinguishing text rather than by the word "unreachable": the non-retryable
+    # message legitimately QUOTES that word while explaining why it is not used
+    # ("three retries would only bury it under a generic 'unreachable'"), so a
+    # substring check on it is red for the wrong reason against any correct
+    # implementation. Same self-referential-grep class 06-02 hit with
+    # `normalization_mapping` and 06-05 hit with `allclose`; solved the same way, by
+    # asserting the discriminating thing instead of weakening either message.
+    assert "rejected the call with gRPC status" in message, (
+        "the refusal did not come through the session's non-retryable branch, so the "
+        f"server's own diagnosis was not surfaced verbatim: {message!r}"
+    )
+    assert "FAILED_PRECONDITION" in message, (
+        "the refusal does not name FAILED_PRECONDITION. An 'unavailable' or 'unknown' "
+        "status would be retryable or indistinguishable from a transport fault, and "
+        f"RETRYABLE_CODES would then bury this message: {message!r}"
+    )
+    assert "attempts (last gRPC status" not in message, (
+        "the message carries the retry-EXHAUSTION wording, which means a non-retryable "
+        "FAILED_PRECONDITION was retried until the budget ran out and the server's own "
+        f"diagnosis was buried under a generic unreachable report: {message!r}"
+    )
+    assert elapsed < REFUSAL_BUDGET_S, (
+        f"the refusal took {elapsed:.1f}s, over the {REFUSAL_BUDGET_S}s budget. "
+        f"FAILED_PRECONDITION must not be retried — three handshake retries would each "
+        f"start another concurrent multi-GB weight load."
+    )
+
+    # The same refusal must be diagnosable from the SERVER side too, at ERROR level:
+    # an operator reading `docker logs` should not have to reconstruct it from a
+    # client traceback they may not have.
+    log = _container_logs_since(since)
+    assert "SAFE-01 guard: REFUSED" in log, (
+        f"the container log for the window opened at {since} carries no 'SAFE-01 guard: "
+        f"REFUSED' line, so the refusal is only visible client-side.\n  log window:\n{log}"
+    )
+    assert "SAFE-01/2" in log, (
+        f"the container log does not carry the SAFE-01/2 text.\n  log window:\n{log}"
+    )
+    assert any("ERROR" in line and "SAFE-01" in line for line in log.splitlines()), (
+        f"the refusal was not logged at ERROR level, so it is easy to miss in a healthy-"
+        f"looking log.\n  log window:\n{log}"
+    )
+
+    # T-06-18: the refusal must not wedge the server for subsequent clients.
+    recovered = LeRobotPolicySession(SERVER_ADDRESS)
+    try:
+        recovered.connect(_specs())
+        actions = recovered.infer(_synthetic_observation())
+    finally:
+        recovered.close()
+    assert len(actions) == EXPECTED_HORIZON, (
+        f"after a refused handshake a CORRECT handshake yielded {len(actions)} actions, "
+        f"expected {EXPECTED_HORIZON}. The refusal path wedged the server."
+    )
+    for i, timed in enumerate(actions):
+        assert tuple(timed.get_action().shape) == (EXPECTED_ACTION_DIM,), (
+            f"post-refusal action {i} has shape {tuple(timed.get_action().shape)}, "
+            f"expected ({EXPECTED_ACTION_DIM},)"
+        )

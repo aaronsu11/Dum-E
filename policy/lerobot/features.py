@@ -64,8 +64,11 @@ ROBOT_STATE_KEYS: tuple[str, ...] = (
 CAMERA_KEYS: tuple[str, ...] = ("wrist", "front")
 
 #: Camera frame geometry. 480x640 is the size ``scripts/test_live_policy_server.py``
-#: already uses and the size PAR-05's recorded ``(256, 340, 3)`` verdict is
-#: measured at — do not "simplify" it to a square.
+#: already uses and the size PAR-05's verdicts are measured at — do not
+#: "simplify" it to a square. The served pipeline now forces the letterbox pad
+#: so this frame preprocesses to ``(256, 256, 3)``, matching the checkpoint's
+#: training-time geometry; unpatched upstream would yield ``(256, 340, 3)``.
+#: See ``docs/LEROBOT-SERVING-VERDICTS.md``.
 FRAME_HEIGHT: int = 480
 FRAME_WIDTH: int = 640
 

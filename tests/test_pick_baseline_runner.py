@@ -392,6 +392,71 @@ def test_an_ordinary_failed_attempt_does_not_void_the_series(exception):
 # ---------------------------------------------------------------------------
 
 
+def test_port_defaults_to_the_selected_backends_own_default(monkeypatch):
+    """``--port`` must NOT hardcode groot-native's ZMQ 5555 (WR-01).
+
+    ``policy/lerobot/backend.py:59-62`` keeps the two ports deliberately distinct
+    because "one shared key for both backends is the wrong-port trap this pair
+    exists to avoid", and the backend resolves
+    ``port if port is not None else os.getenv(PORT_ENV_VAR, 8080)`` — so an explicit
+    kwarg always wins. A hardcoded 5555 default therefore made
+    ``run_pick_baseline.py --backend lerobot`` dial 5555 and silently ignore both
+    ``DUME_LEROBOT_POLICY_PORT`` and ``controller.lerobot_policy_port``, surfacing
+    as "unreachable at localhost:5555" — a dead-server report for a
+    misconfiguration.
+
+    Asserted at both ends: the parser default, and the port the backend actually
+    resolves through the real factory.
+    """
+    import os
+
+    from policy.factory import POLICY_BACKEND_ENV_VAR, make_policy_backend
+    from policy.lerobot.backend import DEFAULT_PORT, PORT_ENV_VAR
+
+    args = runner.build_parser().parse_args(
+        ["--instruction", "pick up the banana", "--backend", "lerobot"]
+    )
+    assert args.port is None, (
+        "--port carries a hardcoded default, so it is forwarded unconditionally and "
+        "overrides whichever backend-specific port the operator configured"
+    )
+
+    monkeypatch.setenv(POLICY_BACKEND_ENV_VAR, "lerobot")
+    monkeypatch.delenv(PORT_ENV_VAR, raising=False)
+
+    # This mirrors run_pick_baseline's own construction: forward `port` only when
+    # the operator named one.
+    kwargs = {"host": "127.0.0.1", "language_instruction": args.instruction}
+    if args.port is not None:
+        kwargs["port"] = args.port
+    backend = make_policy_backend(**kwargs)
+    try:
+        assert backend._port == DEFAULT_PORT == 8080
+    finally:
+        backend.close()
+
+    # The env var still reaches it -- that is the channel the unconditional kwarg
+    # was silently overriding.
+    monkeypatch.setenv(PORT_ENV_VAR, "9099")
+    backend = make_policy_backend(**kwargs)
+    try:
+        assert backend._port == 9099
+    finally:
+        backend.close()
+
+    # And an EXPLICIT --port still wins, so the fix did not remove the override.
+    explicit = runner.build_parser().parse_args(
+        ["--instruction", "pick up the banana", "--backend", "lerobot", "--port", "7001"]
+    )
+    assert explicit.port == 7001
+    backend = make_policy_backend(**{**kwargs, "port": explicit.port})
+    try:
+        assert backend._port == 7001
+    finally:
+        backend.close()
+    assert os.environ[PORT_ENV_VAR] == "9099", "the explicit kwarg must beat the env var"
+
+
 def test_backend_selection_sets_the_env_var_when_it_is_unset(monkeypatch):
     from policy.factory import POLICY_BACKEND_ENV_VAR
 

@@ -1010,11 +1010,20 @@ def preflight(args: argparse.Namespace, counter: ClampWarningCounter) -> Tuple[D
         from policy.factory import make_policy_backend
         from shared import IPolicyBackend
 
-        backend = make_policy_backend(
-            host=args.host,
-            port=args.port,
-            language_instruction=args.instruction,
-        )
+        # `port` is forwarded ONLY when the operator named one. An explicit kwarg
+        # always wins over DUME_LEROBOT_POLICY_PORT / controller.lerobot_policy_port
+        # (backend.py:102), so passing args.port unconditionally made
+        # `--backend lerobot` dial groot-native's ZMQ 5555 and silently ignore both
+        # config channels — the exact wrong-port trap the two distinct keys exist to
+        # prevent, surfacing as "unreachable at localhost:5555" rather than as the
+        # misconfiguration it is.
+        backend_kwargs: dict[str, Any] = {
+            "host": args.host,
+            "language_instruction": args.instruction,
+        }
+        if args.port is not None:
+            backend_kwargs["port"] = args.port
+        backend = make_policy_backend(**backend_kwargs)
         if not isinstance(backend, IPolicyBackend):
             raise TypeError(f"selector returned a {type(backend).__name__}, not an IPolicyBackend")
         evidence["backend_selection"] = selection
@@ -1036,7 +1045,11 @@ def preflight(args: argparse.Namespace, counter: ClampWarningCounter) -> Tuple[D
     context["backend"] = backend
 
     # 4 — server reachability ----------------------------------------------
-    print(head(f"policy server reachability — {args.host}:{args.port}"))
+    # Do NOT restate a number here that may not be the one dialled: with --port
+    # omitted the backend resolves its own default, and the effective value is logged
+    # by the backend's own one-line constructor log (D-11).
+    dialled = args.port if args.port is not None else f"<{args.backend} default>"
+    print(head(f"policy server reachability — {args.host}:{dialled}"))
     if backend is None:
         print(_red("  FAIL: no backend to ping (the selector did not return one)"))
         checks["server_reachable"] = False
@@ -1254,7 +1267,16 @@ def build_parser() -> argparse.ArgumentParser:
         "inference call. It is the only controlled variable of this baseline.",
     )
     parser.add_argument("--host", default="localhost", help="Policy server host.")
-    parser.add_argument("--port", type=int, default=5555, help="Policy server port.")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Policy server port. Default: the SELECTED BACKEND's own default — 5555 "
+        "for groot-native's ZMQ, DUME_LEROBOT_POLICY_PORT (or 8080) for lerobot. The "
+        "two ports are deliberately distinct (policy/lerobot/backend.py:59-62), and "
+        "an explicit kwarg always beats the env var, so a hardcoded default here "
+        "would dial 5555 for --backend lerobot and report it as a dead server.",
+    )
     parser.add_argument(
         "--backend",
         default=DEFAULT_BACKEND,

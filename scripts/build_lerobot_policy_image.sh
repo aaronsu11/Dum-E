@@ -91,11 +91,19 @@ if [ ! -f "$DOCKERFILE" ]; then
   exit 1
 fi
 
+# == the tag the build writes FIRST, before the post-build assertion below has
+# passed. The operator-facing $IMAGE_TAG is applied only afterwards, so "refusing
+# to tag" is literally what happens on a mismatch rather than a message printed
+# after the tag already moved — and the previously-good $IMAGE_TAG keeps pointing
+# at the last image that DID carry the pinned snapshot.
+STAGING_TAG="${IMAGE_TAG}:unverified"
+
 echo "Building $IMAGE_TAG"
 echo "  lerobot pin        : $LEROBOT_PIN"
 echo "  backbone model     : $BACKBONE_MODEL"
 echo "  backbone revision  : $BACKBONE_REVISION"
 echo "  dockerfile         : $DOCKERFILE"
+echo "  staging tag        : $STAGING_TAG"
 
 # --secret id=hf_token,env=HF_TOKEN, never --build-arg: a --build-arg lands in
 # the image history and `docker image inspect` would show it.
@@ -105,10 +113,62 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg "BACKBONE_MODEL=$BACKBONE_MODEL" \
   --build-arg "BACKBONE_REVISION=$BACKBONE_REVISION" \
   -f "$DOCKERFILE" \
-  -t "$IMAGE_TAG" \
+  -t "$STAGING_TAG" \
   .
 
+echo "Built staging image: $STAGING_TAG"
+
+# ==================== POST-BUILD IN-IMAGE SNAPSHOT ASSERTION ====================
+# This is the analogue of build_gr00t_image.sh:54-61's HEAD check, transposed from
+# a git SHA to an HF revision SHA — the same fail-closed shape and the same
+# `ERROR: ... — refusing to ...` + `exit 1` message shape, applied to the half of
+# this script's reproducibility anchor that lives in an image layer rather than in
+# a clone.
+#
+# Why it is worth a whole extra container start: without it, a STALE image is
+# INDISTINGUISHABLE from a current one at inference time. The pre-cache layer's own
+# assertions ran during the build that produced them, so a layer cached from an
+# older BACKBONE_REVISION satisfies them and is then silently reused. And because
+# _build_n1_7_processor accepts no `revision` argument
+# (processor_groot.py:1369-1381), nothing downstream can notice: the image's HF
+# cache contents plus HF_HUB_OFFLINE=1 are the ONLY available enforcement (D-08).
+#
+# It runs INSIDE the freshly built image rather than inspecting the host
+# filesystem, because the host's HF cache is not what the container reads — the
+# claim being checked is about this image.
+#
+# Scope, stated so it is not overread: this proves the image carries the revision
+# THIS script pinned. It is DRIFT protection, not provenance — the SHA is the
+# repo's current revision, not a recovered training-time revision (see the
+# BACKBONE_REVISION comment above).
+echo "Asserting the pinned backbone snapshot is inside $STAGING_TAG ..."
+if ! docker run --rm \
+  -e "EXPECT_BACKBONE_REVISION=$BACKBONE_REVISION" \
+  --entrypoint python3 "$STAGING_TAG" -c '
+import os
+import sys
+from pathlib import Path
+
+from huggingface_hub.constants import HF_HUB_CACHE
+
+revision = os.environ["EXPECT_BACKBONE_REVISION"]
+snapshots = Path(HF_HUB_CACHE) / "models--nvidia--Cosmos-Reason2-2B" / "snapshots"
+found = sorted(p.name for p in snapshots.iterdir() if p.is_dir()) if snapshots.is_dir() else []
+target = snapshots / revision
+if not revision or not target.is_dir() or not any(target.iterdir()):
+    sys.exit(
+        f"asserted revision {revision!r} is not a non-empty snapshot directory under "
+        f"{snapshots}; revisions found in the image: {found}"
+    )
+print(f"In-image backbone snapshot OK: {target}")
+'; then
+  echo "ERROR: backbone snapshot $BACKBONE_REVISION not found in image $IMAGE_TAG — refusing to tag." >&2
+  echo "       The staging image is left as $STAGING_TAG for inspection, and $IMAGE_TAG still" >&2
+  echo "       points at the last image that DID carry the pinned snapshot." >&2
+  exit 1
+fi
+
+docker tag "$STAGING_TAG" "$IMAGE_TAG"
+# Untag the staging name only; the image itself now lives under $IMAGE_TAG.
+docker rmi "$STAGING_TAG" >/dev/null
 echo "Built image: $IMAGE_TAG"
-# Plan 06-06 adds the post-build in-image snapshot assertion here (run the image
-# and confirm the cached snapshot directory equals $BACKBONE_REVISION), plus the
-# entrypoint runtime check that pairs with it.

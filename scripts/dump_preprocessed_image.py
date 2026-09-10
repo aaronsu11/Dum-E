@@ -266,7 +266,21 @@ def _red(s: str) -> str:
 class Checks:
     """Numbered-check PASS/FAIL harness with a ``passed == total`` exit contract.
 
-    Shape copied from ``scripts/capture_frozen_corpus.py:144-173``.
+    Shape copied from ``scripts/capture_frozen_corpus.py:144-173``, and carrying the
+    SAME repudiation fix as ``docker/lerobot-policy/entrypoint.py``'s copy (T-06-37,
+    commit ``fb5ae11``). The two contracts are deliberately identical; do not resync
+    either back to the original.
+
+    The hole the fix closes: gating on ``passed == len(self.results)`` counts every
+    *recorded* check, so a check DELETED from ``main()`` records nothing, the rest all
+    pass, and the probe prints ``8/8 checks passed`` and exits 0 — indistinguishable
+    from a probe that genuinely measured everything. That matters more here than in the
+    entrypoint, because ``docs/LEROBOT-SERVING-VERDICTS.md`` cites "**9/9** checks
+    PASS, exit 0" as the evidence behind the PAR-05 geometry verdict, and this class is
+    what produces that line for BOTH probes (``dump_gr00t_native_preprocessed_image.py``
+    imports it).
+
+    ``report()`` therefore additionally requires ``len(self.results) == self.total``.
     """
 
     def __init__(self, total: int) -> None:
@@ -294,8 +308,23 @@ class Checks:
         for name, ok in self.results.items():
             print(f"  {_green('PASS') if ok else _red('FAIL')}  {name}")
         print(f" {passed}/{len(self.results)} checks passed")
+        # A check that never RAN is reported distinctly from a check that FAILED: the
+        # two demand different responses (a code defect in main() vs a real geometry
+        # drift), and conflating them is the repudiation failure T-06-37 names.
+        # Early-return failure paths legitimately record fewer than `total`, but they
+        # already carry a FAIL and so exit non-zero via the `passed` clause below.
+        missing = self.total - len(self.results)
+        if missing > 0 and passed == len(self.results):
+            print(
+                _red(
+                    f"  FAIL: {missing} of {self.total} check(s) never ran. Every "
+                    "recorded check passed, so this is not a geometry drift — a check "
+                    "was removed from main() or `total` disagrees with it. Refusing to "
+                    "report a verdict from an incomplete probe."
+                )
+            )
         print("=" * 72)
-        return 0 if passed == len(self.results) else 1
+        return 0 if passed == len(self.results) == self.total else 1
 
 
 # --- The recipe, read from the checkpoint -------------------------------------

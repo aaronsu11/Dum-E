@@ -108,6 +108,7 @@ from dump_preprocessed_image import (  # noqa: E402
     SOURCE_HEIGHT,
     SOURCE_WIDTH,
     CAMERA_KEYS as PROBE_CAMERA_KEYS,
+    Checks,
     USE_ALBUMENTATIONS,
     build_serving_preprocessor,
     checkpoint_recipe,
@@ -221,6 +222,74 @@ def test_serving_pipeline_carries_the_forced_letterbox_pad():
     assert served["shortest_image_edge"] == SHORTEST_IMAGE_EDGE
     assert served["image_crop_size"] == IMAGE_CROP_SIZE
     assert served["image_target_size"] == IMAGE_TARGET_SIZE
+
+
+def test_probe_refuses_to_report_a_verdict_when_a_check_never_runs():
+    """A vanished probe check FAILS; it is not silently absent (WR-07 / T-06-37).
+
+    This is the MIRROR of ``test_preflight_refuses_when_a_check_never_runs``. The
+    T-06-37 fix landed in ``docker/lerobot-policy/entrypoint.py``'s ``Checks`` copy
+    (commit ``fb5ae11``) but not in this one — the copy whose output IS the committed
+    geometry verdict: ``docs/LEROBOT-SERVING-VERDICTS.md`` cites "9/9 checks PASS,
+    exit 0" for BOTH probes, and ``scripts/dump_gr00t_native_preprocessed_image.py``
+    imports this very class. Under the unfixed contract, deleting a check from
+    ``main()`` printed ``8/8 checks passed`` and exited 0.
+
+    Both halves are pinned, because asserting only the happy path is how this
+    regressed in the first place.
+    """
+    complete = Checks(3)
+    for i in range(3):
+        complete.start(f"check {i}")
+        complete.ok(f"name-{i}", "fine")
+    assert complete.report() == 0
+
+    # One check never ran. Every RECORDED check passed, so the original contract
+    # returned 0 here -- that is precisely the hole.
+    truncated = Checks(3)
+    for i in range(2):
+        truncated.start(f"check {i}")
+        truncated.ok(f"name-{i}", "fine")
+    assert truncated.report() != 0, (
+        "a probe missing a check must refuse to report a verdict; every recorded "
+        "check passing is not evidence that every expected check ran"
+    )
+
+    # A recorded failure still fails, so the new clause did not replace the old one.
+    failing = Checks(2)
+    failing.start("check 0")
+    failing.ok("name-0", "fine")
+    failing.start("check 1")
+    failing.fail("name-1", "nope")
+    assert failing.report() != 0
+
+
+def test_both_probe_harnesses_share_one_checks_contract():
+    """The two probes' ``9/9`` verdicts come from ONE class, and its contract matches
+    the container entrypoint's.
+
+    ``dump_gr00t_native_preprocessed_image.py`` imports ``Checks`` from
+    ``dump_preprocessed_image``, so there is one definition behind both recorded
+    verdicts. The entrypoint holds a genuinely separate copy (``scripts/`` does not
+    exist inside the image), and the two must agree on the exit contract — the
+    ``fb5ae11`` fix landing in one and not the other is what WR-07 reports.
+    """
+    import dump_gr00t_native_preprocessed_image as native  # noqa: PLC0415
+
+    assert native.Checks is Checks
+
+    entrypoint_source = (
+        REPO_ROOT / "docker" / "lerobot-policy" / "entrypoint.py"
+    ).read_text(encoding="utf-8")
+    probe_source = (REPO_ROOT / "scripts" / "dump_preprocessed_image.py").read_text(
+        encoding="utf-8"
+    )
+    contract = "return 0 if passed == len(self.results) == self.total else 1"
+    assert entrypoint_source.count(contract) == 1, "the entrypoint's exit contract moved"
+    assert probe_source.count(contract) == 1, (
+        "the probe harness no longer carries the same exit contract as the container "
+        "entrypoint's copy; a check deleted from main() would report a verdict"
+    )
 
 
 def test_probe_geometry_matches_the_client_handshake_definition():

@@ -486,11 +486,38 @@ class DumEGrootPolicyServer(PolicyServer):
     """Composition-only ``PolicyServer`` subclass. Every override calls ``super()``
     or a public/protected upstream helper — never a patch, never a fork."""
 
-    #: The cameras this server serves, and their frame geometry. These must agree
-    #: with ``policy/lerobot/features.py``'s ``CAMERA_KEYS``/``FRAME_*`` on the
-    #: client side: the client's ``lerobot_features`` decides which
-    #: ``observation.images.<cam>`` keys arrive, and ``config.input_features``
-    #: decides which ones are looked up. A disagreement is a ``KeyError``.
+    #: The cameras this server serves, and their frame geometry.
+    #:
+    #: **PINNED COPIES, and ``policy/lerobot/features.py`` is the DEFINITION** —
+    #: ``CAMERA_KEYS``, ``FRAME_HEIGHT``, ``FRAME_WIDTH`` and
+    #: ``len(ROBOT_STATE_KEYS)`` there. They are copied rather than imported for a
+    #: mechanical reason: the Dockerfile copies ``policy_guard/`` and
+    #: ``docker/lerobot-policy/*.py`` into the image, not ``policy/``, so there is
+    #: nothing to import from inside the container.
+    #: ``tests/test_container_contract.py``
+    #: ::test_container_camera_and_frame_geometry_match_the_client_handshake asserts
+    #: the copies against the definition on every suite run — the same
+    #: pinned-copy-plus-keyless-cross-check idiom
+    #: ``scripts/dump_preprocessed_image.py`` uses for
+    #: ``SERVING_LETTER_BOX_TRANSFORM``.
+    #:
+    #: **The two halves of a disagreement fail DIFFERENTLY, and only one is loud.**
+    #: The client's ``lerobot_features`` decides which ``observation.images.<cam>``
+    #: keys arrive; ``config.input_features`` decides which are looked up and *what
+    #: they are resized to*:
+    #:
+    #: * a CAMERA-NAME disagreement is a ``KeyError`` in
+    #:   ``prepare_raw_observation`` — loud, immediate, unmissable;
+    #: * a FRAME-SIZE disagreement is **SILENT**. ``config.input_features``'
+    #:   declared shape feeds ``policy_image_features``, and
+    #:   ``raw_observation_to_observation`` -> ``prepare_raw_observation``
+    #:   *resizes* every incoming frame to it (``helpers.py:165-168``). That is
+    #:   blocker 3's mechanism exactly: a client/server frame-size drift silently
+    #:   reintroduces the aspect-ratio corruption this module says it prevents,
+    #:   with correct shapes end to end and every log line looking healthy. It is
+    #:   shape-INVISIBLE downstream too, because the forced letterbox pad squares
+    #:   every input. The keyless equality test above is therefore the ONLY
+    #:   detector for that half.
     CAMERA_KEYS: tuple[str, ...] = ("wrist", "front")
     FRAME_HEIGHT: int = 480
     FRAME_WIDTH: int = 640

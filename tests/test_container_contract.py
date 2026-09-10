@@ -981,6 +981,59 @@ def _load_container_server():
     return module
 
 
+def test_container_camera_and_frame_geometry_match_the_client_handshake():
+    """The server's declared geometry IS the client's, asserted ACROSS the boundary.
+
+    WR-06. ``docker/lerobot-policy/server.py`` states the requirement — its
+    ``CAMERA_KEYS``/``FRAME_*``/``STATE_DIM``/``ACTION_DIM`` "must agree with
+    ``policy/lerobot/features.py``" — but nothing asserted it, and the values cannot
+    be imported: the Dockerfile copies ``policy_guard/`` and
+    ``docker/lerobot-policy/*.py`` into the image, not ``policy/``. So they are pinned
+    copies, and this is the keyless cross-check that keeps them from drifting (the
+    same idiom ``scripts/dump_preprocessed_image.py`` uses for
+    ``SERVING_LETTER_BOX_TRANSFORM``).
+
+    **The two halves fail differently, and this test exists for the quiet one.** The
+    client's ``lerobot_features`` decides which ``observation.images.<cam>`` keys
+    arrive; ``config.input_features`` decides which are looked up AND what they are
+    resized to. A camera-NAME disagreement is a loud ``KeyError`` in
+    ``prepare_raw_observation``. A frame-SIZE disagreement is silent:
+    ``raw_observation_to_observation`` -> ``prepare_raw_observation`` *resizes* every
+    incoming frame to the declared shape (``helpers.py:165-168``), which is blocker
+    3's mechanism — so a drift reintroduces the aspect-ratio corruption the module
+    says it prevents, with correct shapes end to end. It is shape-invisible
+    downstream too, because the forced pad squares every input. Nothing else in the
+    suite would notice.
+    """
+    server_module = _load_container_server()
+    server = server_module.DumEGrootPolicyServer
+
+    assert tuple(server.CAMERA_KEYS) == tuple(features.CAMERA_KEYS), (
+        f"server CAMERA_KEYS {tuple(server.CAMERA_KEYS)} != client "
+        f"{tuple(features.CAMERA_KEYS)}; a name disagreement is a KeyError in "
+        "prepare_raw_observation"
+    )
+    assert (server.FRAME_HEIGHT, server.FRAME_WIDTH) == (
+        features.FRAME_HEIGHT,
+        features.FRAME_WIDTH,
+    ), (
+        f"server frame geometry ({server.FRAME_HEIGHT}, {server.FRAME_WIDTH}) != client "
+        f"({features.FRAME_HEIGHT}, {features.FRAME_WIDTH}). This one is SILENT: the "
+        "server resizes every incoming frame to its own declared shape, so the aspect "
+        "ratio is corrupted with correct shapes end to end"
+    )
+    assert server.STATE_DIM == server.ACTION_DIM == len(features.ROBOT_STATE_KEYS) == 6
+
+    # And the client's own handshake payload really declares that geometry, so the
+    # comparison is against the bytes on the wire rather than two constants that
+    # happen to match.
+    built = features.build_lerobot_features()
+    for cam in server.CAMERA_KEYS:
+        key = f"observation.images.{cam}"
+        assert key in built, f"{key} is not in the handshake features: {sorted(built)}"
+        assert tuple(built[key]["shape"])[:2] == (server.FRAME_HEIGHT, server.FRAME_WIDTH)
+
+
 class _AbortRaised(Exception):
     """What a real ``ServicerContext.abort`` does: terminate by raising."""
 

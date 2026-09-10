@@ -221,8 +221,24 @@ EXPECTED_CORRUPTED_SHAPE = (256, 256, 3)
 #: which makes it look aspect-independent and is exactly why the frame size is pinned
 #: here: the padded square's CONTENT — how much of the frame is image and how much is
 #: zero padding — still depends entirely on 480x640, and that is what the VLM sees.
+#:
+#: **PINNED COPIES of ``policy/lerobot/features.py``'s ``FRAME_HEIGHT``/``FRAME_WIDTH``**,
+#: for the same reason :data:`SERVING_LETTER_BOX_TRANSFORM` above is a copy: this module is
+#: also imported inside the ``gr00t:latest`` container by
+#: ``scripts/dump_gr00t_native_preprocessed_image.py``, where ``policy`` and the ``lerobot``
+#: it imports do not exist, so a module-scope import here would make the cross-backend probe
+#: unrunnable. ``test_probe_geometry_matches_the_client_handshake_definition`` asserts the
+#: copies against the definition on every suite run.
 SOURCE_HEIGHT = 480
 SOURCE_WIDTH = 640
+
+#: The cameras the SERVING pipeline is built for. A THIRD pinned copy of
+#: ``policy/lerobot/features.py``'s ``CAMERA_KEYS`` (``docker/lerobot-policy/server.py``
+#: holds the second), named rather than inlined so the same keyless cross-check can reach
+#: it. Order is irrelevant to THIS probe — it only decides which ``input_features`` keys
+#: exist so the built pipeline is the served one — but the NAMES are not: a rename would
+#: build a pipeline for cameras the server does not serve.
+CAMERA_KEYS: tuple[str, ...] = ("wrist", "front")
 
 #: The edge ``from_pretrained``'s placeholder feature squares every camera to.
 PLACEHOLDER_EDGE = 224
@@ -411,7 +427,7 @@ def build_serving_preprocessor(checkpoint_dir: Path = CHECKPOINT_DIR) -> Any:
         f"{OBS_IMAGES}.{cam}": PolicyFeature(
             type=FeatureType.VISUAL, shape=(3, SOURCE_HEIGHT, SOURCE_WIDTH)
         )
-        for cam in ("wrist", "front")
+        for cam in CAMERA_KEYS
     }
     config.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(6,))
     config.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(6,))}

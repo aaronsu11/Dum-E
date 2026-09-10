@@ -107,6 +107,7 @@ from dump_preprocessed_image import (  # noqa: E402
     SHORTEST_IMAGE_EDGE,
     SOURCE_HEIGHT,
     SOURCE_WIDTH,
+    CAMERA_KEYS as PROBE_CAMERA_KEYS,
     USE_ALBUMENTATIONS,
     build_serving_preprocessor,
     checkpoint_recipe,
@@ -220,6 +221,30 @@ def test_serving_pipeline_carries_the_forced_letterbox_pad():
     assert served["shortest_image_edge"] == SHORTEST_IMAGE_EDGE
     assert served["image_crop_size"] == IMAGE_CROP_SIZE
     assert served["image_target_size"] == IMAGE_TARGET_SIZE
+
+
+def test_probe_geometry_matches_the_client_handshake_definition():
+    """The probe's THIRD copy of the camera keys and frame size tracks the definition.
+
+    WR-06. ``policy/lerobot/features.py`` is the definition; this module and
+    ``docker/lerobot-policy/server.py`` each hold a pinned copy, for the same reason
+    :data:`SERVING_LETTER_BOX_TRANSFORM` is a copy — this module is imported inside the
+    ``gr00t:latest`` container by ``scripts/dump_gr00t_native_preprocessed_image.py``,
+    where ``policy`` and ``lerobot`` do not exist, so a module-scope import would make
+    the cross-backend probe unrunnable.
+
+    Why it matters HERE specifically: the probe builds the real serving preprocessor
+    from ``config.input_features``, and those features carry the camera NAMES and the
+    frame SIZE. A drift would make the measured verdict describe a pipeline the server
+    does not run, while every number in the manifest still looked self-consistent.
+    """
+    from policy.lerobot import features
+
+    assert (SOURCE_HEIGHT, SOURCE_WIDTH) == (features.FRAME_HEIGHT, features.FRAME_WIDTH)
+    assert set(PROBE_CAMERA_KEYS) == set(features.CAMERA_KEYS), (
+        f"the probe builds a pipeline for {tuple(PROBE_CAMERA_KEYS)} but the handshake "
+        f"declares {tuple(features.CAMERA_KEYS)}"
+    )
 
 
 def test_serving_letterbox_constant_matches_the_guards_definition():

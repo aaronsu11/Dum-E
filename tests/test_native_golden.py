@@ -59,6 +59,15 @@ def setup(workspace, *, session="test-session", attention="sdpa"):
     profiles_digest = digest(read_json(workspace / "profiles.json"))
     for name in ("repeatability.json", "tolerance-proposal.json", "calibration.json"):
         rewrite(workspace, name, lambda value: value.update(profiles_fingerprint=profiles_digest, session=session))
+    # Rebuild the measured worker basis after changing the native operational profile.
+    # The shared gate now checks all repeatability worker profiles and argv.
+    from test_parity_gate import fabricated_repeats
+    ev = api().Evidence(workspace, test_only=True)
+    repeated, _ = fabricated_repeats(ev, {
+        **ev.identity(), "schema_version": 1, "evidence_kind": "test_only", "status": "complete",
+        "started_at": ts(3), "ended_at": ts(4),
+    }, prefix="TEST_ONLY-golden-repeat")
+    rewrite(workspace, "repeatability.json", lambda value: (value.clear(), value.update(repeated)))
     repeat_ref = {"path": "repeatability.json", "sha256": hashlib.sha256((workspace / "repeatability.json").read_bytes()).hexdigest()}
     rewrite(workspace, "tolerance-proposal.json", lambda value: value.update(repeatability=repeat_ref))
     review(workspace, "tolerances", 10)
@@ -533,3 +542,144 @@ def test_change_during_collection_retains_complete_worker_but_fails_candidate(tm
     record = read_json(tmp_path / "golden-candidate.json")
     assert record["status"] == "failed"
     assert len(read_json(tmp_path / record["worker"]["manifest"]["path"])["cases"]) == 600
+
+
+
+def test_review_redated_candidate_cases_cannot_erase_actual_replay_drift(tmp_path):
+    lifecycle(tmp_path)
+    assert run(tmp_path, "verify", worker=HermeticWorker(offset=1), second=40,
+               extra=["--stage", "pre-live"]) == 1
+    assert run(tmp_path, "check", second=50, extra=["--stage", "pre-live"]) == 1
+    ev = api().Evidence(tmp_path, test_only=True)
+    candidate = ev.json("golden-candidate.json")
+    original = {name: (tmp_path / name).read_bytes() for name in
+                ("golden-candidate.json", "golden-approval.json", "golden-manifest.json")}
+    worker = copy.deepcopy(ev.json(candidate["worker"]["manifest"]))
+    case_bytes = {row["evidence"]["path"]: ev.bytes(row["evidence"]) for row in worker["cases"]}
+    worker.update(started_at=ts(41), ended_at=ts(42))
+    wrapper = write_evidence(tmp_path, "workers/TEST_ONLY-redated-candidate.json", worker)
+    rewrite(tmp_path, "golden-replay.json", lambda record: record.update(
+        status="complete", prerequisite_errors=[], tensors=candidate["tensors"],
+        worker={"status": "complete", "exit_code": 0, "manifest": wrapper},
+    ))
+    assert run(tmp_path, "check", second=50, extra=["--stage", "pre-live"]) == 1, (
+        "Redating a summary must not turn old candidate cases into fresh replay"
+    )
+    assert all((tmp_path / name).read_bytes() == data for name, data in original.items())
+    assert all((tmp_path / name).read_bytes() == data for name, data in case_bytes.items())
+
+
+def production_probe_fixture(root):
+    # Production host probe with TEST_ONLY files and a Docker process stand-in.
+    from policy_guard.replay_contract import BACKBONE_REVISION, canonical
+    from scripts import pose_sweep_units_probe as calibration
+    workspace, corpus, checkpoint = (root / name for name in ("workspace", "corpus", "checkpoint"))
+    for directory in (workspace, corpus, checkpoint):
+        directory.mkdir(parents=True)
+    records = []
+    for index in range(120):
+        name = f"record_{index:04d}.npz"
+        (corpus / name).write_bytes(f"TEST_ONLY hash fixture {index}".encode())
+        records.append({"file": name, "seeds": [0, 1, 2, 3, 4], "instruction": "TEST_ONLY"})
+    write_evidence(corpus, "manifest.json", {
+        "TEST_ONLY": True, "records": records, "record_count": 120,
+        "seed_verdict": "not-honored", "seed_options_sent": True, "frame_shape": [480, 640, 3],
+        "action_modality_layout": {"single_arm": [0, 5], "gripper": [5, 6]},
+    })
+    for name in ("config.json", "processor_config.json", "statistics.json", "embodiment_id.json"):
+        write_evidence(checkpoint, name, {"TEST_ONLY": True})
+    write_evidence(checkpoint, "model.safetensors.index.json", {"TEST_ONLY": True, "weight_map": {}})
+    ticks, statistics = root / "TEST_ONLY-calibration.json", root / "TEST_ONLY-statistics.json"
+    ticks.write_bytes(canonical(calibration.CALIBRATION_TICK_RANGES))
+    statistics.write_bytes(canonical({"new_embodiment": {
+        "state": calibration.CHECKPOINT_STATE_STATS, "action": calibration.CHECKPOINT_ACTION_STATS}}))
+    record = calibration.derive_current_calibration(ticks, statistics)
+    record.update(session_id="TEST_ONLY", started_at=ts(1), ended_at=ts(2))
+    write_evidence(workspace, "session.json", {"schema_version": 1, "session_id": "TEST_ONLY"})
+    write_evidence(workspace, "calibration.json", record)
+    cache = root / "cache"
+    model = cache / "hub/models--nvidia--Cosmos-Reason2-2B"
+    snapshot_dir = model / "snapshots" / BACKBONE_REVISION
+    snapshot_dir.mkdir(parents=True)
+    (model / "refs").mkdir()
+    (model / "refs/main").write_text(BACKBONE_REVISION)
+    for name in ("config.json", "tokenizer_config.json", "tokenizer.json"):
+        write_evidence(snapshot_dir, name, {"TEST_ONLY": True, "asset": name})
+    (model / "blobs").mkdir()
+    (model / "blobs/TEST_ONLY").write_bytes(b"TEST_ONLY mounted model blob")
+    (snapshot_dir / "model.safetensors").symlink_to("../../blobs/TEST_ONLY")
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    docker = bin_dir / "docker"
+    expected = ["image", "inspect", "TEST_ONLY_IMAGE", "--format", "{{.Id}}"]
+    image = "sha256:" + digest("TEST_ONLY_IMAGE")
+    docker.write_text(f"#!{sys.executable}\nimport sys\nassert sys.argv[1:] == {expected!r}\nprint({image!r})\n")
+    docker.chmod(0o700)
+    env = {"PATH": str(bin_dir), "PYTHONDONTWRITEBYTECODE": "1",
+           "PYTHONPATH": str(ROOT) + ":" + str(ROOT / "scripts")}
+    return {"workspace": workspace, "corpus": corpus, "checkpoint": checkpoint,
+            "cache": cache, "snapshot": snapshot_dir, "model": model, "env": env}
+
+
+def production_probe(fixture, *, cache=None):
+    # The corpus/checkpoint, calibration, sources and cache all use production hashing.
+    code = "\n".join([
+        "import json, sys", "from pathlib import Path", "from types import SimpleNamespace",
+        "from scripts.replay_native_golden import current_inputs",
+        "from policy_guard.replay_contract import PrerequisiteError",
+        "args = SimpleNamespace(workspace=Path(sys.argv[1]), corpus=Path(sys.argv[2]),",
+        "    checkpoint=Path(sys.argv[3]), native_cache=Path(sys.argv[4]), native_image=\"TEST_ONLY_IMAGE\")",
+        "try:", "    print(json.dumps(current_inputs(args), sort_keys=True))",
+        "except (PrerequisiteError, FileNotFoundError) as exc:",
+        "    print(json.dumps(dict(status=\"not_run\", message=str(exc))))", "    sys.exit(2)",
+        "except ValueError as exc:", "    print(json.dumps(dict(status=\"failed\", message=str(exc))))",
+        "    sys.exit(1)",
+    ])
+    result = subprocess.run([sys.executable, "-c", code, *map(str, (
+        fixture["workspace"], fixture["corpus"], fixture["checkpoint"], cache or fixture["cache"]))],
+        env=fixture["env"], cwd=ROOT, capture_output=True, text=True, timeout=30)
+    assert result.returncode in (0, 1, 2), result.stderr
+    assert result.stdout, result.stderr
+    return result.returncode, json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("asset", ["tokenizer.json", "config.json", "model.safetensors"])
+def test_review_production_probe_hashes_mounted_backbone_bytes(tmp_path, asset):
+    fixture = production_probe_fixture(tmp_path)
+    status, before = production_probe(fixture)
+    assert status == 0
+    (fixture["snapshot"] / asset).write_bytes(b"TEST_ONLY changed mounted bytes")
+    status, after = production_probe(fixture)
+    assert status == 0
+    assert digest(before) != digest(after), "Mounted backbone bytes must invalidate current identity"
+
+
+@pytest.mark.parametrize("problem", ["missing-tokenizer", "wrong-revision", "alternate-cache",
+                                     "escaping-blob", "dangling-blob"])
+def test_review_production_probe_rejects_unavailable_or_changed_cache(tmp_path, problem):
+    fixture = production_probe_fixture(tmp_path)
+    status, before = production_probe(fixture)
+    assert status == 0
+    cache = fixture["cache"]
+    if problem == "missing-tokenizer":
+        (fixture["snapshot"] / "tokenizer.json").unlink()
+    elif problem == "wrong-revision":
+        (fixture["model"] / "refs/main").write_text("TEST_ONLY_WRONG_REVISION")
+    elif problem == "alternate-cache":
+        cache = tmp_path / "alternate-cache"
+        shutil.copytree(fixture["cache"], cache, symlinks=True)
+        path = cache / fixture["snapshot"].relative_to(fixture["cache"]) / "tokenizer.json"
+        path.write_bytes(b"TEST_ONLY alternative tokenizer")
+    else:
+        link = fixture["snapshot"] / "model.safetensors"
+        link.unlink()
+        external = tmp_path / "TEST_ONLY-outside-blob"
+        if problem == "escaping-blob":
+            external.write_bytes(b"TEST_ONLY outside mounted model")
+        link.symlink_to(external)
+    status, after = production_probe(fixture, cache=cache)
+    if problem == "alternate-cache":
+        assert status == 0 and digest(before) != digest(after), "Selected mounted cache must be measured"
+    else:
+        assert status == (2 if problem in ("missing-tokenizer", "wrong-revision") else 1), (
+            "Missing or invalid mounted prerequisites must not produce a passing fingerprint")

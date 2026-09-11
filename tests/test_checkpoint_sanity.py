@@ -307,8 +307,7 @@ def approved_runner(workspace):
     fixtures.cli().prepare_live(gate.Evidence(workspace, test_only=True), review["path"], clock=clock)
     answers = iter(["Fixture operator", "Test-only decision", "approve"])
     fixtures.cli().record_decision(workspace, "live", prompt=lambda _: next(answers), clock=clock, test_only=True)
-    live = r.preflight(ev, stage="live", attempt=1, previous_preflight=review["path"], reason="Approved transition",
-                       runtime_source=source, clock=clock)
+    live = r.preflight(ev, stage="live", attempt=1, runtime_source=source, clock=clock)
     return live, source, clock
 
 
@@ -793,3 +792,14 @@ def test_controller_inputs_hash_and_consume_the_same_config_bytes(tmp_path, monk
     snapshot = r.controller_inputs(tmp_path)
     assert snapshot["config_sha256"] == r.hashlib.sha256(after).hexdigest()
     assert snapshot["controller"]["robot_port"] == "NEW", "settings must derive from the captured, hashed bytes"
+
+
+
+def test_renewal_requires_explicit_reason_before_any_new_request(tmp_path):
+    r, ev, live, source, clock, _, _, _ = setup_run(tmp_path)
+    request = source.current()["request"]
+    with pytest.raises(ValueError, match="reason"):
+        r.preflight(ev, stage="live", attempt=2, previous_preflight=live["path"],
+                    runtime_source=source, clock=clock)
+    assert source.current()["request"] == request
+    assert not (tmp_path / "preflights/live-0002.json").exists()

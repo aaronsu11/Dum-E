@@ -267,17 +267,34 @@ def armed_stop(stop):
         logger.remove(sink_id)
 
 
+def runtime_identity(runtime):
+    attestation = runtime["attestation"]
+    return {"instance": copy.deepcopy(attestation["instance"]),
+            "loaded_at": attestation["loaded_at"],
+            "configuration_fingerprint": attestation["configuration_fingerprint"],
+            "host": {k: v for k, v in runtime["host"].items() if k != "checked_at"}}
+
+
 class CheckedPolicy:
     language_instruction = INSTRUCTION
 
-    def __init__(self, policy, stop):
+    def __init__(self, policy, stop, *, runtime_source=None, runtime=None):
         self.policy, self.stop, self.iterations = policy, stop, 0
+        self.runtime_source = runtime_source
+        self.released_identity = runtime_identity(runtime) if runtime is not None else None
+
+    def _check_runtime(self):
+        if self.runtime_source is not None:
+            gate.require(runtime_identity(self.runtime_source.current()) == self.released_identity,
+                         "active trial runtime instance/load changed; explicit renewal required")
 
     def get_action(self, observation, instruction):
-        with self.stop.dispatch("policy.get_action"):
-            actions = self.policy.get_action(observation, instruction)
-        self.stop.check()
         try:
+            self._check_runtime()
+            with self.stop.dispatch("policy.get_action"):
+                actions = self.policy.get_action(observation, instruction)
+            self.stop.check()
+            self._check_runtime()
             gate.require(isinstance(actions, list) and len(actions) == ACTIONS,
                          "policy chunk must contain exactly 16 actions")
             for action in actions:
@@ -286,8 +303,9 @@ class CheckedPolicy:
                 gate.require(all(isinstance(value, (int, float, np.number)) and
                                  not isinstance(value, (bool, np.bool_)) and np.isfinite(value)
                                  for value in action.values()), "policy targets must be finite numbers")
-        except (TypeError, ValueError) as exc:
-            self.stop.trip(str(exc))
+        except Exception as exc:
+            if not self.stop.stopped:
+                self.stop.trip(str(exc) or type(exc).__name__)
             raise SafetyStop(str(exc)) from exc
         self.iterations += 1
         return actions
@@ -398,7 +416,9 @@ def run(workspace, *, preflight, preflight_attempt, runtime_source,
     live = ev.reference(preflight) if isinstance(preflight, str) else preflight
     gate.require(ev.test_only or (controller_factory is StopGuardedController and policy_factory is None and observe is None),
                  "injected hardware/policy/observations require explicit test_only evidence")
-    _release(ev, live, "live", runtime_source.current(), clock, runtime_source)
+    selected_runtime = runtime_source.current()
+    _release(ev, live, "live", selected_runtime, clock, runtime_source)
+    selected_identity = runtime_identity(selected_runtime)
     expected_settings = runtime_source.inputs()["controller"]
     if settings is not None:
         gate.require(settings == expected_settings, "controller settings differ from reviewed inputs")
@@ -408,6 +428,8 @@ def run(workspace, *, preflight, preflight_attempt, runtime_source,
     construction, rv = collect_preflight(ev, stage="run", attempt=preflight_attempt,
                                          runtime_source=runtime_source, previous=previous_preflight or live,
                                          reason=reason or "Approved construction preflight", clock=clock)
+    gate.require(runtime_identity(rv) == selected_identity,
+                 "runtime instance/load changed before construction; explicit renewal required")
     _release(ev, construction, "run", rv, clock, runtime_source)
     result = {**ev.identity(), "schema_version": 1,
               "evidence_kind": "test_only" if ev.test_only else "real_model",
@@ -430,9 +452,11 @@ def run(workspace, *, preflight, preflight_attempt, runtime_source,
                 reference, rv = collect_preflight(ev, stage=stage, attempt=1,
                                                   runtime_source=runtime_source, previous=previous,
                                                   reason="Fresh preflight before trial reset", clock=clock)
+                gate.require(runtime_identity(rv) == selected_identity,
+                             "runtime instance/load changed before trial; explicit renewal required")
                 _release(ev, reference, stage, rv, clock, runtime_source)
                 result["preflights"].append(reference)
-                checked = CheckedPolicy(policy, stop)
+                checked = CheckedPolicy(policy, stop, runtime_source=runtime_source, runtime=rv)
                 trial = {"index": index, "preflight": reference, "started_at": clock(),
                          "iterations": 0, "actions_per_chunk": ACTIONS, "action_delay": ACTION_DELAY,
                          "coherent": False, "wrong_target": False, "erratic": False, "grasp": False,
@@ -629,7 +653,11 @@ class RuntimeSource:
                         expected_configuration=gate.Evidence(source.workspace).json("profiles.json")["serving_configuration"],
                         now=utc_now(),
                     )
-                    source._runtime = {"attestation": attestation, "host": host, "request": request}
+                    observed = {"attestation": attestation, "host": host, "request": request}
+                    if source._runtime is not None:
+                        gate.require(runtime_identity(observed) == runtime_identity(source._runtime),
+                                     "runtime instance/load changed during inference; explicit renewal required")
+                    source._runtime = observed
                     return result
 
             class AttachedPolicy(LeRobotPolicyBackend):

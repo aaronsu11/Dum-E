@@ -1,5 +1,43 @@
 # Checkpoint parity: local numerical instrument
 
+## Physical review ready — 2026-09-11T22:54:59.431070+00:00
+
+Active evidence workspace: `corpus/phase7-small-gpu-20260911`. It is an explicitly documented immutable evidence view of the original session, with separate retry artifacts. `retry-evidence-view.json` preserves the failed launcher attempt and predecessor identities. The original strict report remains unchanged.
+
+- Relaxed physical-unit acceptance passed, SHA `7ec01b1dcf9605914fa81035df137aa2d26ff41a4a5d19720dde1e215346d3fd`.
+- Native reference candidate SHA `36431859e9d9b23923254b610842928b3815be08f816c78868dca6ec40b780a7`. Fresh 12-case GPU replay passed with raw/noise/decoded maximum error exactly zero, SHA `2c28a4876778e74b8a297e79f6c0a630c6ae9a5534231c7cd2f055f762448185`; runtime about 28 seconds. Includes 12 observer-control calls, no CPU model execution.
+- Pinned LeRobot serving image `sha256:6758186bd24cd0745b7442dafbb6680cbc2a986fe387eb2de5aaf0b75dce9c98` is running as `dume-milestone-serving-01`, loopback `127.0.0.1:8080`. No hardware devices are mounted. Fresh arm-free serving attestation passed, SHA `2ec5c8ba2d5283f3267982bb0f5ce60b9d8a37eaa8966296bde9b4a63d6a44e3`. Runtime snapshots use `runtime-live/lerobot.json` in this workspace.
+- Actual review preflight `preflights/review-0001.json` passed, SHA `f6a14f8e90710c675e53cc60f16c29fbc56127fa4fdb06e0f65ecae586b49e01`. Exact review bundle `release-review.json` SHA `04e12d94d1e31cdc3e284c77a3b9b00cef16d7a4a04c8184646be89d58f91244` is ready.
+- User reconnected the devices; `/dev/ttyACM0`, `/dev/video0`, `/dev/video2` are present. No controller has been constructed or connected; no robot motion occurred.
+- Next gate: explicit combined approval of this native reference and the fixed three-trial physical test, with operator present, banana in reach, clear workspace and accessible stop. The prior request to prepare/proceed is preserved, but no exact-bundle approval or presence confirmation is fabricated. After that decision, record it canonically, collect a fresh `live` preflight, then run the guarded physical protocol in a PTY so stop and per-trial observations remain interactive.
+
+Review and upcoming guarded commands (do not execute motion before that decision):
+
+```sh
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/approve_parity_evidence.py live --workspace corpus/phase7-small-gpu-20260911
+DUME_POLICY_BACKEND=lerobot UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/run_checkpoint_sanity.py preflight --workspace corpus/phase7-small-gpu-20260911 --stage live --attempt 1 --container dume-milestone-serving-01 --endpoint 127.0.0.1:8080 --attestation corpus/phase7-small-gpu-20260911/runtime-live/lerobot.json
+DUME_POLICY_BACKEND=lerobot UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/run_checkpoint_sanity.py run --workspace corpus/phase7-small-gpu-20260911 --preflight preflights/live-0001.json --preflight-attempt 1 --container dume-milestone-serving-01 --endpoint 127.0.0.1:8080 --attestation corpus/phase7-small-gpu-20260911/runtime-live/lerobot.json
+```
+
+Software validation: 11 scoped comparison/acceptance tests, 12 scoped native tests, 25 integration tests, 31 guard regressions passed. Read-only review found no blocking issue. The native launcher originally failed before model import on a Python3.10-incompatible eager host-helper import; that attempt is preserved, and the lazy-import fix passed the real GPU replay. Source commits: `25bd555`, `6c3da4b`, `71e35cf` (following reducer `96f95b1`). No fresh package install or upstream/model modification.
+
+## Current acceptance and physical-test preparation (2026-09-11)
+
+The operator reviewed the approximately one-degree discrepancy and explicitly asked to relax the milestone criteria and proceed to physical testing. The resulting `milestone-criteria-authorization.json` records this **retrospective** instruction. The original strict report remains failed and unchanged; the separate `milestone-acceptance.json` passes calibrated physical-unit limits.
+
+| Metric | Five arm joints | Gripper |
+|---|---|---|
+| Maximum absolute difference | 2 degrees | 1 normalized point |
+| Mean absolute difference | 0.5 degrees | 0.25 normalized points |
+| Absolute mean signed bias | 0.5 degrees | 0.25 normalized points |
+
+Measured arm maxima are 0.605–1.017 degrees, mean absolute differences 0.122–0.194 degrees, and maximum absolute signed bias 0.079 degrees. Gripper maximum is 0.1773 points. Raw/input representation differences and chunk-index slope remain diagnostics. These limits are acceptance criteria, not a collision-safety envelope or a measured Cartesian-error bound.
+
+The small native reference and one fresh 12-case GPU regression must validate before review readiness. A single explicit final review will bind the exact scoped native reference and the physical test together. No prior golden approval is fabricated. The physical protocol is three banana-directed trials of 20 × 16 actions each; at least two must move coherently toward the target, grasp optional. Existing calibration, runtime freshness, reset-inclusive zero-clamp checks and latched stops remain required. Operator presence, a clear workspace and accessible stop controls must be confirmed before construction/connection/reset. No hardware has been accessed during this preparation.
+
+The new release branch uses this explicitly declared milestone evidence. The archived exhaustive gate remains separate; it has not passed and will not be rerun on CPU. Implementation and validation details follow below as history.
+
+
 ## Active milestone scope: 12 observations, one seed (2026-09-11)
 
 The operator cancelled the exhaustive 7,200-inference matrix and prohibited CPU model inference, then explicitly selected **12 observations, one seed**. Select the middle stored observation from each of the 12 recorded episodes and its first locked seed. Both configurations use deployed GPU BF16. This section supersedes the exhaustive workflow documented below, which remains historical context.

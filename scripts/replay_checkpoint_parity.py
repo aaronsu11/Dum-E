@@ -45,14 +45,25 @@ def device_snapshot():
     return {"gpu": gpu, "compute_processes": processes, "meminfo": Path("/proc/meminfo").read_text()}
 
 
+def profile_device(args, purpose):
+    if purpose == "diagnostic":
+        return args.diagnostic_device or args.device
+    if purpose == "stock-capacity":
+        return args.stock_device or args.device
+    return args.device
+
+
 def worker_argv(args, backend, purpose, image, output, container_name):
+    device = profile_device(args, purpose)
     script = "/replay/scripts/replay_groot_native.py" if backend == "native" else "/replay/docker/lerobot-policy/replay_checkpoint.py"
     argv = [
         "docker", "run", "--rm", "--name", container_name, "--network", "none",
         "--read-only", "--memory", "24g", "--memory-swap", "24g",
         "--tmpfs", "/tmp:rw,size=2g",
     ]
-    if args.device.startswith("cuda"):
+    # Stock policy keeps its configured FlashAttention loader, which requires
+    # CUDA visibility even when measuring both resident models on the CPU.
+    if device.startswith("cuda") or purpose == "stock-capacity":
         argv += ["--gpus", "all"]
     # The only writable persistent mount is this explicit evidence workspace.
     for source, destination, mode in (
@@ -83,7 +94,7 @@ def worker_argv(args, backend, purpose, image, output, container_name):
         "--input-lock", "/evidence/input-lock.json", "--schedule", "/evidence/tracer-schedule.json",
         "--corpus", "/inputs/corpus", "--checkpoint", "/inputs/checkpoint",
         "--workspace", "/evidence", "--profile", purpose, "--output-manifest", output,
-        "--image-digest", image, "--device", args.device,
+        "--image-digest", image, "--device", device,
     ]
     return argv
 
@@ -105,7 +116,8 @@ def run_worker(args, backend, purpose, image, cases):
         "policy/lerobot/features.py",
     )}
     start = now()
-    print(f"Starting {label} on {args.device}", flush=True)
+    device = profile_device(args, purpose)
+    print(f"Starting {label} on {device}", flush=True)
     # Logs persist incrementally, including Docker/OOM failures before Python can write.
     log_path = contained(args.workspace, f"workers/{label}.log")
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,7 +153,7 @@ def run_worker(args, backend, purpose, image, cases):
             report, args.workspace, cases, expected_session=expected_session,
             input_lock=input_lock, backend=backend, purpose=purpose,
             checkpoint_fingerprint=input_lock["checkpoint_fingerprint"],
-            image_digest=image, source_files=source_files, device=args.device,
+            image_digest=image, source_files=source_files, device=device,
         )
     launch["manifest"] = {"path": output, "sha256": sha256_file(destination)}
     print(json.dumps({"worker": label, "status": launch["status"], "exit_code": exit_code}), flush=True)
@@ -177,7 +189,9 @@ def feasibility(args):
         write_evidence(args.workspace, "input-lock.json", lock)
         write_evidence(args.workspace, "tracer-schedule.json", {
             "schema_version": 1, "session": session["session_id"], "cases": cases,
-            "profiles": PROFILE_SCHEDULE, "observer_control": "same seed, same backend, capture disabled",
+            "profiles": PROFILE_SCHEDULE,
+            "devices": {purpose: profile_device(args, purpose) for _, purpose in PROFILE_SCHEDULE},
+            "observer_control": "same seed, same backend, capture disabled",
         })
         report["input_fingerprint"] = lock["fingerprint"]
         sources = {}
@@ -195,11 +209,11 @@ def feasibility(args):
             for backend, ref in (("native", args.native_image), ("lerobot", args.lerobot_image))
         }
         report["resources_before"] = device_snapshot()
-        if args.device.startswith("cuda") and report["resources_before"]["compute_processes"]:
+        if report["resources_before"]["compute_processes"]:
             raise PrerequisiteError("GPU already owned by a compute process; release it before an explicit new session")
         profiles = []
         for backend, purpose in PROFILE_SCHEDULE:
-            if args.device.startswith("cuda") and device_snapshot()["compute_processes"]:
+            if device_snapshot()["compute_processes"]:
                 raise PrerequisiteError("previous GPU owner still alive; sequential worker contract refused")
             launch, worker_report = run_worker(args, backend, purpose, images[backend], cases)
             report["workers"].append(launch)
@@ -232,6 +246,8 @@ def main():
         stage.add_argument("--workspace", type=Path, required=True)
         stage.add_argument("--record", default="record_0000.npz")
         stage.add_argument("--device", default="cuda:0", choices=("cuda:0", "cpu"))
+        stage.add_argument("--diagnostic-device", choices=("cuda:0", "cpu"), help="Explicit diagnostic override; operational device is unchanged")
+        stage.add_argument("--stock-device", choices=("cuda:0", "cpu"), help="Explicit device for the stock two-model capacity measurement")
         stage.add_argument("--native-image", default="gr00t:latest")
         stage.add_argument("--lerobot-image", default="lerobot-policy:latest")
         stage.add_argument("--native-cache", type=Path, default=Path.home() / ".cache/huggingface")

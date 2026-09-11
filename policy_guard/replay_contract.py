@@ -767,6 +767,13 @@ def worker_main(backend: str, adapter_factory, stock_loader=None) -> int:
         identity = runtime_identity(backend, args.image_digest, lock)
         report.resources["runtime_identity"] = identity
         report.resources["checkpoint_fp32_tensor_bytes"] = lock["checkpoint_fp32_tensor_bytes"]
+        report.resources["requested_device"] = args.device
+        report.resources["host_meminfo_before"] = Path("/proc/meminfo").read_text()
+        report.resources["cpu_model"] = next((line for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), "unavailable")
+        for name in ("memory.max", "memory.swap.max"):
+            path = Path("/sys/fs/cgroup") / name
+            if path.exists():
+                report.resources[name] = path.read_text().strip()
         report.resources["stock_two_model_tensor_lower_bound_bytes"] = lock["checkpoint_fp32_tensor_bytes"] * 3 // 2
         if args.device.startswith("cuda"):
             if not torch.cuda.is_available():
@@ -782,6 +789,15 @@ def worker_main(backend: str, adapter_factory, stock_loader=None) -> int:
                 raise ValueError("stock capacity belongs to native environment")
             models = stock_loader(Path(args.checkpoint), args.device)
             report.resources["resident_models"] = len(models)
+            report.resources["resident_model_storage"] = []
+            for loaded in models:
+                model = loaded if isinstance(loaded, torch.nn.Module) else loaded.model
+                parameters = list(model.parameters())
+                report.resources["resident_model_storage"].append({
+                    "devices": sorted({str(p.device) for p in parameters}),
+                    "dtypes": sorted({str(p.dtype) for p in parameters if p.is_floating_point()}),
+                    "parameter_bytes": sum(p.numel() * p.element_size() for p in parameters),
+                })
             report.status = "complete"
         else:
             adapter = adapter_factory(Path(args.checkpoint), args.profile, args.device)

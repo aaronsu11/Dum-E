@@ -384,3 +384,6 @@ def test_explicit_cpu_diagnostic_keeps_operational_cuda_and_arguments(tmp_path):
     assert "--gpus" not in diagnostic
     assert operational[operational.index("--device") + 1] == "cuda:0"
     assert operational[operational.index("--gpus") + 1] == "all"
+    stock = module.worker_argv(args, "native", "stock-capacity", "image", "worker.json", "test")
+    assert stock[stock.index("--device") + 1] == "cpu"
+    assert stock[stock.index("--gpus") + 1] == "all"

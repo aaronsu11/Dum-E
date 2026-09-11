@@ -369,3 +369,18 @@ def test_manifest_binds_exact_launcher_identity(tmp_path, corruption):
         report["profile_fingerprint"] = api.fingerprint_configuration(report["profile"])
     with pytest.raises(ValueError):
         api.validate_replay_manifest(report, tmp_path, expected, **identity)
+
+
+def test_explicit_cpu_diagnostic_keeps_operational_cuda_and_arguments(tmp_path):
+    from types import SimpleNamespace
+    module = importlib.import_module("scripts.replay_checkpoint_parity")
+    args = SimpleNamespace(
+        device="cuda:0", diagnostic_device="cpu", stock_device="cpu",
+        corpus=tmp_path, checkpoint=tmp_path, workspace=tmp_path, native_cache=tmp_path,
+    )
+    diagnostic = module.worker_argv(args, "native", "diagnostic", "image", "worker.json", "test")
+    operational = module.worker_argv(args, "native", "operational", "image", "worker.json", "test")
+    assert diagnostic[diagnostic.index("--device") + 1] == "cpu", "CPU diagnostic selection must reach the actual worker"
+    assert "--gpus" not in diagnostic
+    assert operational[operational.index("--device") + 1] == "cuda:0"
+    assert operational[operational.index("--gpus") + 1] == "all"

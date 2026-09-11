@@ -729,3 +729,61 @@ def test_calibration_bounds_reads_a_dataclass_and_a_plain_dict_alike():
     assert calibration_bounds(
         {"gripper": {"range_min": 2045, "range_max": 3486}}, "gripper"
     ) == (2045.0, 3486.0, 0)
+
+
+@pytest.fixture
+def derivation_inputs(tmp_path):
+    import json
+    calibration = tmp_path / 'calibration.json'
+    statistics = tmp_path / 'statistics.json'
+    calibration.write_text(json.dumps(CALIBRATION_TICK_RANGES))
+    statistics.write_text(json.dumps({'new_embodiment': {
+        'state': CHECKPOINT_STATE_STATS, 'action': CHECKPOINT_ACTION_STATS}}))
+    return calibration, statistics
+
+
+def test_derivation_requires_local_inputs(derivation_inputs):
+    calibration, statistics = derivation_inputs
+    calibration.unlink()
+    ok, notes = probe.check_pinned_constants_against_local_artifacts(
+        str(statistics), str(calibration))
+    assert not ok, 'missing calibration must not satisfy the Phase 7 prerequisite'
+
+
+def test_derivation_current_snapshot_and_refuses_one_tick_drift(derivation_inputs):
+    import json
+    calibration, statistics = derivation_inputs
+    assert hasattr(probe, 'derive_current_calibration'), 'offline derivation API is required'
+    record = probe.derive_current_calibration(calibration, statistics)
+    assert record['status'] == 'passed'
+    assert record['kind'] == 'offline_arithmetic'
+    assert record['calibration']['sha256']
+    assert record['reset_targets']['initial']['reachable'] is True
+    assert record['scale_deg_per_pct']['wrist_roll'] == 1.8
+    changed = json.loads(calibration.read_text())
+    changed['elbow_flex']['range_max'] += 1
+    calibration.write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match='DRIFT'):
+        probe.derive_current_calibration(calibration, statistics)
+
+
+@pytest.mark.parametrize('flags', [[], ['--skip-hardware', '--demo-clamp'],
+                                  ['--skip-hardware', '--pose-sequence', 'initial']])
+def test_derivation_cli_refuses_motion_modes(flags, monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, 'argv', ['probe', '--write-derivation', str(tmp_path/'out.json'), *flags])
+    with pytest.raises(SystemExit) as exc:
+        probe.main()
+    assert exc.value.code == 2
+
+
+def test_current_resolver_cannot_fall_back_to_stale_robot_copy(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv('HF_LEROBOT_CALIBRATION', str(tmp_path))
+    stale = tmp_path/'robots/so101_follower'/f'{probe.DEFAULT_ROBOT_ID}.json'
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps(CALIBRATION_TICK_RANGES))
+    current = probe.resolve_calibration_path()
+    assert current == tmp_path/'robots/so_follower'/f'{probe.DEFAULT_ROBOT_ID}.json'
+    assert not current.exists()
+    assert not probe.check_pinned_constants_against_local_artifacts(
+        calibration_path=str(current))[0]

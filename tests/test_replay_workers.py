@@ -190,4 +190,30 @@ def test_feasibility_has_no_approval_or_comparison_subcommand(tmp_path):
     )
     assert result.returncode == 0
     assert "feasibility" in result.stdout
-    assert "approve" not in result.stdout
+    rejected = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/replay_checkpoint_parity.py"), "approve"],
+        capture_output=True, text=True, timeout=20,
+    )
+    assert rejected.returncode == 2
+    assert "invalid choice" in rejected.stderr
+
+
+def test_offline_metadata_and_oom_are_prerequisites_not_success():
+    api = contract()
+    for name in ("OfflineModeIsEnabled", "OutOfMemoryError", "LocalEntryNotFoundError"):
+        error = type(name, (RuntimeError,), {})("measured failure")
+        assert api.prerequisite_exception(error)
+    assert not api.prerequisite_exception(ValueError("wrong manifest"))
+
+
+def test_log_reference_supports_relative_workspace(tmp_path):
+    sys.path.insert(0, str(ROOT / "scripts"))
+    orchestrator = importlib.import_module("replay_checkpoint_parity")
+    import os
+
+    log = tmp_path / "worker.log"
+    log.write_text("actual worker failure")
+    relative_workspace = Path(os.path.relpath(tmp_path))
+    ref = orchestrator.evidence_reference(relative_workspace, log.resolve())
+    assert ref["path"] == "worker.log"
+    assert ref["sha256"] == contract().sha256_file(log)

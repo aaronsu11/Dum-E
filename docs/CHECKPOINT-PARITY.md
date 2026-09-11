@@ -242,7 +242,7 @@ false. Older evidence lacking the pair is historical context, not a current
 profile or release witness.
 
 
-## Measured proposal awaiting Task 3 agreement
+## Measured proposal and subsequent agreement
 
 Workspace: `corpus/phase7-tf32-pair-20260911`, a fresh successor linked through
 `session.json` to the retained earlier attempts. All measured instrument files
@@ -324,8 +324,95 @@ cross-backend coverage or parity. Historical `seed_verdict: not-honored`,
 unknown training calibration/backbone provenance, and forced-letterbox geometry
 caveats remain unchanged.
 
-**Task 3 is a blocking-human decision.** No tolerance agreement, cross-backend
-residual, stock consumer, full-600 comparison or hardware run has occurred.
-The next action is explicit named human review of the exact proposal digest.
-The executor may transcribe an actual affirmative response and its provenance;
-absence of a response, parent readiness or a successful measurement is not assent.
+The Plan 04 blocking-human numerical decision was resolved by Aaron: "Approve,
+but we may adjust them later upon more experiments". The canonical agreement
+was recorded at `2026-09-11T17:33:05.244020+00:00`, SHA-256
+`2e6459457fc06072490b159aeaebcfe1e60a84060ce97b9986540f74a8fa20c8`.
+Its tolerance-stage check passed. Future adjustments require a new documented
+proposal and explicit approval before a NEW comparison. This agreement grants
+neither golden nor physical approval.
+
+## Plan 07 actual stock attempt: execution prerequisite failure
+
+Workspace: `corpus/phase7-tf32-pair-20260911`. Starting HEAD was `bb08455`;
+all ten sealed instrument files remained unchanged. The external harness was
+pristine at `7e241bd630a3719a56157a497ce5d08f244784f1`. Both stock stage processes
+were invoked serially by the unchanged strict wrapper, with a fresh private
+`stock/producer` directory. Every inference container had network disabled and
+read-only source/input mounts; no serial or camera device was mounted.
+
+Commands actually executed:
+
+```sh
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/approve_parity_evidence.py check --stage tolerances --workspace corpus/phase7-tf32-pair-20260911
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run pytest tests/test_upstream_parity.py tests/test_checkpoint_parity.py -q
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/replay_upstream_parity.py run --workspace corpus/phase7-tf32-pair-20260911
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/replay_upstream_parity.py check --workspace corpus/phase7-tf32-pair-20260911
+```
+
+| Stage/check | Actual result |
+| --- | --- |
+| Canonical agreement | Exit 0, complete |
+| Hermetic wrapper/comparator tests | Exit 0; 62 passed, zero skips, 78.99 seconds |
+| Fresh stock producer | Exit 0; exactly one new_embodiment artifact at seed 42 |
+| Stock consumer process | Exit 1: No module named pytest |
+| Strict wrapper | Exit 1; upstream-result.json is failed |
+| Archived stock check | Exit 1: required evidence is failed or incomplete |
+| Full corpus and operational bridges | Not run: required stock gate failed |
+| Golden generation/approval/promotion/replay | Not run: dependent gate blocked |
+| Hardware | No access or approval |
+
+The wrapper ran from `17:39:20.022797` to `17:40:14.230129` UTC on September 11,
+2026, after agreement. Producer process time was 38.390 seconds
+(`17:39:25.158266`–`17:40:03.547950`); consumer process time was 10.547 seconds
+(`17:40:03.681442`–`17:40:14.228694`). These include setup, not just inference.
+No new peak-memory telemetry was collected; launcher limits are not measurements.
+
+The producer saved 6,343,453 bytes and independently observed full `(2,40,132)`
+raw output/noise. Parameters, buffers, floating inputs, backbone and compute were
+FP32 on CPU, with SDPA (244 observed calls), four flow steps, one sampler draw,
+eval mode, no autocast, both TF32 flags false, and exact observer-disabled
+same-backend control equality. Bootstrap FlashAttention warnings remain in its
+log; the fair model inference controls were separately observed and validated.
+
+The consumer stopped at the wrapper import before stock test collection or
+consumer model loading. No consumer JUnit, coverage, raw/noise observation,
+paired-noise measurement or cross-backend residual exists. The wrapper correctly
+blocks release with its preserved failed status; consumer inference itself was
+**not run**. This is an execution-prerequisite failure, not evidence of a numerical
+parity failure or of tolerances being too strict.
+
+| Artifact relative to this workspace | SHA-256 |
+| --- | --- |
+| upstream-result.json | 24f1d992acf64ca7fa4cc5ccb63f1cbfec80439978495169d29320588c28c8a7 |
+| stock/producer/original_n1_7_new_embodiment.npz | d6e308ee56e76d86f4e28aef16d6dda0ea7b5a0f2002e43d4cac56c516313515 |
+| stock/producer-observation.json | bf4021e8a6809ee135a89615d9ee17f98d7d7e4bbc537cb6cbdd16a424da2349 |
+| stock/consumer.log | 979a601c2ce05fca18710f587f3536aae7b7ffbf16c4280882fea01b8c395c03 |
+
+The result records exact Docker argv, allowlisted environment, image IDs,
+chronology and log hashes. `plan07-execution/` retains tests, command results,
+read-only environment/cache diagnosis and post-failure checks. Containers exited
+and no GPU compute process remained.
+
+Read-only inspection confirmed no alternate pytest/interpreter path in the exact
+consumer image `sha256:5da8133fa5669c2132325dc8aa68063dd70c3186729a28efd0ab876fe5ac725d`.
+The missing packages are pytest, pluggy and iniconfig. Existing packaging 25.0
+and Pygments 2.21.0 satisfy pytest requirements; all 113 existing distributions
+pass pip check. Native/host test environments have different identities and were
+not substituted. Exact host-lock wheels for pluggy 1.6.0 and iniconfig 2.3.0
+exist in the pip cache; pytest 9.1.0 has an expanded uv cache but its original
+lock-hashed wheel was not found. No package was installed or downloaded.
+
+The concrete review proposal is `.planning/phases/07-checkpoint-parity-gate/07-07-REMEDIATION.md`:
+a derived image adding only pytest 9.1.0, pluggy 1.6.0 and iniconfig 2.3.0, with
+exact wheel hashes, cache paths, proposed Dockerfile/build commands and inventory
+checks. It requires explicit approval for the additions and the missing wheel
+acquisition. No source/image/profile remedy has been applied.
+
+A changed image/package inventory changes the approved subject. After a reviewed
+remedy, preserve this failed workspace and create a linked successor with fresh
+canonical calibration, feasibility/profiles, repeatability, real arm-free
+attestation, a new documented proposal and explicit numerical approval before
+new stock comparisons. Never rerun into these immutable stage paths, bypass
+stock into the full corpus, or reinterpret old bounds/results. Golden approval
+remains a separate later blocking-human gate.

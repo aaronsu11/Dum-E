@@ -15,7 +15,7 @@ import signal
 import sys
 import threading
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -404,6 +404,22 @@ def _release(workspace, reference, stage, runtime, clock, runtime_source=None):
                                     current_calibration_sha256=calibration, now=clock())
 
 
+def validate_loaded_calibration(controller, approved):
+    expected = approved["calibration_mapping"]
+    gate.require(isinstance(expected, dict) and bool(expected), "approved calibration mapping missing")
+    robot = controller.robot
+    path = Path(robot.calibration_fpath).resolve(strict=True)
+    gate.require(str(path) == approved["calibration_path"], "loaded calibration path differs from approval")
+    gate.require(sha256_file(path) == approved["calibration_sha256"], "loaded calibration file changed")
+    for name, mapping in (("follower", robot.calibration), ("bus", robot.bus.calibration)):
+        gate.require(isinstance(mapping, dict) and
+                     {joint: asdict(value) for joint, value in mapping.items()} == expected,
+                     name + " loaded calibration mapping differs from approval")
+    gate.require(set(robot.bus.motors) == set(expected) and
+                 all(motor.id == expected[name]["id"] for name, motor in robot.bus.motors.items()),
+                 "bus motor/calibration identity differs from approval")
+
+
 def run(workspace, *, preflight, preflight_attempt, runtime_source,
         controller_factory=StopGuardedController, policy_factory=None, observe=None,
         clock=utc_now, stop=None, settings=None, previous_preflight=None, reason=""):
@@ -443,6 +459,9 @@ def run(workspace, *, preflight, preflight_attempt, runtime_source,
             stop.check()
             result["constructed_at"] = result["started_at"] = clock()
             controller = controller_factory(stop=stop, **(settings or {}))
+            approved_inputs = _runner_inputs(ev.json(construction))
+            if not ev.test_only or "calibration_mapping" in approved_inputs:
+                validate_loaded_calibration(controller, approved_inputs)
             controller.connect(calibrate=False)
             stop.check()
             policy = policy_factory()
@@ -569,8 +588,12 @@ def controller_inputs(workspace):
     settings["max_relative_target"] = resolve_max_relative_target(block.get("max_relative_target"))
     gate.require(settings["use_degrees"] is True and settings["max_relative_target"] == 160.0,
                  "Phase 5 units and clamp must remain unchanged")
-    calibration_path = resolve_calibration_file("so_follower", settings["robot_id"])
-    gate.require(sha256_file(calibration_path) == release["calibration_sha256"], "resolved controller calibration changed")
+    calibration_path = resolve_calibration_file("so_follower", settings["robot_id"]).resolve(strict=True)
+    calibration_bytes = capture_bytes(calibration_path)
+    gate.require(hashlib.sha256(calibration_bytes).hexdigest() == release["calibration_sha256"],
+                 "resolved controller calibration changed")
+    calibration_mapping = read_json(calibration_bytes)
+    gate.require(isinstance(calibration_mapping, dict), "calibration must be a mapping")
     reference = ev.json("session.json").get("calibration_reference")
     calibration = (read_json(capture_bytes(Path(reference["path"]))) if reference else ev.json("calibration.json"))
     identity = calibration["robot_identity"]
@@ -578,6 +601,7 @@ def controller_inputs(workspace):
                  "controller identity differs from approved calibration")
     return {"controller": settings, "config_sha256": config_sha,
             "calibration_path": str(calibration_path), "calibration_sha256": release["calibration_sha256"],
+            "calibration_mapping": calibration_mapping,
             "pid": DUME_PID}
 
 
@@ -709,12 +733,40 @@ class RuntimeSource:
             self._policy.close()
 
 
+def validate_run_safety_journal(run):
+    events = run.get("events")
+    gate.require(isinstance(events, list) and bool(events), "operation journal missing")
+    previous, stops = None, []
+    for index, entry in enumerate(events):
+        gate.require(isinstance(entry, dict), "invalid operation journal entry")
+        event = dict(entry)
+        checksum = event.pop("sha256", None)
+        gate.require(type(event.get("index")) is int and event["index"] == index and
+                event.get("previous") == previous and digest(event) == checksum,
+                "operation journal changed")
+        gate.require(event.get("kind") in ("dispatch", "returned", "stop"), "unknown operation journal event")
+        if event["kind"] == "stop":
+            gate.require(type(event.get("clamp")) is bool, "invalid journal clamp flag")
+            gate.text(event.get("reason"), "journal stop reason")
+            stops.append(entry)
+        previous = checksum
+    gate.require(run.get("stop_events") == stops, "journal stop_events disagree")
+    clamps = sum(event["clamp"] for event in stops)
+    gate.require(type(run.get("safety_stop")) is bool and run["safety_stop"] == bool(stops) and
+            type(run.get("clamp_warnings")) is int and run["clamp_warnings"] == clamps and
+            run.get("stop_reason") == (stops[0]["reason"] if stops else ""),
+            "journal safety summary disagrees")
+    gate.require(not stops and clamps == 0, "journal safety event overrides score")
+
+
+
 def check(workspace):
     ev = fresh_evidence(workspace)
     gate.validate_live_approval(ev)
     if not (ev.workspace / "live-run.json").exists():
         return {"status": "complete", "stage": "live-approval-check", "hardware_verified": False}
     result = ev.record("live-run.json")
+    validate_run_safety_journal(result)
     gate.require(result["approval"] == ev.reference("live-approval.json"), "run approval changed")
     gate.require(result["instruction"] == INSTRUCTION and result["safety_stop"] is False and
                  result["clamp_warnings"] == 0 and len(result["trials"]) == TRIALS,
@@ -749,13 +801,6 @@ def check(workspace):
                      "trial denominator/budget/safety changed")
     gate.require(sum(t["coherent"] and not t["wrong_target"] and not t["erratic"] for t in result["trials"]) >= 2,
                  "fewer than two directional successes")
-    previous = None
-    for index, entry in enumerate(result["events"]):
-        event = dict(entry)
-        checksum = event.pop("sha256")
-        gate.require(event["index"] == index and event["previous"] == previous and digest(event) == checksum,
-                     "operation journal changed")
-        previous = checksum
     return {"status": "complete", "stage": "directional-run-check", "live_run": ev.reference("live-run.json")}
 
 

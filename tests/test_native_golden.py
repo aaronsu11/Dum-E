@@ -42,14 +42,14 @@ def api():
     return importlib.import_module("policy_guard.golden")
 
 
-def setup(workspace, *, session="test-session"):
+def setup(workspace, *, session="test-session", attention="sdpa"):
     fixture_workspace(workspace)
     rewrite(workspace, "session.json", lambda value: value.update(session_id=session))
     def configure(profiles):
         profiles["session"] = session
         native = profiles["profiles"][2]["observed"]
         native.update(
-            path=NATIVE_PATH, parameter_dtypes=["torch.bfloat16"],
+            path=NATIVE_PATH, attention=[attention], parameter_dtypes=["torch.bfloat16"],
             compute_dtypes=["torch.bfloat16", "torch.float32"],
             noise_dtype="torch.bfloat16", device="cuda:0",
             rng_algorithm="torch.default_generator.cuda",
@@ -331,7 +331,7 @@ def test_changed_source_still_replays_all_cases_and_retains_failure(approved_cop
     assert len(worker.calls) == 1 and len(worker.calls[0]) == 600
     final = read_json(approved_copy / "final-regression.json")
     assert final["status"] == "failed" and final["identity_changed"] is True
-    assert final["comparison"]["passed"] is True
+    assert final["comparison"]["numerically_passed"] is True
 
 
 @pytest.mark.parametrize("problem", ["missing-live", "live-after-replay"])
@@ -482,3 +482,54 @@ def test_rejected_review_is_retained_and_cannot_promote(tmp_path):
     assert promote(tmp_path) == 1
     assert read_json(tmp_path / "golden-approval.json")["decision"] == "rejected"
     assert not (tmp_path / "golden-manifest.json").exists()
+
+
+
+def test_generate_default_command_reports_missing_prerequisites(tmp_path):
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/replay_native_golden.py"),
+                             "generate", "--workspace", str(tmp_path)],
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == 2
+    assert "not_run" in result.stdout, "documented generate command must reach prerequisite checks"
+
+
+def test_promotion_recaptures_cached_candidate_before_writing(tmp_path):
+    setup(tmp_path)
+    assert generate(tmp_path) == 0
+    assert approve(tmp_path) == 0
+    ev = api().Evidence(tmp_path, test_only=True)
+    api().validate_candidate(ev)
+    ref = ev.reference("golden-candidate.json")
+    rewrite(tmp_path, "golden-candidate.json", lambda c: c.update(reason="changed after validation"))
+    with pytest.raises(ValueError, match="digest|changed"):
+        api().promote_reviewed_candidate(ev, candidate_sha256=ref["sha256"], clock=lambda: ts(31))
+    assert not (tmp_path / "golden-manifest.json").exists()
+
+
+def test_actual_attention_profile_full_worker_and_changed_sampler(tmp_path):
+    setup(tmp_path, attention="flash_attention_2")
+    assert generate(tmp_path) == 0
+    ev = api().Evidence(tmp_path, test_only=True)
+    candidate = api().validate_candidate(ev)
+    assert ev.json(candidate["worker"]["manifest"])["profile"]["attention"] == ["flash_attention_2"]
+
+
+def test_replay_cannot_reuse_old_candidate_worker(approved_copy):
+    candidate = read_json(approved_copy / "golden-candidate.json")
+    rewrite(approved_copy, "golden-replay.json", lambda r: r.update(worker=candidate["worker"]))
+    assert run(approved_copy, "check", second=50, extra=["--stage", "pre-live"]) == 1
+
+
+def test_change_during_collection_retains_complete_worker_but_fails_candidate(tmp_path):
+    setup(tmp_path)
+    calls = []
+    def changed(args):
+        value = snapshot(args)
+        if calls:
+            value["source_files"]["TEST_ONLY.py"] = digest("changed during inference")
+        calls.append(True)
+        return value
+    assert generate(tmp_path, probe=changed) == 1
+    record = read_json(tmp_path / "golden-candidate.json")
+    assert record["status"] == "failed"
+    assert len(read_json(tmp_path / record["worker"]["manifest"]["path"])["cases"]) == 600

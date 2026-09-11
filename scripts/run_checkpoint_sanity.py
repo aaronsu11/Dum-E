@@ -162,6 +162,17 @@ class StopGuardedBus(FeetechMotorsBus):
         self.stop.check()
         return super().enable_torque(*args, **kwargs)
 
+    @contextmanager
+    def torque_disabled(self, *args, **kwargs):
+        # Latch BODY failures before inherited finally reaches enable_torque.
+        # SDK communication retries remain inherited and may recover normally.
+        with super().torque_disabled(*args, **kwargs):
+            try:
+                yield
+            except BaseException as exc:
+                self.stop.trip("torque-disabled configuration failed: " + str(exc))
+                raise
+
     def disconnect(self, disable_torque=True):
         return super().disconnect(False if self.stop.stopped else disable_torque)
 

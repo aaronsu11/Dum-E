@@ -403,3 +403,189 @@ def test_tracer_actual_skill_reset_and_bounded_chunk(tmp_path, monkeypatch, rese
         assert len(actions) == 16 and delays.count(0.05) == 16
         assert events.count("reset-target") == 3  # inherited ready -> initial -> ready
         assert result["trials"][0]["iterations"] == 1
+
+
+
+def full_run(tmp_path, monkeypatch, *, labels=None, stop_trial=None):
+    r, ev, live, source, clock, stop, events, _ = setup_run(tmp_path)
+    from embodiment.so_arm10x import controller as cm, skills
+    delays, targets = [], []
+    monkeypatch.setattr(cm, "time", SimpleNamespace(sleep=delays.append))
+    monkeypatch.setattr(skills, "time", SimpleNamespace(sleep=delays.append))
+
+    class Controller(r.StopGuardedController):
+        def __init__(self, **kwargs):
+            self.stop = stop
+            events.append("construct")
+
+        def connect(self, calibrate):
+            assert calibrate is False
+            events.append("connect")
+
+        def set_target_state(self, action):
+            stop.check()
+            if isinstance(action, np.ndarray):
+                targets.append(tuple(action))
+                return dict(zip(JOINT_ORDER, action, strict=True))
+            targets.append(action)
+            return action
+
+        def get_observation(self):
+            return {**dict.fromkeys(JOINT_ORDER, 0.0), "front": np.zeros((2, 2, 3), np.uint8),
+                    "wrist": np.zeros((2, 2, 3), np.uint8)}
+
+        def get_current_images(self):
+            return {"front": self.get_observation()["front"], "wrist": self.get_observation()["wrist"]}
+
+        def disconnect(self):
+            events.append("disconnect")
+
+    class Policy:
+        calls = 0
+
+        def get_action(self, observation, instruction):
+            assert instruction == "Grab a banana and put it on the plate"
+            assert set(observation) == set(JOINT_ORDER) | {"front", "wrist"}
+            self.calls += 1
+            return [dict.fromkeys(JOINT_ORDER, 0.0) for _ in range(16)]
+
+    def observe(index):
+        if stop_trial == index:
+            stop.trip("operator safety stop")
+        return (labels or [dict(coherent=True, wrong_target=False, erratic=False, grasp=False,
+                               operator="Fixture observer") for _ in range(3)])[index - 1]
+
+    result = r.run(ev, preflight=live["path"], preflight_attempt=1, runtime_source=source,
+                   controller_factory=Controller, policy_factory=Policy, observe=observe,
+                   stop=stop, clock=clock)
+    return result, targets, delays, source, ev
+
+
+def test_exact_three_trial_protocol_and_canonical_closeout(tmp_path, monkeypatch):
+    result, targets, delays, _, ev = full_run(tmp_path, monkeypatch)
+    assert result["status"] == "complete"
+    assert len(result["trials"]) == 3 and result["directional_successes"] == 3
+    assert all(t["iterations"] == 20 and t["actions_per_chunk"] == 16 and
+               t["action_delay"] == 0.05 and not t["grasp"] for t in result["trials"])
+    assert len([t for t in targets if isinstance(t, dict)]) == 3 * 20 * 16
+    assert len([t for t in targets if isinstance(t, tuple)]) == 9
+    assert delays.count(0.05) == 960
+    run_ref = gate.Evidence(tmp_path, test_only=True).reference("live-run.json")
+    final = read_json(tmp_path / "golden-replay.json")
+    final.update(live_run=run_ref, started_at=fixtures.ts(1000), ended_at=fixtures.ts(1001))
+    fixtures.save(tmp_path, "final-regression.json", final)
+    assert gate.validate_closeout(gate.Evidence(tmp_path, test_only=True))["status"] == "complete"
+    assert result["preflights"] == [result["live_preflight"], result["run_preflight"],
+                                    *(t["preflight"] for t in result["trials"])]
+
+
+@pytest.mark.parametrize("successes,wrong,erratic,grasp,expected", [
+    (2, False, False, False, "complete"), (1, False, False, True, "failed"),
+    (3, True, False, True, "failed"), (3, False, True, True, "failed"),
+])
+def test_directional_scoring_has_fixed_denominator(tmp_path, monkeypatch, successes, wrong, erratic, grasp, expected):
+    labels = [dict(coherent=i < successes, wrong_target=wrong, erratic=erratic, grasp=grasp,
+                   operator="Fixture observer") for i in range(3)]
+    result, targets, _, _, _ = full_run(tmp_path, monkeypatch, labels=labels)
+    assert result["status"] == expected and len(result["trials"]) == 3
+    assert len([t for t in targets if isinstance(t, dict)]) == 960
+
+
+def test_safety_stop_cannot_be_outvoted_or_drop_interrupted_trial(tmp_path, monkeypatch):
+    result, _, _, _, _ = full_run(tmp_path, monkeypatch, stop_trial=3)
+    assert result["status"] == "failed" and result["safety_stop"]
+    assert len(result["trials"]) == 3 and result["trials"][2]["safety_stop"]
+    assert result["directional_successes"] >= 2
+
+
+@pytest.mark.parametrize("size", [0, 15, 17])
+def test_chunk_budget_refuses_short_and_extended_actions(size):
+    r = runner()
+    stop = r.StopLatch()
+    policy = r.CheckedPolicy(SimpleNamespace(get_action=lambda *_: [dict.fromkeys(JOINT_ORDER, 0.0)] * size), stop)
+    with pytest.raises(r.SafetyStop, match="exactly 16"):
+        policy.get_action({}, r.INSTRUCTION)
+    assert stop.stopped and policy.iterations == 0
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, "1"])
+def test_nonfinite_or_non_numeric_policy_targets_stop(bad):
+    r = runner()
+    stop = r.StopLatch()
+    policy = r.CheckedPolicy(SimpleNamespace(get_action=lambda *_: [dict.fromkeys(JOINT_ORDER, bad)] * 16), stop)
+    with pytest.raises(r.SafetyStop):
+        policy.get_action({}, r.INSTRUCTION)
+    assert stop.stopped
+
+
+def test_cli_exposes_only_fixed_budgets_and_explicit_preflight_attempts():
+    r = runner()
+    assert callable(getattr(r, "build_parser", None)), "Runnable preflight/run/check commands are required"
+    parser = r.build_parser()
+    args = parser.parse_args(["preflight", "--stage", "review", "--attempt", "0001", "--workspace", "example"])
+    assert args.stage == "review" and args.attempt == 1
+    args = parser.parse_args(["run", "--preflight", "preflights/live-0001.json", "--preflight-attempt", "0001"])
+    assert args.preflight_attempt == 1
+    for option in ("--trials", "--iterations", "--actions-per-chunk", "--action-delay", "--test-only", "--approve"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["run", "--preflight", "preflights/live-0001.json", "--preflight-attempt", "0001", option, "4"])
+
+
+def test_review_approval_live_restart_run_lifecycle(tmp_path, monkeypatch):
+    r = runner()
+    assert callable(getattr(r, "preflight", None)), "Real runner must collect immutable review/live attempts"
+    identity, lock, pairs = fixtures.fixture_workspace(tmp_path)
+    fixtures.complete_offline(tmp_path, identity, lock, pairs)
+    ev = gate.Evidence(tmp_path, test_only=True)
+    clock = Clock(19)
+    source = Runtime(clock, fixtures.runtime(15))
+    source.instance = source.value["attestation"]["instance"]
+    ref = r.preflight(ev, stage="review", attempt=1, runtime_source=source, clock=clock)
+    assert not (tmp_path / "live-approval.json").exists()
+    fixtures.cli().prepare_live(gate.Evidence(tmp_path, test_only=True), ref["path"], clock=clock)
+    answers = iter(["Fixture operator", "Test-only decision", "approve"])
+    fixtures.cli().record_decision(tmp_path, "live", prompt=lambda _: next(answers), clock=clock, test_only=True)
+    live = r.preflight(ev, stage="live", attempt=1, previous_preflight=ref["path"], reason="Approved transition",
+                       runtime_source=source, clock=clock)
+    old = {p: p.read_bytes() for p in (tmp_path / "preflights").iterdir()}
+    restarted = fixtures.runtime(clock.second + 1, "second")
+    source.value, source.instance = restarted, restarted["attestation"]["instance"]
+    with pytest.raises(ValueError):
+        r._release(ev, live, "live", source.current(), clock)
+    renewed = r.preflight(ev, stage="live", attempt=2, previous_preflight=live["path"], reason="Same-profile restart",
+                          runtime_source=source, clock=clock)
+    r._release(ev, renewed, "live", source.current(), clock)
+    with pytest.raises(ValueError, match="exists"):
+        r.preflight(ev, stage="live", attempt=2, previous_preflight=live["path"], reason="Reuse refusal",
+                    runtime_source=source, clock=clock)
+    assert all(p.read_bytes() == value for p, value in old.items())
+    assert read_json(tmp_path / renewed["path"])["attestation"] == source.current()["attestation"]
+
+
+def test_failed_preflight_is_immutable_evidence(tmp_path):
+    r, ev, live, source, clock, _, _, _ = setup_run(tmp_path)
+    source.collect = lambda: (_ for _ in ()).throw(TimeoutError("fake diagnostic timeout"))
+    with pytest.raises(TimeoutError):
+        r.collect_preflight(ev, stage="run", attempt=1, previous=live,
+                            reason="Fresh run", runtime_source=source, clock=clock)
+    target = tmp_path / "preflights/run-0001.json"
+    assert target.exists(), "Failed freshness attempts must remain immutable and cannot release"
+    assert read_json(target)["status"] == "failed"
+    with pytest.raises(ValueError):
+        gate.validate_preflight_record(gate.Evidence(tmp_path, test_only=True), "preflights/run-0001.json")
+
+
+def test_operator_labels_cannot_override_budget_or_safety(tmp_path, monkeypatch):
+    labels = [dict(coherent=True, wrong_target=False, erratic=False, grasp=False,
+                   operator="Fixture observer", preflight={"path": "forged", "sha256": "0" * 64},
+                   actions_per_chunk=99, safety_stop=False) for _ in range(3)]
+    result, _, _, _, _ = full_run(tmp_path, monkeypatch, labels=labels)
+    assert result["status"] == "failed", "Observation fields cannot replace protected trial evidence"
+    assert result["trials"][0]["actions_per_chunk"] == 16
+
+
+def test_production_cli_rejects_fixture_evidence_before_runtime(tmp_path):
+    r = runner()
+    assert callable(getattr(r, "main", None)), "Production CLI must fail closed on test_only evidence"
+    fixtures.approved(tmp_path)
+    assert r.main(["check", "--workspace", str(tmp_path)]) != 0

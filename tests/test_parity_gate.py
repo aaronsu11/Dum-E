@@ -736,12 +736,18 @@ def test_serving_attestor_publishes_only_completed_observed_request(tmp_path):
 
     server = Server.__new__(Server)
     server.config = SimpleNamespace(host="0.0.0.0", port=8080)
+    import logging
+    server.logger = logging.getLogger("attestor-test")
     server.policy = torch.nn.Module()
     server.policy.config = SimpleNamespace(base_model_path="/fixture/checkpoint")
     server.policy._groot_model = Model().eval()
     identity = {"container": {"container_id": digest("first"), "container_started_at": ts(0),
                                "image_digest": "sha256:" + digest("lerobot")}}
     current_identity = copy.deepcopy(identity)
+    identity_calls = []
+    def identity_reader(*args):
+        identity_calls.append(args)
+        return current_identity
     def profile_reader(server, model, identity, measured, raw):
         profile = observed("lerobot", "operational")
         profile.update(parameter_dtypes=["torch.float32"], compute_dtypes=sorted(measured.compute_dtypes),
@@ -750,7 +756,8 @@ def test_serving_attestor_publishes_only_completed_observed_request(tmp_path):
     moments = iter([ts(2), ts(30), ts(31), ts(40)])
     attestor = module.ServingAttestor(
         server, tmp_path / "lerobot.json", identity,
-        identity_reader=lambda *args: current_identity, profile_reader=profile_reader,
+        identity_reader=identity_reader, integrity_reader=lambda *args: current_identity,
+        profile_reader=profile_reader,
         clock=lambda: next(moments), process_reader=lambda: {
             k: v for k, v in runtime(30)["host"].items()
             if k in ("pid", "process_start_ticks", "process_started_at", "boot_id")
@@ -762,7 +769,9 @@ def test_serving_attestor_publishes_only_completed_observed_request(tmp_path):
     raw_observation.update({key: np.zeros((480, 640, 3), np.uint8) for key in CAMERA_ORDER})
     raw_observation["task"] = "fixture banana"
     obs = TimedObservation(timestamp=30.0, timestep=0, observation=raw_observation, must_go=True)
+    assert len(identity_calls) == 1
     result = server._predict_action_chunk(obs)
+    assert len(identity_calls) == 1, "full content hashing must not run per chunk"
     complete = read_json(tmp_path / "lerobot.json")
     assert complete["status"] == "complete"
     assert complete["request"]["observation_sha256"] == api().observation_fingerprint(raw_observation)

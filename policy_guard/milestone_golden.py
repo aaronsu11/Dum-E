@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from policy_guard import parity_gate as gate
+from policy_guard import instrumentation_transition as transition
 from policy_guard.milestone_acceptance import validate_milestone_acceptance
 from policy_guard.replay_contract import (
     fingerprint_configuration as digest, now, profile_configuration,
@@ -132,7 +133,7 @@ def validate_candidate(workspace):
                        ("acceptance", accepted["report"]),
                        ("agreement", ev.reference("tolerance-agreement.json")),
                        ("cases", cases), ("case_count", 12), ("bounds", BOUNDS),
-                       ("source_files", source_identity()),
+                       ("source_files", transition.historical_sources(ev, source_identity())),
                        ("calibration_sha256", accepted["calibration_sha256"]),
                        ("inference_runs_added", 0), ("approved", False), ("promoted", False)):
         gate.require(record[key] == value, "candidate changed: " + key)
@@ -163,16 +164,16 @@ def validate_worker(ev, candidate, launch):
     schedule = ev.json(launch["schedule"])
     cases = scope_cases(ev.json("input-lock.json"), ev.json(candidate["scope"]))
     gate.require(schedule["cases"] == cases and schedule["candidate"] == ev.reference(CANDIDATE)
-                 and schedule["source_files"] == source_identity()
+                 and schedule["source_files"] == transition.historical_sources(ev, source_identity())
                  and schedule["scope"] == candidate["scope"], "scheduled candidate/scope/source changed")
     gate.require(launch["status"] == "complete" and type(launch["exit_code"]) is int
                  and launch["exit_code"] == 0 and launch["manifest"] == ev.reference(WORKER)
                  and launch["schedule"] == ev.reference(SCHEDULE), "worker launch failed or changed")
     ev.bytes(launch["log"]["path"], launch["log"]["sha256"])
-    gate.require(launch["source_files"] == source_identity(), "launch sources changed")
+    gate.require(launch["source_files"] == transition.historical_sources(ev, source_identity()), "launch sources changed")
     # Reconstruct the only permitted argv from bound host paths and pinned image.
     from scripts.replay_milestone_golden import worker_command
-    gate.require(launch["argv"] == worker_command(ev.workspace, launch["inputs"], launch["container"],
+    gate.require(launch["argv"] == worker_command(transition.historical_workspace(ev), launch["inputs"], launch["container"],
                                                   candidate["profile"]["image_digest"]),
                  "worker invocation differs")
     worker = ev.json(launch["manifest"])
@@ -186,7 +187,7 @@ def validate_worker(ev, candidate, launch):
     gate.require(profile_configuration(worker["profile"]) == profile_configuration(expected),
                  "fresh native operational profile changed")
     binding = execution_binding(ev, schedule)
-    gate.require(worker["execution"] == binding and worker["resources"]["source_files"] == source_identity(),
+    gate.require(worker["execution"] == binding and worker["resources"]["source_files"] == transition.historical_sources(ev, source_identity()),
                  "worker execution/source binding differs")
     process = worker["resources"]["process_identity"]
     original = ev.json(candidate["source"]["worker"])["resources"]["process_identity"]
@@ -225,7 +226,7 @@ def validate_scoped_golden(workspace):
                  and record["approved"] is False and record["promoted"] is False,
                  "completed unpromoted native replay required")
     for key, value in (("candidate", ev.reference(CANDIDATE)), ("scope", candidate["scope"]),
-                       ("source_files", source_identity()), ("case_count", 12),
+                       ("source_files", transition.historical_sources(ev, source_identity())), ("case_count", 12),
                        ("cases", candidate["cases"]), ("bounds", BOUNDS)):
         gate.require(record[key] == value, "replay changed: " + key)
     launch = ev.json(record["launch"])

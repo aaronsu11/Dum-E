@@ -385,6 +385,39 @@ def capture_serving_identity(checkpoint, binding_path):
     }
 
 
+
+def file_metadata(paths):
+    """Detect replacement or writes without rereading multi-gigabyte weights."""
+    result = {}
+    for path in sorted(set(map(Path, paths))):
+        link, target = path.lstat(), path.stat()
+        fields = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                                value.st_mtime_ns, value.st_ctime_ns, value.st_mode)
+        result[str(path)] = {"resolved": str(path.resolve(strict=True)),
+                             "link": fields(link), "target": fields(target)}
+    return result
+
+
+def capture_serving_metadata(checkpoint, binding_path):
+    """Cheap per-request change detection after full load-time hashing.
+
+    Enumerate membership as well as inode/size/mtime/ctime and symlink targets.
+    The immutable image and read-only mounts are independently checked by the
+    client. A change fails the request and requires a fresh guarded model load.
+    """
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    model_dir = Path(HF_HUB_CACHE) / "models--nvidia--Cosmos-Reason2-2B"
+    snapshot = model_dir / "snapshots" / BACKBONE_REVISION
+    package = Path(importlib.util.find_spec("lerobot").origin).parent
+    paths = [Path(binding_path), Path("/etc/hostname"), model_dir / "refs/main"]
+    for root, pattern in ((Path(checkpoint), "*"), (snapshot, "*"), (package, "*.py")):
+        paths.extend(path for path in root.rglob(pattern) if path.is_file())
+    root = Path(__file__).resolve().parents[2]
+    paths.extend(root / name for name in SERVING_SOURCE_FILES)
+    return file_metadata(paths)
+
+
 def capture_effective_configuration(server, model):
     """Capture the actual loaded model and ordered processors for both paths.
 
@@ -441,18 +474,22 @@ class ServingAttestor:
     """
 
     def __init__(self, server, path, load_identity, *, identity_reader=capture_serving_identity,
-                 profile_reader=serving_profile, clock=utc_now, process_reader=process_identity,
+                 integrity_reader=capture_serving_metadata, profile_reader=serving_profile, clock=utc_now, process_reader=process_identity,
                  test_only=False):
         self.server = server
         self.path = Path(path)
         self.identity_reader = identity_reader
         self.profile_reader = profile_reader
+        self.integrity_reader = integrity_reader
         self.clock = clock
         self.test_only = test_only
         self.identity = load_identity
         self.checkpoint = str(server.policy.config.base_model_path)
+        self.integrity = configuration_value(self.integrity_reader(self.checkpoint, self.path.parent / "container.json"))
         require(self.identity_reader(self.checkpoint, self.path.parent / "container.json") == load_identity,
                 "checkpoint/source/image changed during model loading")
+        require(configuration_value(self.integrity_reader(self.checkpoint, self.path.parent / "container.json")) == self.integrity,
+                "checkpoint/source files changed during load-time integrity check")
         binding = self.identity["container"]
         self.instance = {
             **process_reader(), "container_id": binding["container_id"],
@@ -496,8 +533,8 @@ class ServingAttestor:
             require(len(actions) == 16, "completed full decoded chunk required")
             decoded = torch.stack([action.get_action().detach().cpu().float() for action in actions]).numpy()
             require(decoded.shape == (16, 6), "completed action shape mismatch")
-            require(self.identity_reader(self.checkpoint, self.path.parent / "container.json") == self.identity,
-                    "checkpoint/source/image changed after guarded loading")
+            require(configuration_value(self.integrity_reader(self.checkpoint, self.path.parent / "container.json")) == self.integrity,
+                    "checkpoint/source/image changed after guarded loading; reload required")
             profile = self.profile_reader(self.server, self.model, self.identity, measured, raw)
             semantics = operational_semantics(profile)
             request = {
@@ -1107,8 +1144,14 @@ class DumEGrootPolicyServer(PolicyServer):
         if attestor is None:
             return self._predict_action_chunk_impl(observation_t)
         with attestor.observe(observation_t) as measured:
+            generation_started = time.perf_counter()
             result = self._predict_action_chunk_impl(observation_t)
+            generation_seconds = time.perf_counter() - generation_started
+        validation_started = time.perf_counter()
         attestor.complete(observation_t, result, measured)
+        validation_seconds = time.perf_counter() - validation_started
+        self.logger.info("Chunk timing | generation_ms=%.2f | validation_ms=%.2f",
+                         generation_seconds * 1000, validation_seconds * 1000)
         return result
 
     def _predict_action_chunk_impl(self, observation_t) -> list[TimedAction]:

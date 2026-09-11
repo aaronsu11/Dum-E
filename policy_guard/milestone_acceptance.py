@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from policy_guard import parity_gate as gate
+from policy_guard import instrumentation_transition as transition
 from policy_guard.replay_contract import now, write_evidence
 
 ACCEPTANCE = "milestone-acceptance.json"
@@ -60,7 +61,7 @@ def source_data(ev):
     # All actual inference/capture source remains identical to the original run.
     for name, digest in report["source_instrument"].items():
         if name != "policy_guard/parity_gate.py":
-            gate.require(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest, "inference/capture source changed: " + name)
+            transition.require_source(ev, name, digest)
     decoded, noise, profiles = [], [], []
     for name in ("native-operational", "lerobot-operational"):
         proof = report["proofs"][name]
@@ -141,7 +142,7 @@ def validate_milestone_acceptance(workspace):
     authorization = ev.json(accepted["authorization"])
     gate.require(accepted["authorization"] == ev.reference(AUTHORIZATION), "criteria authorization changed")
     gate.require(authorization["user_instruction"] == USER_INSTRUCTION and authorization["limits"] == LIMITS, "criteria authorization invalid")
-    gate.require(accepted["policy_sha256"] == hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "acceptance policy changed")
+    transition.require_source(ev, "policy_guard/milestone_acceptance.py", accepted["policy_sha256"])
     gate.require(accepted["strict_report"] == authorization["strict_report"] == ev.reference("milestone-report.json"), "accepted report changed")
     gate.require(accepted["scope"] == authorization["scope"] == ev.reference("milestone-scope.json"), "accepted sample changed")
     report, delta, profiles, scales, calibration, calibration_ref = source_data(ev)
@@ -152,8 +153,9 @@ def validate_milestone_acceptance(workspace):
     gate.require(gate.timestamp(report["ended_at"]) <= gate.timestamp(authorization["recorded_at"]) <= gate.timestamp(accepted["started_at"]) <= gate.timestamp(accepted["ended_at"]), "acceptance chronology invalid")
     sem = ev.json("profiles.json")["serving_configuration"]
     gate.validate_semantic_configuration(sem)
-    gate.require(sem == gate.operational_semantics(profiles[1]), "serving semantics differ from captured operational profile")
+    gate.require(sem == gate.operational_semantics(transition.serving_profile(ev, profiles[1])),
+                 "serving semantics differ from captured operational profile")
     return {**ev.identity(), "status": "complete", "report": ev.reference(ACCEPTANCE),
             "configuration_fingerprint": gate.fingerprint_configuration(sem),
             "calibration_sha256": calibration, "calibration": calibration_ref,
-            "ended_at": accepted["ended_at"]}
+            "ended_at": accepted["ended_at"], **transition.release_fields(ev)}

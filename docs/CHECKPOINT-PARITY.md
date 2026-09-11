@@ -703,3 +703,32 @@ Task 1 is complete. Task 2 must still execute all full 600-case tiers and
 operational bridges before generating the native candidate. Golden approval
 and hardware release remain separate gates. Future threshold changes require
 a fresh prospective proposal and explicit approval before a new experiment.
+
+
+## Trial 1 latency correction — 2026-09-11
+
+The user reduced this milestone to 12 observations, one seed, GPU BF16,
+accepted the documented physical-unit tolerances, and authorized physical tests
+one at a time. Those later instructions supersede the exhaustive matrix above.
+The first physical trial completed 20 chunks but remained unscored. At the
+user's request it was stopped and archived before restarting from trial 1.
+
+The measured 6.421-second server chunk time included a full checkpoint/backbone
+content scan on every request (6.185 seconds measured separately). Full hashes
+now run at model loading; each completed request checks file membership, inode,
+size, timestamps and symlink targets. Changed files still require a fresh load.
+Generation and validation have separate timers; model inference is unchanged.
+
+An arm-free GPU measurement on one frozen observation gave warm generation
+392.63–396.91 ms, validation 44.96–48.50 ms, and client latency 456–461 ms
+(one warmup, three measured requests). This does not establish the native
+~100 ms baseline or include robot action pacing and live-client checks.
+A separate single fixed-seed request matched all 16×6 decoded values exactly
+against the accepted LeRobot capture.
+
+`corpus/phase7-latency-fix-20260911` preserves the prior 12-observation comparison
+and native reference through an explicit instrumentation-only source transition.
+The transition checks the exact reviewed server AST changes and binds the new
+GPU witness; it does not relabel historical inference as a fresh run. The prior
+physical result remains in `corpus/phase7-small-gpu-20260911/live-run.json` as an
+operator-requested restart, with no claimed physical success or failure score.

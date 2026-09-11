@@ -125,23 +125,15 @@ def test_numeric_evidence_rejects_objects_and_tampering(tmp_path):
 
 def test_real_manifest_cannot_be_passed_by_missing_or_fabricated_worker(tmp_path):
     api = contract()
-    expected = [{"record": "record_0000.npz", "seed": 42}]
-    report = {
-        "schema_version": 1, "session": "test", "stage": "tracer",
-        "status": "complete", "input_fingerprint": "1" * 64,
-        "profile_fingerprint": api.fingerprint_configuration(profile()),
-        "started_at": "2026-09-11T00:00:00+00:00",
-        "ended_at": "2026-09-11T00:00:01+00:00",
-        "expected_cases": expected, "executed_cases": [],
-        "cases": [], "prerequisite_errors": [], "profile": profile(),
-        "evidence_kind": "real_model",
-    }
+    report, expected, identity = complete_manifest_fixture(tmp_path)
+    report["executed_cases"] = []
+    report["cases"] = []
     with pytest.raises(ValueError, match="coverage"):
-        api.validate_replay_manifest(report, tmp_path, expected)
+        api.validate_replay_manifest(report, tmp_path, expected, **identity)
     report["executed_cases"] = copy.deepcopy(expected)
     report["evidence_kind"] = "synthetic"
     with pytest.raises(ValueError, match="real_model"):
-        api.validate_replay_manifest(report, tmp_path, expected)
+        api.validate_replay_manifest(report, tmp_path, expected, **identity)
 
 
 def test_observer_forwards_real_noise_and_does_not_consume_extra_rng():

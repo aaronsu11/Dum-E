@@ -96,6 +96,14 @@ def run_worker(args, backend, purpose, image, cases):
         raise FileExistsError(f"immutable worker evidence exists: {destination}")
     container_name = f"dume-replay-{label}-{os.getpid()}"
     argv = worker_argv(args, backend, purpose, image, output, container_name)
+    expected_session = read_json(args.workspace / "session.json")["session_id"]
+    input_lock = read_json(args.workspace / "input-lock.json")
+    source_files = {name: sha256_file(ROOT / name) for name in (
+        "policy_guard/replay_contract.py", "policy_guard/groot_guard.py",
+        "scripts/replay_groot_native.py", "scripts/replay_checkpoint_parity.py",
+        "docker/lerobot-policy/replay_checkpoint.py", "docker/lerobot-policy/server.py",
+        "policy/lerobot/features.py",
+    )}
     start = now()
     print(f"Starting {label} on {args.device}", flush=True)
     # Logs persist incrementally, including Docker/OOM failures before Python can write.
@@ -129,7 +137,12 @@ def run_worker(args, backend, purpose, image, cases):
         launch["status"] = "failed"
         launch["error"] = "nonzero worker exit cannot complete"
     if report["status"] == "complete" and purpose != "stock-capacity":
-        validate_replay_manifest(report, args.workspace, cases)
+        validate_replay_manifest(
+            report, args.workspace, cases, expected_session=expected_session,
+            input_lock=input_lock, backend=backend, purpose=purpose,
+            checkpoint_fingerprint=input_lock["checkpoint_fingerprint"],
+            image_digest=image, source_files=source_files, device=args.device,
+        )
     launch["manifest"] = {"path": output, "sha256": sha256_file(destination)}
     print(json.dumps({"worker": label, "status": launch["status"], "exit_code": exit_code}), flush=True)
     return launch, report

@@ -96,11 +96,20 @@ def contained(root: Path | str, relative: str) -> Path:
     return result
 
 
-def verify_file(root: Path | str, reference: dict) -> Path:
+def capture_bytes(path: Path, limit: int = MAX_ARRAY_BYTES) -> bytes:
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"excessive captured file size: {path}")
+    return data
+
+
+def verify_file(root: Path | str, reference: dict) -> bytes:
     path = contained(root, reference["path"])
-    if sha256_file(path) != reference["sha256"]:
+    data = capture_bytes(path)
+    if hashlib.sha256(data).hexdigest() != reference["sha256"]:
         raise ValueError(f"input/result digest changed: {reference['path']}")
-    return path
+    return data
 
 
 def _publish(path: Path, data: bytes) -> None:
@@ -131,10 +140,11 @@ def write_evidence(workspace: Path | str, relative: str, payload: Any) -> dict:
     return {"path": relative, "sha256": hashlib.sha256(data).hexdigest()}
 
 
-def load_numeric(path: Path, *, expected_keys: set[str] | None = None, frozen_instruction: bool = False) -> dict:
-    if path.stat().st_size > MAX_ARRAY_BYTES:
-        raise ValueError(f"excessive tensor archive size: {path}")
-    with zipfile.ZipFile(path) as archive:
+def load_numeric(source: Path | bytes, *, expected_keys: set[str] | None = None, frozen_instruction: bool = False) -> dict:
+    data = source if isinstance(source, bytes) else capture_bytes(source)
+    if len(data) > MAX_ARRAY_BYTES:
+        raise ValueError("excessive tensor archive size")
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
         names = archive.namelist()
         if len(names) != len(set(names)) or len(names) > 256:
             raise ValueError("duplicate/excessive tensor keys")
@@ -155,7 +165,7 @@ def load_numeric(path: Path, *, expected_keys: set[str] | None = None, frozen_in
                     raise ValueError("only numeric non-object tensors are allowed")
                 if math.prod(shape) * dtype.itemsize > MAX_ARRAY_BYTES:
                     raise ValueError("excessive declared array size")
-    with np.load(path, allow_pickle=False) as archive:
+    with np.load(io.BytesIO(data), allow_pickle=False) as archive:
         if expected_keys is not None and set(archive.files) != expected_keys:
             raise ValueError("unexpected tensor keys")
         result = {key: archive[key] for key in archive.files}
@@ -278,7 +288,11 @@ def validate_profile(profile: dict) -> None:
             raise ValueError("no actual SDPA calls observed")
 
 
-def validate_replay_manifest(report: dict, workspace: Path | str, expected_cases: list) -> None:
+def validate_replay_manifest(
+    report: dict, workspace: Path | str, expected_cases: list, *,
+    expected_session: str, input_lock: dict, backend: str, purpose: str,
+    checkpoint_fingerprint: str, image_digest: str, source_files: dict, device: str,
+) -> None:
     if report.get("evidence_kind") != "real_model":
         raise ValueError("only real_model evidence may complete a replay")
     if report.get("status") != "complete":
@@ -289,6 +303,21 @@ def validate_replay_manifest(report: dict, workspace: Path | str, expected_cases
         raise ValueError("executed coverage is incomplete")
     if report.get("prerequisite_errors"):
         raise ValueError("unresolved worker errors")
+    if report.get("session") != expected_session or report.get("stage") != purpose:
+        raise ValueError("worker session/stage differs from launcher")
+    if report.get("input_fingerprint") != input_lock["fingerprint"]:
+        raise ValueError("worker input fingerprint differs from locked input")
+    if checkpoint_fingerprint != input_lock["checkpoint_fingerprint"]:
+        raise ValueError("launcher checkpoint differs from input lock")
+    observed = report["profile"]
+    for key, expected in (
+        ("backend", backend), ("purpose", purpose), ("checkpoint_fingerprint", checkpoint_fingerprint),
+        ("image_digest", image_digest), ("owned_source_files", source_files),
+        ("owned_source_fingerprint", fingerprint_configuration(source_files)), ("device", device),
+        ("joint_order", input_lock["joint_order"]), ("camera_order", input_lock["camera_order"]),
+    ):
+        if observed.get(key) != expected:
+            raise ValueError(f"worker profile {key} differs from launcher")
     for key in ("input_fingerprint", "session", "started_at", "ended_at"):
         if not report.get(key):
             raise ValueError(f"missing manifest {key}")
@@ -300,6 +329,13 @@ def validate_replay_manifest(report: dict, workspace: Path | str, expected_cases
     for expected, case in zip(expected_cases, report["cases"], strict=True):
         if case["key"] != expected:
             raise ValueError("case coverage mismatch")
+        if expected not in input_lock["schedule"]:
+            raise ValueError("case is outside locked schedule")
+        record = next((r for r in input_lock["records"] if r["file"] == expected["record"]), None)
+        if record is None or case.get("record_sha256") != record["sha256"]:
+            raise ValueError("case record digest differs from locked record")
+        if case.get("instruction") != record["instruction"]:
+            raise ValueError("case instruction differs from locked record")
         arrays = read_tensors(workspace, case["tensors"])
         for key, shape in (("raw", RAW_SHAPE), ("noise", RAW_SHAPE), ("decoded", DECODED_SHAPE)):
             if key not in arrays or arrays[key].shape != shape:
@@ -433,6 +469,24 @@ def sampling_observer(seed: int, *, capture: bool = True):
     import torch
     import torch.nn.functional as functional
     from torch.overrides import TorchFunctionMode
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class ComputeObserver(TorchDispatchMode):
+        def __init__(self, owner):
+            self.owner = owner
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            self.owner.observe_context()
+            dtypes = floating_dtypes(args) | floating_dtypes(kwargs)
+            result = func(*args, **kwargs)
+            dtypes.update(floating_dtypes(result))
+            if dtypes:
+                self.owner.floating_operation_count += 1
+                self.owner.compute_dtypes.update(dtypes)
+                if dtypes != {"torch.float32"} and len(self.owner.non_fp32_operations) < 64:
+                    self.owner.non_fp32_operations.append({"operation": str(func), "dtypes": sorted(dtypes)})
+            return result
 
     class Observer(TorchFunctionMode):
         def __init__(self):
@@ -446,9 +500,33 @@ def sampling_observer(seed: int, *, capture: bool = True):
             self.noise_device = None
             self.rng_before = None
             self.rng_after = None
+            self.floating_operation_count = 0
+            self.non_fp32_operations = []
+            self.dispatch = ComputeObserver(self) if capture else None
+
+        def __enter__(self):
+            super().__enter__()
+            if self.dispatch is not None:
+                self.dispatch.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            try:
+                if self.dispatch is not None:
+                    self.dispatch.__exit__(*exc)
+            finally:
+                super().__exit__(*exc)
+
+        def observe_context(self):
+            self.autocast |= torch.is_autocast_enabled("cuda") or torch.is_autocast_enabled("cpu")
+            self.tf32 |= torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
+            if capture:
+                # Function mode sees autocast before dispatcher lowering; the
+                # dispatch mode observes actual operations, including direct ATen.
+                self.observe_context()
             if func is torch.randn:
                 # This mode surrounds inference only, never model initialization.
                 shape = kwargs.get("size", args[0] if args else ())
@@ -477,8 +555,6 @@ def sampling_observer(seed: int, *, capture: bool = True):
                 return output
             if capture and func is functional.scaled_dot_product_attention:
                 self.sdpa_calls += 1
-                self.autocast |= torch.is_autocast_enabled("cuda") or torch.is_autocast_enabled("cpu")
-                self.tf32 |= torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
                 self.compute_dtypes.update(floating_dtypes(args))
                 output = func(*args, **kwargs)
                 self.compute_dtypes.update(floating_dtypes(output))
@@ -564,6 +640,8 @@ def trace_prediction(adapter, arrays, entry, seed: int, identity: dict) -> tuple
         "buffer_dtypes": sorted({str(p.dtype) for p in buffers}),
         "input_dtypes": sorted(input_dtypes), "backbone_dtypes": sorted(backbone_dtypes),
         "compute_dtypes": sorted(observer.compute_dtypes),
+        "floating_operation_count": observer.floating_operation_count,
+        "non_fp32_operations": observer.non_fp32_operations,
         "noise_dtype": str(observer.noise.dtype), "raw_dtype": str(raw.dtype),
         "attention": sorted(adapter.attention_implementations()),
         "sdpa_calls": observer.sdpa_calls, "eval": all(not m.training for m in model.modules()),

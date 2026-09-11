@@ -530,3 +530,81 @@ def test_full_600_case_stream_preserves_order_instructions_and_distinct_seeds(tm
     assert {case["key"]["seed"] for case in report.cases[:5]} == {42, 43, 44, 45, 46}
     assert len(list((tmp_path / "workers/cases").glob("*.json"))) == 600
     assert report.evidence_kind == "hermetic_fixture"
+
+
+
+def golden_execution_fixture(workspace, *, collection="pre-live", identity="a" * 32):
+    api = contract()
+    lock = schedule_lock()
+    schedule = {"schema_version": 1, "session": "TEST_ONLY-execution",
+                "input_fingerprint": lock["fingerprint"], "kind": "replay", "cases": lock["schedule"],
+                "evidence_kind": "test_only", "execution": {
+                    "id": identity, "collection": collection,
+                    "started_at": "2026-09-11T00:00:00+00:00",
+                    "worker_manifest": f"workers/native-operational-golden-{collection}.json"}}
+    reference = api.write_evidence(workspace, f"golden-{collection}-schedule.json", schedule)
+    report = api.ReplayManifest("TEST_ONLY-execution", "operational", lock["fingerprint"],
+                                lock["schedule"], evidence_kind="test_only",
+                                started_at="2026-09-11T00:00:01+00:00")
+    binding = {**schedule["execution"], "schedule": reference}
+    return api, lock, report, schedule, binding
+
+
+def test_golden_case_producer_preserves_execution_in_durable_bytes(tmp_path):
+    api, lock, report, schedule, binding = golden_execution_fixture(tmp_path)
+    # Assigning the expected extension works on the old dataclass too: RED must
+    # demonstrate that the actual writer drops it, not fail at construction.
+    report.execution = binding
+    def trace(key):
+        observed, arrays, entry = fixture_trace(key, lock)
+        observed["purpose"] = "operational"
+        return observed, arrays, entry
+    api.execute_cases(report, tmp_path, lock, lock["schedule"][:2], trace,
+                      "native-operational-golden-pre-live")
+    for row in report.cases:
+        saved = api.read_json(tmp_path / row["evidence"]["path"])
+        assert saved.get("execution") == binding, "Case writer must retain actual execution and schedule identity"
+        assert row["execution"] == saved["execution"]
+        assert report.started_at <= saved["started_at"] <= saved["ended_at"]
+
+
+@pytest.mark.parametrize("problem", ["wrong-worker", "wrong-schedule", "no-execution", "bad-id", "future-start"])
+def test_golden_worker_binds_schedule_before_any_trace(tmp_path, problem):
+    api, lock, report, schedule, binding = golden_execution_fixture(tmp_path)
+    assert callable(getattr(api, "bind_worker_execution", None)), "Worker entrypoint needs schedule binding"
+    output = binding["worker_manifest"]
+    path = tmp_path / binding["schedule"]["path"]
+    if problem == "wrong-worker":
+        output = "workers/native-operational-golden-candidate.json"
+    elif problem == "wrong-schedule":
+        path = tmp_path / "TEST_ONLY-wrong-schedule.json"
+        api.write_evidence(tmp_path, path.name, schedule)
+    elif problem == "no-execution":
+        schedule.pop("execution")
+    elif problem == "bad-id":
+        schedule["execution"]["id"] = "old-case"
+    elif problem == "future-start":
+        schedule["execution"]["started_at"] = "2026-09-11T01:00:00+00:00"
+    with pytest.raises(ValueError):
+        api.bind_worker_execution(report, tmp_path, path, schedule, output)
+    assert not report.cases
+
+
+def test_golden_worker_schedule_binding_reaches_case_producer(tmp_path):
+    api, lock, report, schedule, binding = golden_execution_fixture(tmp_path)
+    assert callable(getattr(api, "bind_worker_execution", None)), "Worker entrypoint needs schedule binding"
+    api.bind_worker_execution(report, tmp_path, tmp_path / binding["schedule"]["path"],
+                              schedule, binding["worker_manifest"])
+    assert report.execution == binding
+    times = iter(["2026-09-11T00:00:02+00:00", "2026-09-11T00:00:03+00:00"])
+    def trace(key):
+        observed, arrays, entry = fixture_trace(key, lock)
+        observed["purpose"] = "operational"
+        return observed, arrays, entry
+    api.execute_cases(report, tmp_path, lock, lock["schedule"][:1], trace,
+                      "native-operational-golden-pre-live", clock=lambda: next(times))
+    row = report.cases[0]
+    assert row["execution"] == binding
+    assert row["started_at"] == "2026-09-11T00:00:02+00:00"
+    assert row["ended_at"] == "2026-09-11T00:00:03+00:00"
+    assert api.read_json(tmp_path / row["evidence"]["path"])["execution"] == binding

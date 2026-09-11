@@ -466,7 +466,10 @@ def run(workspace, *, preflight, preflight_attempt, runtime_source,
             controller.connect(calibrate=False)
             stop.check()
             policy = policy_factory()
-            for index in range(1, TRIALS + 1):
+            approval = gate.validate_live_approval(ev)
+            trial_count = 1 if approval.get("approval_scope") == list(gate.MILESTONE_TRIAL1_SCOPE) else TRIALS
+            result["authorized_trials"] = trial_count
+            for index in range(1, trial_count + 1):
                 stop.check()
                 stage = f"trial-{index:02d}"
                 reference, rv = collect_preflight(ev, stage=stage, attempt=1,
@@ -524,6 +527,8 @@ def run(workspace, *, preflight, preflight_attempt, runtime_source,
         for t in result["trials"])
     if len(result["trials"]) == TRIALS and result["directional_successes"] >= 2 and not stop.stopped:
         result["status"] = "complete"
+    if result.get("authorized_trials") == 1 and len(result["trials"]) == 1 and not stop.stopped:
+        result["status"] = "partial"  # One authorized trial cannot complete the three-trial milestone.
     write_evidence(ev.workspace, "live-run.json", result)
     return result
 

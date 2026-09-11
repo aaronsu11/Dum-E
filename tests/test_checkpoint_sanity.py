@@ -979,3 +979,17 @@ def test_constructor_settings_cannot_escape_approved_snapshot_on_input_aba(tmp_p
     except ValueError:
         pass  # Refusal before construction is also safe.
     assert "UNAPPROVED-PORT" not in constructed_ports, "constructor must consume the approved captured settings"
+
+
+def test_trial1_only_runner_stops_after_one_observation(tmp_path, monkeypatch):
+    prepared = setup_run(tmp_path)
+    validate = gate.validate_live_approval
+    def one_trial(*args, **kwargs):
+        return {**validate(*args, **kwargs), "approval_scope": list(gate.MILESTONE_TRIAL1_SCOPE)}
+    monkeypatch.setattr(gate, "validate_live_approval", one_trial)
+    result, targets, delays, _, _ = full_run(tmp_path, monkeypatch, prepared=prepared)
+    assert result["authorized_trials"] == 1
+    assert result["status"] == "partial"
+    assert len(result["trials"]) == 1 and result["trials"][0]["iterations"] == 20
+    assert len([t for t in targets if isinstance(t, dict)]) == 20 * 16
+    assert delays.count(0.05) == 320

@@ -266,3 +266,16 @@ def test_runner_binds_scoped_sources_and_refuses_drift_before_construction(works
                    runtime_source=source, clock=clock,
                    controller_factory=lambda **_: constructed.append(True))
     assert not constructed and not (workspace / "live-run.json").exists()
+
+
+def test_trial1_only_approval_cannot_release_later_trials(workspace):
+    prepare(workspace)
+    answers = iter(["Session user", "Let's rerun trial 1", "approve"])
+    fixtures.cli().record_decision(workspace, "live", prompt=lambda _: next(answers),
+                                   clock=lambda: fixtures.ts(25), test_only=True, trial1_only=True)
+    record = gate.validate_live_approval(ev(workspace))
+    assert record["approval_scope"] == list(gate.MILESTONE_TRIAL1_SCOPE)
+    for stage in ("trial-02", "trial-03"):
+        with pytest.raises(ValueError, match="trial-1-only approval"):
+            gate.assert_live_release(ev(workspace), {}, expected_stage=stage, runtime={},
+                                     current_calibration_sha256="unused")

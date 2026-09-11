@@ -79,6 +79,7 @@ DECISIONS = {
 STAGES = ("review", "live", "run", "trial-01", "trial-02", "trial-03")
 MILESTONE_MODE = "milestone_12"
 MILESTONE_LIVE_SCOPE = ("scoped-native-reference", "three-trial-physical-test")
+MILESTONE_TRIAL1_SCOPE = ("scoped-native-reference", "physical-trial-1-only")
 PREPROCESSING_KEYS = {"image_front", "image_wrist", "state", "tokens", "mask"}
 SEMANTIC_KEYS = {
     "backend", "purpose", "checkpoint_fingerprint", "backbone_fingerprint",
@@ -961,7 +962,7 @@ def validate_live_approval(workspace, *, decision=None):
     review = validate_release_review(ev)
     record = _decision(ev, "live", subject=decision)
     if review["release_evidence"].get("acceptance_mode") == MILESTONE_MODE:
-        require(record.get("approval_scope") == list(MILESTONE_LIVE_SCOPE),
+        require(record.get("approval_scope") in (list(MILESTONE_LIVE_SCOPE), list(MILESTONE_TRIAL1_SCOPE)),
                 "explicit combined scoped-reference and physical-test approval required")
     require(timestamp(review["ended_at"]) < timestamp(record["decided_at"]), "live approval must follow archive/review")
     return record
@@ -974,7 +975,10 @@ def assert_live_release(workspace, preflight, *, expected_stage, runtime,
     # captures current bytes again, while sharing each capture within this call.
     ev = Evidence(supplied.workspace, test_only=supplied.test_only)
     require(expected_stage in STAGES[1:], "review-stage readiness cannot release hardware")
-    validate_live_approval(ev)
+    approval = validate_live_approval(ev)
+    if approval.get("approval_scope") == list(MILESTONE_TRIAL1_SCOPE):
+        require(expected_stage in ("live", "run", "trial-01"),
+                "trial-1-only approval cannot release another trial")
     record = validate_preflight_record(ev, preflight, expected_stage=expected_stage)
     require(current_calibration_sha256 == record["calibration_sha256"], "current calibration changed")
     validate_runtime_attestation(

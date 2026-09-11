@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy_guard.parity_gate import (  # noqa: E402
-    DECISIONS, MILESTONE_LIVE_SCOPE, MILESTONE_MODE, DecisionRecord, Evidence, PrerequisiteError,
+    DECISIONS, MILESTONE_LIVE_SCOPE, MILESTONE_TRIAL1_SCOPE, MILESTONE_MODE, DecisionRecord, Evidence, PrerequisiteError,
     decision_evidence, evidence,
     fingerprint_configuration, require, timestamp, utc_now, validate_closeout,
     validate_golden_approval, validate_golden_candidate, validate_live_approval,
@@ -29,7 +29,7 @@ def _required(prompt, message):
             return answer
 
 
-def record_decision(workspace, kind, *, prompt=input, clock=utc_now, test_only=False):
+def record_decision(workspace, kind, *, prompt=input, clock=utc_now, test_only=False, trial1_only=False):
     """Canonical writer for tolerance, golden and live review, including rejection.
 
     The optional prompt/clock/test_only arguments are injection seams for tests
@@ -45,10 +45,12 @@ def record_decision(workspace, kind, *, prompt=input, clock=utc_now, test_only=F
     print(f"Review {kind}: {ev.reference(subject_name)['sha256']}")
     print(canonical(subject).decode())
     milestone_live = kind == "live" and subject["release_evidence"].get("acceptance_mode") == MILESTONE_MODE
+    require(not trial1_only or milestone_live, "trial-1-only scope requires milestone live review")
     if kind == "live":
         print("joint_order:", ", ".join(ev.json("input-lock.json")["joint_order"]))
         if milestone_live:
-            print("This decision approves the scoped native reference AND the three-trial physical test together.")
+            print("This decision approves the scoped native reference AND " +
+                  ("physical trial 1 only." if trial1_only else "the three-trial physical test together."))
             print("coverage: 12 observations / one seed per observation; exhaustive parity is not established")
             print("native reference:", canonical(ev.reference("milestone-golden-candidate.json")).decode())
             print("fresh native verification:", canonical(ev.reference("milestone-golden-replay.json")).decode())
@@ -70,7 +72,8 @@ def record_decision(workspace, kind, *, prompt=input, clock=utc_now, test_only=F
     operator = _required(prompt, "Operator identity (required): ")
     rationale = _required(prompt, "Intentional-change/review rationale (required): ")
     while True:
-        question = ("Type approve or reject for this exact scoped native reference AND three-trial physical test (no default): "
+        question = ("Type approve or reject for this exact scoped native reference AND " +
+                    ("physical trial 1 only" if trial1_only else "three-trial physical test") + " (no default): "
                     if milestone_live else "Type approve or reject for this exact subject (no default): ")
         answer = _required(prompt, question).lower()
         if answer in ("approve", "reject"):
@@ -84,7 +87,7 @@ def record_decision(workspace, kind, *, prompt=input, clock=utc_now, test_only=F
         "evidence_kind": "test_only" if test_only else "real_model",
     }
     if milestone_live:
-        record["approval_scope"] = list(MILESTONE_LIVE_SCOPE)
+        record["approval_scope"] = list(MILESTONE_TRIAL1_SCOPE if trial1_only else MILESTONE_LIVE_SCOPE)
     require(timestamp(subject["ended_at"]) <= timestamp(record["decided_at"]), "decision predates subject")
     if record["decision"] == "approved":
         {"tolerances": validate_tolerance_agreement, "golden": validate_golden_approval,

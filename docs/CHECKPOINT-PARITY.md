@@ -240,3 +240,92 @@ Changing matmul TF32 while cuDNN TF32 stays enabled changes the operational
 configuration and invalidates the attestation. Diagnostics require both flags
 false. Older evidence lacking the pair is historical context, not a current
 profile or release witness.
+
+
+## Measured proposal awaiting Task 3 agreement
+
+Workspace: `corpus/phase7-tf32-pair-20260911`, a fresh successor linked through
+`session.json` to the retained earlier attempts. All measured instrument files
+match reviewed source at `2dc8cc6`. Calibration was freshly derived through the
+canonical resolver; no robot was constructed or connected.
+
+Proposal file: `corpus/phase7-tf32-pair-20260911/tolerance-proposal.json`.
+The exact file SHA-256 used by the decision writer is:
+
+```text
+579e1d8361f71b9a514ad1f97cdc4364c6f21e56fb41627f2db3c4de435c5266
+```
+
+The fixed schedule completed **192 real cases in 52 serial processes** from
+2026-09-11 16:10:40 to 16:32:39 UTC. Each profile completed 48 cases in 13
+processes: six fixed records, five same-seed warm repeats and one changed-seed
+control per record, then two independent same-seed cold processes per record.
+All 24 changed-seed controls passed; every same-seed raw, preprocessing and
+decoded deviation was zero, including per-joint and per-trace bias/slope metrics.
+The independent `check --stage repeatability` reconstructed and validated the
+worker/case witnesses, process identities, chronology, statistics and source hashes.
+
+| Measured profile | Device / parameters | Attention | TF32 matmul / cuDNN |
+| --- | --- | --- | --- |
+| Native diagnostic | CPU / FP32 | SDPA | false / false |
+| LeRobot diagnostic | CPU / FP32 | SDPA | false / false |
+| Native operational | CUDA:0 / BF16 | FlashAttention 2 | false / true |
+| LeRobot operational | CUDA:0 / BF16 | SDPA | false / true |
+
+Both diagnostics observed only FP32 compute; both operational profiles observed
+BF16/FP32 compute. All four observed four flow steps. CPU diagnostics are the
+measured fallback: checkpoint FP32 parameter storage is 12,576,064,000 bytes,
+greater than the GPU's measured 12,487,294,976-byte capacity.
+
+Before the long schedule, a real frozen-record gRPC request independently matched
+the LeRobot operational configuration, ordered processors, both TF32 flags and
+ambient deployed seed policy. It returned the complete `(16,6)` chunk, with one
+`(1,40,132)` sampler draw, four flow steps and 196 observed SDPA calls. This
+attestation is retained historical measurement evidence; later live release
+still requires its own fresh request and host observation.
+
+The unchanged pinned stock producer also completed on CPU, retaining its two-model
+lifetime and dumping exactly `new_embodiment` at seed 42. Observation verified
+full `(2,40,132)` raw/noise tensors, actual FP32/SDPA/four-step computation,
+both TF32 flags off, and observer inertness. Its consumer has not run.
+Producer feasibility uses its own directory and does not replace the future
+agreement-bound stock producer/consumer execution.
+
+All four comparison scopes—diagnostic, native precision bridge, LeRobot precision
+bridge and operational—propose the following bounds for every joint:
+
+| Boundary / metric | Proposed bound |
+| --- | --- |
+| Floating preprocessing | atol `1e-6`, rtol `1e-6` |
+| Tokens, masks and categorical data | exact equality |
+| Full raw output | atol `1e-3`, rtol `1e-3` |
+| Decoded maximum absolute error | `0.1` |
+| Decoded mean absolute error | `0.05` |
+| Absolute decoded bias, individual trace and aggregate | `0.02` |
+| Absolute OLS slope over indices 0–15, individual trace and aggregate | `0.002` per index |
+| Native operational golden replay | atol `1e-5`, rtol `0` |
+
+Decoded units are checkpoint percent for each of the five arm joints and gripper
+percent for the sixth. The rule is four times the largest relevant same-backend
+measurement with the stated floors. Since all observed repeatability deviations
+were zero, the floors determine this proposal. Raw floors follow the pinned
+stock defaults; decoded floors are an explicit prospective engineering budget,
+requiring human agreement. The factor of four is not a confidence interval.
+For the current arm calibration, the `0.1` percent maximum-error floor corresponds
+to approximately 0.0966–0.18 degrees, depending on the joint; this arithmetic
+interpretation grants no motion permission.
+
+Diagnostic noise must match exactly in the eventual comparison. Operational
+bridges retain independent noise and all individual/aggregate error bounds;
+equal integer seeds do not establish cross-dtype noise equality. These strict
+bounds may fail under independent noise, and no adaptive loosening is authorized.
+The six-record repeatability schedule does not establish actual 600-case
+cross-backend coverage or parity. Historical `seed_verdict: not-honored`,
+unknown training calibration/backbone provenance, and forced-letterbox geometry
+caveats remain unchanged.
+
+**Task 3 is a blocking-human decision.** No tolerance agreement, cross-backend
+residual, stock consumer, full-600 comparison or hardware run has occurred.
+The next action is explicit named human review of the exact proposal digest.
+The executor may transcribe an actual affirmative response and its provenance;
+absence of a response, parent readiness or a successful measurement is not assent.

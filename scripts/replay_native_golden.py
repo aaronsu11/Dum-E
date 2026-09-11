@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy_guard.golden import (  # noqa: E402
@@ -108,8 +109,10 @@ def collect(args, ev, worker, probe, clock, *, stage):
     require(current["image_digest"] == native_profile(ev)["image_digest"], "current native image changed")
     schedule = ev.json("input-lock.json")["schedule"]
     schedule_file = f"golden-{stage}-schedule.json"
-    write_evidence(args.workspace, schedule_file, {
-        "schema_version": 1, **identity, "kind": "replay", "cases": schedule,
+    execution = {"id": uuid4().hex, "collection": stage, "started_at": start,
+                 "worker_manifest": f"workers/native-operational-golden-{stage}.json"}
+    schedule_ref = write_evidence(args.workspace, schedule_file, {
+        "schema_version": 1, **identity, "kind": "replay", "cases": schedule, "execution": execution,
         "evidence_kind": "test_only" if ev.test_only else "real_model",
     })
     record = {
@@ -118,6 +121,7 @@ def collect(args, ev, worker, probe, clock, *, stage):
         "profile": "native-operational", "cases": schedule,
         "agreement": ev.reference("tolerance-agreement.json"), "current_inputs": current,
         "current_fingerprint": digest(current), "prerequisite_errors": [],
+        "execution": {**execution, "schedule": schedule_ref},
     }
     if stage == "candidate":
         record.update(reason=args.reason, previous=previous)
@@ -128,7 +132,7 @@ def collect(args, ev, worker, probe, clock, *, stage):
         record["worker"] = launch
         if launch["status"] == "not_run":
             raise PrerequisiteError("native operational worker did not run")
-        arrays = consume_worker(ev, launch, schedule)
+        arrays = consume_worker(ev, launch, schedule, record)
         record["tensors"] = write_tensors(args.workspace, arrays)
         after = probe(args)
         require(after == current, "relevant source/configuration changed during replay")

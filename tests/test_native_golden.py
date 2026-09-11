@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from policy_guard.replay_contract import (
-    BACKBONE_REVISION, ReplayManifest, execute_cases, fingerprint_configuration as digest,
+    BACKBONE_REVISION, ReplayManifest, bind_worker_execution, execute_cases, fingerprint_configuration as digest,
     read_json, write_evidence, write_tensors,
 )
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -96,6 +96,9 @@ class HermeticWorker:
             input_fingerprint=lock["fingerprint"], expected_cases=cases,
             started_at=ts(self.second + 1 if self.second is not None else (21 if "candidate" in suffix else 41)), evidence_kind="test_only",
         )
+        bind_worker_execution(report, workspace, workspace / schedule_file,
+                              read_json(workspace / schedule_file),
+                              f"workers/native-operational{suffix}.json")
         seen = []
         def trace(key):
             if self.fail_at == len(seen):
@@ -129,7 +132,12 @@ class HermeticWorker:
             }
             return profile, tensors, lock["records"][index]
         try:
-            execute_cases(report, workspace, lock, cases, trace, "native-operational" + suffix)
+            from datetime import datetime, timedelta
+            ticks = iter(range(len(cases) * 2))
+            def case_clock():
+                return (datetime.fromisoformat(report.started_at) +
+                        timedelta(microseconds=next(ticks))).isoformat()
+            execute_cases(report, workspace, lock, cases, trace, "native-operational" + suffix, clock=case_clock)
             report.status = "complete"
         except Exception as exc:
             report.status = "failed"
@@ -723,3 +731,75 @@ def test_current_backbone_must_match_independently_measured_profile(approved_cop
     worker = HermeticWorker()
     assert run(workspace, command, worker=worker, second=50, probe=changed, extra=options) == 1
     assert not worker.calls
+
+
+
+@pytest.mark.parametrize("problem", ["candidate-cases", "copied-candidate-bytes", "missing-execution",
+                                     "different-execution", "old-case-times", "missing-case-times",
+                                     "schedule-changed"])
+def test_durable_cases_bind_collection_even_with_fresh_worker_summary(approved_copy, problem):
+    from policy_guard.replay_contract import canonical
+    ev = api().Evidence(approved_copy, test_only=True)
+    replay = ev.json("golden-replay.json")
+    candidate = ev.json("golden-candidate.json")
+    worker = copy.deepcopy(ev.json(replay["worker"]["manifest"]))
+    candidate_worker = ev.json(candidate["worker"]["manifest"])
+    original = {name: ev.bytes(name) for name in
+                ("golden-candidate.json", "golden-approval.json", "golden-manifest.json")}
+    if problem == "candidate-cases":
+        # Keep replay execution, worker path and dates; only substitute old cases.
+        worker["cases"] = copy.deepcopy(candidate_worker["cases"])
+    elif problem == "schedule-changed":
+        rewrite(approved_copy, replay["execution"]["schedule"]["path"],
+                lambda schedule: schedule["execution"].update(id="f" * 32))
+    else:
+        row = worker["cases"][0]
+        path = row["evidence"]["path"]
+        saved = copy.deepcopy(ev.json(row["evidence"]))
+        if problem == "copied-candidate-bytes":
+            row = copy.deepcopy(candidate_worker["cases"][0])
+            saved = copy.deepcopy(ev.json(row["evidence"]))
+            worker["cases"][0] = row
+        elif problem == "missing-execution":
+            row.pop("execution")
+            saved.pop("execution")
+        elif problem == "different-execution":
+            # Copy only this row so no mutation propagates into the top binding.
+            row["execution"] = {**row["execution"], "id": "f" * 32}
+            saved["execution"] = row["execution"]
+        elif problem == "old-case-times":
+            row.update(started_at=ts(21), ended_at=ts(22))
+            saved.update(started_at=ts(21), ended_at=ts(22))
+        elif problem == "missing-case-times":
+            for name in ("started_at", "ended_at"):
+                row.pop(name)
+                saved.pop(name)
+        data = canonical(saved) + b"\n"
+        (approved_copy / path).write_bytes(data)
+        row["evidence"] = {"path": path, "sha256": hashlib.sha256(data).hexdigest()}
+    # Deliberately update synthetic wrapper hashes so validation must examine
+    # the case binding, not merely reject a stale outer digest or filename.
+    path = replay["worker"]["manifest"]["path"]
+    data = canonical(worker) + b"\n"
+    (approved_copy / path).write_bytes(data)
+    ref = {"path": path, "sha256": hashlib.sha256(data).hexdigest()}
+    rewrite(approved_copy, "golden-replay.json", lambda record: record["worker"].update(manifest=ref))
+    assert run(approved_copy, "check", second=50, extra=["--stage", "pre-live"]) == 1
+    assert all((approved_copy / name).read_bytes() == data for name, data in original.items())
+
+
+def test_full_600_cases_have_distinct_candidate_and_replay_execution(approved_copy):
+    ev = api().Evidence(approved_copy, test_only=True)
+    candidate, replay = (ev.json(name) for name in ("golden-candidate.json", "golden-replay.json"))
+    assert candidate["execution"]["id"] != replay["execution"]["id"]
+    for record in (candidate, replay):
+        worker = ev.json(record["worker"]["manifest"])
+        assert worker["execution"] == record["execution"]
+        assert len(worker["cases"]) == 600
+        previous = api().timestamp(worker["started_at"])
+        for row in worker["cases"]:
+            saved = ev.json(row["evidence"])
+            assert saved["execution"] == record["execution"]
+            assert previous <= api().timestamp(saved["started_at"]) <= api().timestamp(saved["ended_at"])
+            previous = api().timestamp(saved["ended_at"])
+        assert previous <= api().timestamp(worker["ended_at"])

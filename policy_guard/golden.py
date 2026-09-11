@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import re
 
 import numpy as np
 
@@ -71,7 +72,34 @@ def validate_backbone_identity(current, measured):
             "current native backbone digest differs from measured profile")
 
 
-def consume_worker(ev, launch, expected_cases):
+def collection_execution(ev, collection, launch, report, cases):
+    stage = collection["stage"]
+    require(stage in ("candidate", *STAGE_FILES), "unknown native collection")
+    schedule_ref = ev.reference(f"golden-{stage}-schedule.json")
+    schedule = ev.json(schedule_ref)
+    for key, value in ev.identity().items():
+        require(schedule[key] == value, "collection schedule identity mismatch")
+    require(schedule["schema_version"] == 1 and schedule["kind"] == "replay" and
+            schedule["cases"] == cases and schedule["evidence_kind"] == collection["evidence_kind"],
+            "collection schedule coverage or evidence kind mismatch")
+    base = schedule["execution"]
+    require(set(base) == {"id", "collection", "started_at", "worker_manifest"} and
+            isinstance(base["id"], str) and re.fullmatch(r"[0-9a-f]{32}", base["id"]) is not None,
+            "invalid native execution identifier")
+    expected_manifest = f"workers/native-operational-golden-{stage}.json"
+    require(base["collection"] == stage and base["started_at"] == collection["started_at"] and
+            base["worker_manifest"] == expected_manifest, "execution belongs to another collection")
+    binding = {**base, "schedule": schedule_ref}
+    require(collection["execution"] == report["execution"] == binding,
+            "worker execution or schedule binding mismatch")
+    require(launch["manifest"]["path"] == expected_manifest,
+            "worker manifest outside this collection namespace")
+    require(timestamp(base["started_at"]) <= timestamp(report["started_at"]),
+            "worker execution predates collection")
+    return binding
+
+
+def consume_worker(ev, launch, expected_cases, collection):
     """Validate durable operational case evidence and retain actual RNG provenance."""
     require(launch["status"] == "complete" and launch["exit_code"] == 0,
             "native worker failed or incomplete")
@@ -94,14 +122,26 @@ def consume_worker(ev, launch, expected_cases):
     require(profile_configuration(profile) == profile_configuration(native_profile(ev)),
             "measured native profile changed; new repeatability/agreement required")
     require(timestamp(report["started_at"]) <= timestamp(report["ended_at"]), "worker chronology reversed")
+    execution = collection_execution(ev, collection, launch, report, expected_cases)
+    previous_end = timestamp(report["started_at"])
     records = {row["file"]: row for row in ev.json("input-lock.json")["records"]}
     collected = {name: [] for name in ("raw", "noise", "decoded")}
-    for key, row in zip(expected_cases, report["cases"], strict=True):
+    for index, (key, row) in enumerate(zip(expected_cases, report["cases"], strict=True)):
         require(row["key"] == key, "worker case order changed")
         record = records[key["record"]]
         require(row["record_sha256"] == record["sha256"] and row["instruction"] == record["instruction"],
                 "record bytes or language identity changed")
+        label = Path(execution["worker_manifest"]).stem
+        require(row["evidence"]["path"] == f"workers/cases/{label}-{index:04d}.json",
+                "durable case outside this execution namespace")
         saved = ev.json(row["evidence"])
+        require(row["execution"] == saved["execution"] == execution,
+                "durable case belongs to another execution")
+        require(row["started_at"] == saved["started_at"] and row["ended_at"] == saved["ended_at"],
+                "durable case chronology differs from worker")
+        require(previous_end <= timestamp(saved["started_at"]) <= timestamp(saved["ended_at"]) <=
+                timestamp(report["ended_at"]), "durable case chronology outside worker execution")
+        previous_end = timestamp(saved["ended_at"])
         require(all(saved.get(k) == v for k, v in row.items() if k != "evidence"),
                 "durable case differs from worker manifest")
         for name, value in (("session", identity["session"]), ("stage", "operational"),
@@ -137,7 +177,8 @@ def validate_candidate(workspace, *, _depth=0):
             "candidate current identity digest changed")
     if candidate.get("previous") is not None:
         validate_previous(ev, candidate["previous"], _depth=_depth)
-    arrays = consume_worker(ev, candidate["worker"], candidate["cases"])
+    require(candidate["stage"] == "candidate", "candidate collection required")
+    arrays = consume_worker(ev, candidate["worker"], candidate["cases"], candidate)
     stored = ev.tensors(candidate["tensors"])
     require(all(np.array_equal(arrays[k], stored[k]) for k in arrays),
             "candidate tensors differ from actual worker")
@@ -206,7 +247,8 @@ def compare_native_replay(workspace, replay):
     require(timestamp(approval["decided_at"]) < timestamp(replay["started_at"]),
             "fresh replay must follow approval")
     validate_tolerance_agreement(ev, comparison_started_at=replay["started_at"])
-    observed = consume_worker(ev, replay["worker"], replay["cases"])
+    require(replay["stage"] in STAGE_FILES, "verification collection required")
+    observed = consume_worker(ev, replay["worker"], replay["cases"], replay)
     right = ev.tensors(replay["tensors"])
     require(set(right) == set(observed) and all(np.array_equal(observed[k], right[k]) for k in observed),
             "replay tensors differ from actual worker output")

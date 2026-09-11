@@ -266,6 +266,7 @@ class ReplayManifest:
     prerequisite_errors: list = field(default_factory=list)
     resources: dict = field(default_factory=dict)
     failure_ledger: list = field(default_factory=list)
+    execution: dict | None = None
 
 
 def base_case(key: dict) -> dict:
@@ -320,18 +321,27 @@ def profile_configuration(profile: dict) -> dict:
     )}
 
 
-def execute_cases(report, workspace, lock, cases, trace_case, label):
+def execute_cases(report, workspace, lock, cases, trace_case, label, *, clock=now):
     """Serialize each complete prediction/decode, publishing before the next case."""
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", label) or not cases:
         raise ValueError("invalid case stream label or empty schedule")
+    execution = json.loads(canonical(report.execution)) if report.execution is not None else None
+    if execution is not None and execution["worker_manifest"] != f"workers/{label}.json":
+        raise ValueError("case namespace differs from bound worker execution")
     for index, key in enumerate(cases):
         try:
+            case_started = clock()
             profile, tensors, entry = trace_case(key)
             reference = write_tensors(workspace, tensors)
             case = {"key": key, "record_sha256": entry["sha256"],
                     "instruction": entry["instruction"], "tensors": reference,
                     "observer_inert": profile["observer_inert"],
                     "profile_fingerprint": fingerprint_configuration(profile)}
+            if execution is not None:
+                case_ended = clock()
+                if report.execution != execution or datetime.fromisoformat(case_ended) < datetime.fromisoformat(case_started):
+                    raise ValueError("execution changed or case chronology reversed")
+                case.update(execution=execution, started_at=case_started, ended_at=case_ended)
             current = fingerprint_configuration(profile_configuration(profile))
             issue = None
             try:
@@ -872,6 +882,35 @@ def prerequisite_exception(exc: Exception) -> bool:
     )
 
 
+def bind_worker_execution(report, workspace, schedule_path, schedule, output_manifest):
+    # Optional for prior workers; golden collections require it at the consumer.
+    binding = schedule.get("execution")
+    if binding is None:
+        if output_manifest.startswith("workers/native-operational-golden-"):
+            raise ValueError("golden worker requires execution binding")
+        return
+    if set(binding) != {"id", "collection", "started_at", "worker_manifest"}:
+        raise ValueError("invalid worker execution fields")
+    if not isinstance(binding["id"], str) or not re.fullmatch(r"[0-9a-f]{32}", binding["id"]):
+        raise ValueError("invalid worker execution identifier")
+    stage = binding["collection"]
+    if stage not in ("candidate", "pre-live", "final"):
+        raise ValueError("invalid golden collection")
+    expected = f"workers/native-operational-golden-{stage}.json"
+    if output_manifest != expected or binding["worker_manifest"] != expected:
+        raise ValueError("worker destination differs from scheduled execution")
+    if report.stage != "operational" or schedule["kind"] != "replay":
+        raise ValueError("golden execution requires operational replay")
+    path = str(Path(schedule_path).resolve().relative_to(Path(workspace).resolve()))
+    if path != f"golden-{stage}-schedule.json":
+        raise ValueError("wrong golden execution schedule path")
+    if datetime.fromisoformat(binding["started_at"]) > datetime.fromisoformat(report.started_at):
+        raise ValueError("worker precedes collection")
+    if schedule != read_json(schedule_path) or schedule["cases"] != report.expected_cases:
+        raise ValueError("worker schedule bytes or expected cases changed")
+    report.execution = {**binding, "schedule": {"path": path, "sha256": sha256_file(schedule_path)}}
+
+
 def worker_main(backend: str, adapter_factory, stock_loader=None) -> int:
     """Immutable worker lifecycle; failed profiles retain measured evidence."""
     import argparse
@@ -901,6 +940,7 @@ def worker_main(backend: str, adapter_factory, stock_loader=None) -> int:
             session=session["session_id"], stage=args.profile,
             input_fingerprint=lock["fingerprint"], expected_cases=schedule,
         )
+        bind_worker_execution(report, workspace, args.schedule, schedule_record, args.output_manifest)
         current = load_input_lock(args.corpus, args.checkpoint)
         if current != lock:
             raise ValueError("input lock changed before worker inference")

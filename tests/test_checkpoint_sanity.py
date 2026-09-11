@@ -211,7 +211,7 @@ def test_tracer_nonstopped_prearm_readback_and_sdk_forwarding():
     assert [e[1] for e in events if e[0] == "read"] == [
         "Torque_Enable", "Present_Position", "Goal_Position", "Goal_Position",
     ]
-    assert all(e[2] == {"normalize": False, "num_retry": 3} for e in events if e[0] == "read")
+    assert all(e[2] == {"normalize": False, "num_retry": 2} for e in events if e[0] == "read")
     bus.connect()
     bus.sync_write("Goal_Position", {"shoulder_pan": 123}, normalize=False, num_retry=2)
     assert events[-1] == ("sync", 42, 2, {1: [123, 0]})
@@ -343,3 +343,63 @@ def test_tracer_missing_approval_never_constructs(tmp_path):
               clock=clock, stop=stop, controller_factory=controller,
               policy_factory=lambda: SimpleNamespace(), observe=lambda _: {})
     assert events == []
+
+
+@pytest.mark.parametrize("reset_clamp", [False, True])
+def test_tracer_actual_skill_reset_and_bounded_chunk(tmp_path, monkeypatch, reset_clamp):
+    r, ev, live, source, clock, stop, events, _ = setup_run(tmp_path)
+    from embodiment.so_arm10x import controller as cm, skills
+    delays = []
+    monkeypatch.setattr(cm, "time", SimpleNamespace(sleep=delays.append))
+    monkeypatch.setattr(skills, "time", SimpleNamespace(sleep=delays.append))
+    actions = []
+
+    class Controller(r.StopGuardedController):
+        def __init__(self, **kwargs):
+            self.stop = stop
+            events.append("construct")
+
+        def connect(self, calibrate):
+            assert calibrate is False
+            events.append("connect")
+
+        def set_target_state(self, action):
+            stop.check()
+            if isinstance(action, np.ndarray):
+                events.append("reset-target")
+                if reset_clamp:
+                    logging.warning(cm.CLAMP_WARNING_TEXT)
+                    stop.check()
+                return dict(zip(JOINT_ORDER, action, strict=True))
+            actions.append(action)
+            return action
+
+        def get_observation(self):
+            return {**dict.fromkeys(JOINT_ORDER, 0.0), "front": np.zeros((2, 2, 3), np.uint8),
+                    "wrist": np.zeros((2, 2, 3), np.uint8)}
+
+        def disconnect(self):
+            events.append("disconnect")
+
+    class Policy:
+        calls = 0
+
+        def get_action(self, observation, instruction):
+            assert instruction == "Grab a banana and put it on the plate"
+            self.calls += 1
+            if self.calls == 2:
+                stop.trip("stop during next inference")
+            return [dict.fromkeys(JOINT_ORDER, 0.0) for _ in range(16)]
+
+    result = r.run(ev, preflight=live["path"], preflight_attempt=1, runtime_source=source,
+                   controller_factory=Controller, policy_factory=Policy, observe=lambda _: {},
+                   stop=stop, clock=clock)
+    assert result["status"] == "failed" and len(result["trials"]) == 1
+    assert result["clamp_warnings"] == int(reset_clamp)
+    assert events[-1] == "disconnect"
+    if reset_clamp:
+        assert not actions and events.count("reset-target") == 1
+    else:
+        assert len(actions) == 16 and delays.count(0.05) == 16
+        assert events.count("reset-target") == 3  # inherited ready -> initial -> ready
+        assert result["trials"][0]["iterations"] == 1

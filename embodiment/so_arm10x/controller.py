@@ -711,6 +711,7 @@ class SO10xArmController(IRobotController):
         front_cam_idx: int = 1,
         use_degrees: "bool | str | None" = None,
         max_relative_target: "float | Dict[str, float] | None" = None,
+        robot_factory=None,
     ) -> None:
         if robot_port is None:
             robot_port = os.getenv("SO_ARM_PORT")
@@ -812,7 +813,9 @@ class SO10xArmController(IRobotController):
 
         # `SO100Follower is SO101Follower is SOFollower` at 0.6.1, so the single
         # consolidated class is the exact annotation for both branches.
-        self.robot: SOFollower = make_robot_from_config(self.config)
+        self.robot: SOFollower = (
+            make_robot_from_config if robot_factory is None else robot_factory
+        )(self.config)
 
         # Cache ordering used for vector<->dict conversions
         self._state_keys: List[str] = [

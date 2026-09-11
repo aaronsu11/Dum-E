@@ -295,7 +295,7 @@ def test_tracer_blocked_inference_never_dispatches_returned_actions():
     assert errors and not thread.is_alive()
 
 
-def approved_runner(workspace):
+def approved_runner(workspace, *, inputs=None):
     r = runner()
     identity, lock, pairs = fixtures.fixture_workspace(workspace)
     fixtures.complete_offline(workspace, identity, lock, pairs)
@@ -303,6 +303,8 @@ def approved_runner(workspace):
     clock = Clock(19)
     source = Runtime(clock, fixtures.runtime(15))
     source.instance = source.value["attestation"]["instance"]
+    if inputs is not None:
+        source.inputs = lambda: inputs
     review = r.preflight(ev, stage="review", attempt=1, runtime_source=source, clock=clock)
     fixtures.cli().prepare_live(gate.Evidence(workspace, test_only=True), review["path"], clock=clock)
     answers = iter(["Fixture operator", "Test-only decision", "approve"])
@@ -311,9 +313,9 @@ def approved_runner(workspace):
     return live, source, clock
 
 
-def setup_run(tmp_path):
+def setup_run(tmp_path, *, inputs=None):
     r = runner()
-    live, source, clock = approved_runner(tmp_path)
+    live, source, clock = approved_runner(tmp_path, inputs=inputs)
     ev = gate.Evidence(tmp_path, test_only=True)
     events = []
     stop = r.StopLatch()
@@ -422,7 +424,7 @@ def test_tracer_actual_skill_reset_and_bounded_chunk(tmp_path, monkeypatch, rese
 
 
 
-def full_run(tmp_path, monkeypatch, *, labels=None, stop_trial=None, prepared=None):
+def full_run(tmp_path, monkeypatch, *, labels=None, stop_trial=None, prepared=None, policy_factory=None):
     r, ev, live, source, clock, stop, events, _ = prepared or setup_run(tmp_path)
     from embodiment.so_arm10x import controller as cm, skills
     delays, targets = [], []
@@ -447,8 +449,8 @@ def full_run(tmp_path, monkeypatch, *, labels=None, stop_trial=None, prepared=No
             return action
 
         def get_observation(self):
-            return {**dict.fromkeys(JOINT_ORDER, 0.0), "front": np.zeros((2, 2, 3), np.uint8),
-                    "wrist": np.zeros((2, 2, 3), np.uint8)}
+            return {**dict.fromkeys(JOINT_ORDER, 0.0), "front": np.zeros((480, 640, 3), np.uint8),
+                    "wrist": np.zeros((480, 640, 3), np.uint8)}
 
         def get_current_images(self):
             return {"front": self.get_observation()["front"], "wrist": self.get_observation()["wrist"]}
@@ -472,7 +474,7 @@ def full_run(tmp_path, monkeypatch, *, labels=None, stop_trial=None, prepared=No
                                operator="Fixture observer") for _ in range(3)])[index - 1]
 
     result = r.run(ev, preflight=live["path"], preflight_attempt=1, runtime_source=source,
-                   controller_factory=Controller, policy_factory=Policy, observe=observe,
+                   controller_factory=Controller, policy_factory=policy_factory or Policy, observe=observe,
                    stop=stop, clock=clock)
     return result, targets, delays, source, ev
 
@@ -697,19 +699,20 @@ def test_named_observations_have_no_default_or_motion_authority():
                       "erratic": False, "grasp": False, "stop_reason": ""}
 
 
-def test_actual_attached_policy_maps_observations_and_never_loads_model(tmp_path, monkeypatch):
+def attached_source(tmp_path, monkeypatch, *, clock=None, initial=None, restart=False):
     # The production attachment and inherited get_action mapping execute against
     # a fake owned Session class. Only the runtime validator test_only argument
     # is injected; every fixture byte stays labelled test_only in this tmpdir.
     r = runner()
     import torch
     from policy.lerobot import session as sm, backend as bm
-    clock = Clock(40)
+    clock = clock or Clock(40)
     monkeypatch.setattr(r, "utc_now", clock)
-    fixtures.save(tmp_path, "profiles.json", {"serving_configuration": fixtures.semantics()})
-    initial = fixtures.runtime(30)
+    if not (tmp_path / "profiles.json").exists():
+        fixtures.save(tmp_path, "profiles.json", {"serving_configuration": fixtures.semantics()})
+    initial = initial or fixtures.runtime(30)
     path = tmp_path / "runtime/lerobot.json"
-    path.parent.mkdir()
+    path.parent.mkdir(exist_ok=True)
     path.write_bytes(fixtures.canonical(initial["attestation"]))
     events, hosts = [], []
     decoded = np.arange(96, dtype=np.float32).reshape(16, 6)
@@ -731,7 +734,11 @@ def test_actual_attached_policy_maps_observations_and_never_loads_model(tmp_path
         def infer(self, observation):
             events.append(("infer", observation))
             assert set(observation) == set(JOINT_ORDER) | {"front", "wrist", "task"}
-            rv = fixtures.runtime(clock.second + 1)
+            replaced = restart and sum(event[0] == "infer" for event in events) >= 2
+            rv = fixtures.runtime(clock.second + 1, "replacement" if replaced else initial["attestation"]["instance"]["load_id"])
+            if not replaced:
+                rv["attestation"]["instance"] = initial["attestation"]["instance"]
+                rv["host"].update(initial["attestation"]["instance"])
             rv["request"]["observation_sha256"] = gate.observation_fingerprint(observation)
             rv["request"]["output_sha256"] = gate.array_fingerprint(decoded)
             rv["attestation"]["request"] = rv["request"]
@@ -751,12 +758,20 @@ def test_actual_attached_policy_maps_observations_and_never_loads_model(tmp_path
     actual_validator = gate.validate_runtime_attestation
     def validate(*args, **kwargs):
         assert args[0]["evidence_kind"] == "test_only"
-        return actual_validator(*args, **kwargs, test_only=True)
+        kwargs["test_only"] = True
+        return actual_validator(*args, **kwargs)
     monkeypatch.setattr(gate, "validate_runtime_attestation", validate)
     source = r.RuntimeSource(SimpleNamespace(workspace=tmp_path, attestation=path, preflight=None,
                                             container="fake", endpoint="127.0.0.1:8080", checkpoint_mount="/checkpoint"))
     observation = {**dict.fromkeys(JOINT_ORDER, 0.0), "front": np.zeros((480, 640, 3), np.uint8),
                    "wrist": np.ones((480, 640, 3), np.uint8)}
+    source._runtime = initial
+    return source, observation, decoded, events
+
+
+def test_actual_attached_policy_maps_observations_and_never_loads_model(tmp_path, monkeypatch):
+    r = runner()
+    source, observation, decoded, events = attached_source(tmp_path, monkeypatch)
     try:
         actions = source.policy.get_action(observation, r.INSTRUCTION)
         assert len(actions) == 16
@@ -803,3 +818,136 @@ def test_renewal_requires_explicit_reason_before_any_new_request(tmp_path):
                     runtime_source=source, clock=clock)
     assert source.current()["request"] == request
     assert not (tmp_path / "preflights/live-0002.json").exists()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_active_trial_binds_actual_attached_session_instance(tmp_path, monkeypatch, restart):
+    prepared = setup_run(tmp_path)
+    r, ev, live, runtime, clock, stop, _, _ = prepared
+    source, _, _, events = attached_source(tmp_path, monkeypatch, clock=clock,
+                                          initial=runtime.value, restart=restart)
+    original_collect = runtime.collect
+    def collect():
+        value = original_collect()
+        source._runtime = value
+        source.attestation_path.write_bytes(fixtures.canonical(value["attestation"]))
+        return value
+    runtime.collect = collect
+    runtime.current = lambda: source._runtime
+    result, targets, _, _, _ = full_run(tmp_path, monkeypatch, prepared=prepared,
+                                       policy_factory=lambda: source.policy)
+    actions = [target for target in targets if isinstance(target, dict)]
+    if restart:
+        assert result["status"] == "failed", "same-profile replacement cannot inherit the active trial release"
+        assert stop.stopped and len(actions) == 16
+        assert len(result["trials"]) == 1 and result["trials"][0]["iterations"] == 1
+        assert sum(event[0] == "infer" for event in events) == 2
+        assert "instance" in result["error"] or "runtime" in result["error"]
+        assert not (tmp_path / "preflights/trial-02-0001.json").exists()
+    else:
+        assert result["status"] == "complete" and len(actions) == 960
+        assert not stop.stopped
+
+
+@pytest.mark.parametrize("substitution", ["loaded", "bus", "path", "none"])
+def test_loaded_calibration_checked_before_connect_after_file_aba(tmp_path, substitution):
+    r = runner()
+    from lerobot.robots.so_follower import SO101FollowerConfig
+    from lerobot.motors import MotorCalibration
+    from dataclasses import asdict
+    path = tmp_path / "robot-calibration/fake.json"
+    path.parent.mkdir()
+    mapping = {key.removesuffix(".pos"): dict(id=i + 1, drive_mode=0, homing_offset=0,
+               range_min=10, range_max=4000) for i, key in enumerate(JOINT_ORDER)}
+    approved_bytes = fixtures.canonical(mapping)
+    path.write_bytes(approved_bytes)
+    inputs = {"controller": {"robot_port": "FAKE"}, "calibration_path": str(path.resolve()),
+              "calibration_sha256": r.hashlib.sha256(approved_bytes).hexdigest(),
+              "calibration_mapping": mapping, "safety": {"stop_ready": True}}
+    r, ev, live, source, clock, stop, events, _ = setup_run(tmp_path, inputs=inputs)
+    loaded = []
+    class Controller(r.StopGuardedController):
+        def __init__(self, **kwargs):
+            self.stop = stop
+            changed = {name: dict(value) for name, value in mapping.items()}
+            changed["shoulder_pan"]["range_min"] = 999
+            if substitution == "loaded":
+                path.write_bytes(fixtures.canonical(changed))
+            try:
+                self.robot = r.StopGuardedFollower(SO101FollowerConfig(
+                    id="fake", port="FAKE", cameras={}, calibration_dir=path.parent), stop=stop)
+            finally:
+                path.write_bytes(approved_bytes)
+            if substitution == "bus":
+                self.robot.bus.calibration = {name: MotorCalibration(**value) for name, value in changed.items()}
+            if substitution == "path":
+                other = path.parent / "other.json"
+                other.write_bytes(approved_bytes)
+                self.robot.calibration_fpath = other
+            loaded.append({name: asdict(value) for name, value in self.robot.bus.calibration.items()})
+            events.append("construct")
+
+        def connect(self, calibrate=False):
+            events.append("connect/prearm")
+            raise RuntimeError("fake boundary: never open hardware")
+
+        def disconnect(self):
+            events.append("disconnect")
+    result = r.run(ev, preflight=live, preflight_attempt=1, runtime_source=source,
+                   controller_factory=Controller, policy_factory=lambda: SimpleNamespace(),
+                   observe=lambda _: {}, clock=clock, stop=stop)
+    assert path.read_bytes() == approved_bytes
+    if substitution in ("loaded", "bus"):
+        assert loaded[0]["shoulder_pan"]["range_min"] == 999
+    if substitution == "none":
+        assert events == ["construct", "connect/prearm", "disconnect"]
+    else:
+        assert events == ["construct", "disconnect"], "loaded mapping/path must match approval before pre-arm"
+        assert "calibration" in result["error"]
+    assert result["status"] == "failed" and stop.stopped and not result["trials"]
+
+
+@pytest.mark.parametrize("checker", ["runner", "canonical"])
+@pytest.mark.parametrize("hide_stop_events", [False, True])
+def test_authentic_final_trial_stop_cannot_be_hidden_by_summary_flags(tmp_path, monkeypatch, checker, hide_stop_events):
+    r = runner()
+    labels = [dict(coherent=True, wrong_target=False, erratic=False, grasp=False,
+                   operator="Fixture observer") for _ in range(3)]
+    labels[-1]["stop_reason"] = "Operator stopped after final actions"
+    result, targets, _, _, ev = full_run(tmp_path, monkeypatch, labels=labels)
+    assert result["status"] == "failed" and result["safety_stop"]
+    assert len([target for target in targets if isinstance(target, dict)]) == 960
+    assert any(event["kind"] == "stop" for event in result["events"])
+    result.update(status="complete", safety_stop=False, clamp_warnings=0, stop_reason="")
+    for trial in result["trials"]:
+        trial.update(safety_stop=False, clamp_warnings=0, stop_reason="")
+    if hide_stop_events:
+        result["stop_events"] = []
+    (tmp_path / "live-run.json").write_bytes(fixtures.canonical(result))
+    final = read_json(tmp_path / "golden-replay.json")
+    final.update(live_run=gate.Evidence(tmp_path, test_only=True).reference("live-run.json"),
+                 started_at=fixtures.ts(1000), ended_at=fixtures.ts(1001))
+    fixtures.save(tmp_path, "final-regression.json", final)
+    with pytest.raises(ValueError, match="journal|stop|safety"):
+        (r.check if checker == "runner" else gate.validate_closeout)(gate.Evidence(tmp_path, test_only=True))
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_attached_session_replacement_cannot_dispatch_next_chunk(tmp_path, monkeypatch, restart):
+    r = runner()
+    source, observation, _, events = attached_source(tmp_path, monkeypatch, restart=restart)
+    stop = r.StopLatch()
+    policy = r.CheckedPolicy(source.policy, stop)
+    first = policy.get_action(observation, r.INSTRUCTION)
+    assert len(first) == 16 and policy.iterations == 1
+    try:
+        if restart:
+            with pytest.raises(r.SafetyStop, match="instance|runtime"):
+                policy.get_action(observation, r.INSTRUCTION)
+            assert stop.stopped and policy.iterations == 1
+        else:
+            assert len(policy.get_action(observation, r.INSTRUCTION)) == 16
+            assert not stop.stopped and policy.iterations == 2
+        assert sum(event[0] == "infer" for event in events) == 2
+    finally:
+        source.close()

@@ -17,7 +17,7 @@ from policy_guard.parity_gate import (
     validate_golden_candidate, validate_tolerance_agreement,
 )
 from policy_guard.replay_contract import (
-    _publish, contained, fingerprint_configuration as digest, now, profile_configuration,
+    BACKBONE_REVISION, _publish, contained, fingerprint_configuration as digest, now, profile_configuration,
     validate_profile, validate_schedule, write_evidence,
 )
 
@@ -59,6 +59,16 @@ def validate_native_profile(profile):
     require(profile.get("attention") in (["sdpa"], ["flash_attention_2"]),
             "observed native attention implementation required")
     require(bool(profile.get("effective_configuration")), "actual processor/model configuration required")
+
+
+def validate_backbone_identity(current, measured):
+    require(current["backbone_revision"] == measured["backbone_revision"] == BACKBONE_REVISION,
+            "current native backbone revision differs from measured profile")
+    files = current["backbone_files"]
+    require(isinstance(files, list) and bool(files) and files == measured["backbone_files"],
+            "current native backbone bytes differ from measured profile")
+    require(digest(files) == current["backbone_fingerprint"] == measured["backbone_fingerprint"],
+            "current native backbone digest differs from measured profile")
 
 
 def consume_worker(ev, launch, expected_cases):
@@ -122,6 +132,7 @@ def validate_candidate(workspace, *, _depth=0):
     if "native_candidate" in ev._validated:
         return ev._validated["native_candidate"]
     candidate = validate_golden_candidate(ev)
+    validate_backbone_identity(candidate["current_inputs"], native_profile(ev))
     require(candidate["current_fingerprint"] == digest(candidate["current_inputs"]),
             "candidate current identity digest changed")
     if candidate.get("previous") is not None:
@@ -208,6 +219,7 @@ def compare_native_replay(workspace, replay):
     require(replay["evidence_kind"] == candidate["evidence_kind"], "replay evidence kind mismatch")
     require(replay["agreement"] == ev.reference("tolerance-agreement.json"), "replay agreement changed")
     require(replay["current_fingerprint"] == digest(replay["current_inputs"]), "replay fingerprint changed")
+    validate_backbone_identity(replay["current_inputs"], native_profile(ev))
     result = compare_arrays(ev.tensors(candidate["tensors"]), right, ev.json("tolerance-proposal.json")["golden"])
     result["numerically_passed"] = result["passed"]
     result["identity_changed"] = replay["current_fingerprint"] != candidate["current_fingerprint"]

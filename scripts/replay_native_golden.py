@@ -10,15 +10,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy_guard.golden import (  # noqa: E402
     Evidence, STAGE_FILES, calibration_identity, compare_arrays, compare_native_replay,
     consume_worker, import_previous, native_profile, previous_digest, validate_previous,
+    validate_backbone_identity,
     promote_reviewed_candidate, require, timestamp, validate_candidate, validate_golden,
     validate_tolerance_agreement,
 )
 from policy_guard.replay_contract import (  # noqa: E402
-    PrerequisiteError, canonical, fingerprint_configuration as digest,
+    BACKBONE_REVISION, PrerequisiteError, canonical, fingerprint_configuration as digest,
     load_input_lock, now, sha256_file, write_evidence, write_tensors,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def native_cache_identity(cache):
+    # Match runtime_identity inventory names/hashes and the exact mounted cache.
+    root = Path(cache).resolve()
+    hub = root / "hub"
+    model = hub / "models--nvidia--Cosmos-Reason2-2B"
+    snapshot = model / "snapshots" / BACKBONE_REVISION
+    revision = model / "refs/main"
+    require(hub.resolve().is_relative_to(root) and model.resolve().is_relative_to(hub.resolve()),
+            "native cache escapes mounted root")
+    require(snapshot.resolve().is_relative_to(model.resolve()) and
+            revision.resolve().is_relative_to(model.resolve()), "native snapshot escapes model cache")
+    if not snapshot.is_dir() or not revision.is_file():
+        raise PrerequisiteError("pinned native backbone snapshot is absent")
+    if revision.read_text().strip() != BACKBONE_REVISION:
+        raise PrerequisiteError("native backbone default revision differs from pin")
+    for name in ("config.json", "tokenizer_config.json", "tokenizer.json"):
+        if not (snapshot / name).is_file():
+            raise PrerequisiteError(f"pinned snapshot missing {name}")
+    files = []
+    for path in sorted(snapshot.rglob("*")):
+        if path.is_symlink():
+            require(path.exists() and path.resolve().is_relative_to(model.resolve()),
+                    "native snapshot blob missing or escapes model cache")
+            require(not path.is_dir(), "native snapshot directory links cannot be inventoried")
+        if path.is_file():
+            files.append({"path": str(path.relative_to(snapshot)), "sha256": sha256_file(path)})
+    return {"backbone_revision": BACKBONE_REVISION, "backbone_files": files,
+            "backbone_fingerprint": digest(files)}
 
 
 def current_inputs(args):
@@ -36,8 +67,9 @@ def current_inputs(args):
     from replay_checkpoint_parity import command_output
     image = command_output(["docker", "image", "inspect", args.native_image, "--format", "{{.Id}}"])
     calibration = calibration_identity(ev)
+    backbone = native_cache_identity(args.native_cache)
     return {"input_fingerprint": current["fingerprint"], "source_files": sources,
-            "calibration_sha256": calibration["sha256"], "image_digest": image}
+            "calibration_sha256": calibration["sha256"], "image_digest": image, **backbone}
 
 
 def operational_worker(args, cases, schedule_file, suffix):
@@ -71,6 +103,7 @@ def collect(args, ev, worker, probe, clock, *, stage):
             require(timestamp(old.json("golden-manifest.json")["ended_at"]) < timestamp(start),
                     "replacement must follow old promotion")
     current = probe(args)
+    validate_backbone_identity(current, native_profile(ev))
     require(current["input_fingerprint"] == identity["input_fingerprint"], "current input lock changed")
     require(current["image_digest"] == native_profile(ev)["image_digest"], "current native image changed")
     schedule = ev.json("input-lock.json")["schedule"]
@@ -174,7 +207,9 @@ def main(argv=None, *, worker=None, probe=None, prompt=None, clock=now, test_onl
         if args.command in ("review", "promote"):
             candidate = validate_candidate(ev)
             require(previous_digest(ev, candidate) == args.previous_sha256, "exact previous manifest digest required")
-            require(digest((probe or current_inputs)(args)) == candidate["current_fingerprint"],
+            current = (probe or current_inputs)(args)
+            validate_backbone_identity(current, native_profile(ev))
+            require(digest(current) == candidate["current_fingerprint"],
                     "current source/configuration changed; complete replay and new review required")
             require(ev.reference("golden-candidate.json")["sha256"] == args.candidate_sha256,
                     "exact candidate digest required")
@@ -191,7 +226,9 @@ def main(argv=None, *, worker=None, probe=None, prompt=None, clock=now, test_onl
         else:
             record = ev.record(STAGE_FILES[args.stage])
             require(record["stage"] == args.stage, "native replay stage mismatch")
-            require(digest((probe or current_inputs)(args)) == record["current_fingerprint"],
+            current = (probe or current_inputs)(args)
+            validate_backbone_identity(current, native_profile(ev))
+            require(digest(current) == record["current_fingerprint"],
                     "relevant source/configuration changed since replay")
             require(timestamp(record["ended_at"]) <= timestamp(clock()), "replay has not completed yet")
             if args.stage == "final":

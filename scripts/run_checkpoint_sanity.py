@@ -435,7 +435,8 @@ def run(workspace, *, preflight, preflight_attempt, runtime_source,
     selected_runtime = runtime_source.current()
     _release(ev, live, "live", selected_runtime, clock, runtime_source)
     selected_identity = runtime_identity(selected_runtime)
-    expected_settings = runtime_source.inputs()["controller"]
+    # Construct from the exact validated input snapshot.
+    expected_settings = _runner_inputs(ev.json(live))["controller"]
     if settings is not None:
         gate.require(settings == expected_settings, "controller settings differ from reviewed inputs")
     settings = expected_settings

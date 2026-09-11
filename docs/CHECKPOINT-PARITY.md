@@ -416,3 +416,170 @@ attestation, a new documented proposal and explicit numerical approval before
 new stock comparisons. Never rerun into these immutable stage paths, bypass
 stock into the full corpus, or reinterpret old bounds/results. Golden approval
 remains a separate later blocking-human gate.
+
+
+## Approved test-image remedy and fresh evidence session
+
+Aaron’s subsequent “Go ahead” authorized the prepared packaging remedy and fresh
+measurements. The parent built and verified
+`lerobot-policy:phase7-stock-tests-20260911`, immutable image:
+
+```text
+sha256:6758186bd24cd0745b7442dafbb6680cbc2a986fe387eb2de5aaf0b75dce9c98
+```
+
+The derived image retains all 113 existing distribution versions and adds only
+pytest 9.1.0, pluggy 1.6.0, and iniconfig 2.3.0. The parent inventory comparison
+and pip check passed; `lerobot-policy:latest` still identifies the old image.
+Build evidence is
+`.planning/phases/07-checkpoint-parity-gate/execution-attempts/07-07-test-image-build.json`.
+No further download, installation, image build, or source correction was needed
+for this refresh. Packaging approval does not constitute numerical approval.
+
+The new exclusive workspace is `corpus/phase7-stock-tests-20260911`. Its canonical
+calibration/session writer links directly to the preserved failed
+`upstream-result.json` in `corpus/phase7-tf32-pair-20260911`. The old proposal,
+agreement, and failed stock result remain byte-unchanged. All ten original sealed
+instrument files still match their original hashes. Global planning state remains
+parent-owned.
+
+Fresh feasibility passed for both CPU FP32/SDPA diagnostics, both CUDA:0 BF16
+operational profiles, and native two-model CPU stock capacity. Diagnostics
+observed TF32 matmul/cuDNN false/false; operational profiles observed false/true.
+Native operational attention remains FlashAttention 2 and LeRobot operational
+attention remains SDPA. All four inference profiles observed four flow steps.
+Every LeRobot profile explicitly binds the new image.
+
+The reused arm-free driver independently exercised that same image through the
+actual loopback gRPC server. Its frozen-record request ran from
+`2026-09-11T18:11:45.598962+00:00` to `2026-09-11T18:11:52.528756+00:00`,
+returned a finite `(16,6)` chunk, and matched the complete operational
+configuration, ordered processors, ambient deployed seed policy, and both TF32
+flags. Observation captured one `(1,40,132)` FP32 CUDA sampler draw, four flow
+steps, and 196 SDPA calls. The container was stopped after attestation.
+
+The unchanged producer-only feasibility run completed from
+`2026-09-11T18:12:04.991835+00:00` to `2026-09-11T18:12:43.090962+00:00`.
+It retained its two-model lifetime, used CPU FP32/SDPA, seed 42 and exactly
+`new_embodiment`, and passed the strict full-shape/control observer checks.
+This remains producer feasibility; any later approved stock comparison must
+run both stages afresh.
+
+Before the long schedule, a GPU-free, network-disabled container using the new
+image successfully imported the test dependencies and `GR00TN17`, then ran
+pytest with `--collect-only` against the unchanged pinned consumer. It collected
+exactly `test_groot_get_action_parity[new_embodiment]`: **one test collected,
+zero tests executed, zero model loads**, exit 0, in 6.795 seconds including
+container/import startup. The fresh producer artifact was mounted read-only
+for filename discovery. No fixture setup or consumer inference occurred.
+Exact argv and output are in `execution/consumer-collection.json` and its log.
+
+The full repeatability command selects both immutable image IDs explicitly:
+
+```sh
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/replay_checkpoint_parity.py repeatability \
+  --workspace corpus/phase7-stock-tests-20260911 \
+  --diagnostic-device cpu --stock-device cpu \
+  --native-image sha256:e263056fffe7a60a7f48b6309a8b8f2fb3ea9f8f2afa9c94a0105ed5b7d2eeaf \
+  --lerobot-image sha256:6758186bd24cd0745b7442dafbb6680cbc2a986fe387eb2de5aaf0b75dce9c98
+```
+
+The first native warm group began while the existing hermetic readiness suite
+was running. Following the parent sequencing instruction, only its coordinator
+was held; the model worker finished all 36 cases uninterrupted at
+`2026-09-11T18:18:36.012527+00:00`. No container remained active. Its exited
+Docker client appeared as a zombie solely because the held coordinator had not
+reaped it. `execution/readiness-launch-hold.json` and
+`execution/warm-completed-during-hold.json` preserve the timing and exact manifest
+hash. At `2026-09-11T18:28:57.744097+00:00`, a later explicit parent instruction
+authorized resuming the same job while readiness continued. The conditional
+watcher was cancelled and the original coordinator received SIGCONT. It reaped
+the actual exit 0 and began the next prescribed cold group normally. No extra
+broad tests, duplicate model workers, rewritten status, or discarded cases were
+introduced. `execution/readiness-launch-resumed.json` records that readiness had
+107 reported passes and was still running; it does not claim an early suite pass.
+Collection wall time includes this explicit readiness wait; it is not an
+isolated performance benchmark.
+
+The subsequent parent instruction cancelled the redundant, unchanged-instrument
+hermetic rerun. Only pytest PID 666578 received SIGINT; it exited 2 at
+`2026-09-11T18:30:28.766041+00:00` after 1080.446 seconds. Its preserved log
+reports 120 partial passes, all excluded from new acceptance pass totals. This
+was an explicitly cancelled duplicate check, not a completed suite or a model
+failure. Existing validated instrument regressions and the new image inventory,
+pip check, import and exact collection evidence remain the readiness basis.
+No additional broad retests were launched.
+
+### Fresh measurement result and renewed numerical checkpoint
+
+The complete repeatability command exited 0: **192 cases in 52 distinct serial
+processes**, exactly 48 cases and 13 processes per profile. All same-seed raw,
+preprocessing, decoded max/mean, trace and aggregate bias/slope, and per-index
+statistics were zero. All 24 changed-seed controls changed both actual noise
+and decoded output. Same-seed noise was exact within each profile; all **48
+matched diagnostic noise pairs** were also exactly equal. Different-backend
+model outputs were not compared.
+
+Collection ran `2026-09-11T18:14:59.670373+00:00` through
+`2026-09-11T18:48:26.849648+00:00`: 2007.179 seconds. The outer command took
+2010.312 seconds (33m30s), including validation. The coordinator hold lasted
+748.834 seconds (12m29s), of which 621.732 seconds (10m22s) occurred after the
+warm model worker had finished. Summed actual worker lifetimes were 1051.527
+seconds (17m32s), excluding container launch/closure and host validation. These
+separate timings prevent the hold from being reported as model computation.
+
+The required independent `check --stage repeatability` exited 0. Proposal
+preparation and the additional capture-derived audit also exited 0. They
+reconstructed worker/process/case chronology and statistics, verified source,
+input and profile identities, revalidated canonical calibration and real serving
+attestation, and confirmed the old proposal/agreement/failure hashes unchanged.
+The audit is `execution/measurement-audit.json`; timing and cleanup are in
+`execution/postflight.json`. Parent assigned Einstein a separate readiness review;
+its verdict remains parent-managed and is not claimed by this executor.
+
+New proposal: `corpus/phase7-stock-tests-20260911/tolerance-proposal.json`.
+Exact SHA-256:
+
+```text
+a8794bcaff088ac1e9638872337ecb336ce6f3156ce5f6f470cfe63c3e18d8cf
+```
+
+The comparison definitions and golden bounds exactly equal the prior proposal:
+
+| Boundary / metric | Fresh proposed bound |
+| --- | --- |
+| Floating preprocessing | atol `1e-6`, rtol `1e-6` |
+| Tokens, masks, categorical data | exact equality |
+| Full raw output | atol `1e-3`, rtol `1e-3` |
+| Decoded maximum / mean absolute error | `0.1` / `0.05` |
+| Absolute trace and aggregate bias | `0.02` |
+| Absolute trace and aggregate OLS slope | `0.002` per action index |
+| Native operational golden replay | atol `1e-5`, rtol `0` |
+
+All four scopes use these bounds: diagnostic, native precision bridge, LeRobot
+precision bridge, and operational. Decoded units are checkpoint percent for
+five arm joints and gripper percent for the sixth. Zero observed variation
+leaves the same prospectively defined floors. Four times observed variation is
+an engineering margin, not a confidence interval. Independent operational noise
+may fail these strict trace bounds; no adaptive loosening is authorized.
+Training calibration, backbone provenance, forced-letterbox geometry and the
+historical seed-not-honored caveats remain. Six-record repeatability is not
+full-600 parity or a physical safety guarantee.
+
+The canonical tolerance check returned the expected exit 2 / `not_run` because
+this new session has **no tolerance agreement**. No stock consumer inference,
+cross-backend output residual, full-600 comparison, golden, or robot activity
+was performed. No container or GPU compute process remained after measurement.
+The old approval does not authorize this new image or proposal.
+
+The fresh blocking-human handoff and summary are:
+
+- `.planning/phases/07-checkpoint-parity-gate/execution-attempts/07-07-stock-tests-20260911/CHECKPOINT.md`
+- `.planning/phases/07-checkpoint-parity-gate/execution-attempts/07-07-stock-tests-20260911/SUMMARY.md`
+
+An actual new affirmative decision must name this exact proposal before any
+comparison. After that decision, the canonical writer records it and the unchanged
+stock wrapper runs BOTH stages in this fresh session. Collection-only and
+producer-feasibility artifacts do not replace the agreement-bound stock run.
+Any failure blocks the full-600 and golden stages; hardware approval remains
+separate. No numerical or physical approval was inferred from packaging approval.

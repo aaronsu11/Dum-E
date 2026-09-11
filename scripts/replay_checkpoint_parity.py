@@ -61,6 +61,10 @@ def worker_argv(args, backend, purpose, image, output, container_name):
         "--read-only", "--memory", "24g", "--memory-swap", "24g",
         "--tmpfs", "/tmp:rw,size=2g",
     ]
+    if backend == "lerobot":
+        # The installed PolicyServer logger creates logs/ during import.
+        # Keep that runtime output on tmpfs, with all sources/inputs read-only.
+        argv += ["--workdir", "/tmp"]
     # Stock policy keeps its configured FlashAttention loader, which requires
     # CUDA visibility even when measuring both resident models on the CPU.
     if device.startswith("cuda") or purpose == "stock-capacity":

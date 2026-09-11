@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import deque
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,6 +24,28 @@ from policy_guard.replay_contract import (  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def mounted_cache_path(root, path):
+    # The launcher resolves the mount source, but absolute links *inside* it
+    # retain their host spelling in the container. Walk every link and ancestor.
+    pending = deque(path.relative_to(root).parts)
+    resolved, links = root, 0
+    while pending:
+        part = pending.popleft()
+        if part == "..":
+            require(resolved != root, "native cache link escapes mounted root")
+            resolved = resolved.parent
+            continue
+        resolved = resolved / part
+        if resolved.is_symlink():
+            target = resolved.readlink()
+            require(not target.is_absolute(), "absolute native cache link is not mount-portable")
+            links += 1
+            require(links <= 40, "native cache symlink cycle or excessive chain")
+            resolved = resolved.parent
+            pending.extendleft(reversed(target.parts))
+    return resolved
+
+
 def native_cache_identity(cache):
     # Match runtime_identity inventory names/hashes and the exact mounted cache.
     root = Path(cache).resolve()
@@ -30,21 +53,26 @@ def native_cache_identity(cache):
     model = hub / "models--nvidia--Cosmos-Reason2-2B"
     snapshot = model / "snapshots" / BACKBONE_REVISION
     revision = model / "refs/main"
-    require(hub.resolve().is_relative_to(root) and model.resolve().is_relative_to(hub.resolve()),
-            "native cache escapes mounted root")
-    require(snapshot.resolve().is_relative_to(model.resolve()) and
-            revision.resolve().is_relative_to(model.resolve()), "native snapshot escapes model cache")
+    mounted_hub = mounted_cache_path(root, hub)
+    mounted_model = mounted_cache_path(root, model)
+    require(mounted_model.is_relative_to(mounted_hub), "native cache escapes mounted hub")
+    require(mounted_cache_path(root, snapshot).is_relative_to(mounted_model) and
+            mounted_cache_path(root, revision).is_relative_to(mounted_model),
+            "native snapshot escapes model cache")
     if not snapshot.is_dir() or not revision.is_file():
         raise PrerequisiteError("pinned native backbone snapshot is absent")
     if revision.read_text().strip() != BACKBONE_REVISION:
         raise PrerequisiteError("native backbone default revision differs from pin")
     for name in ("config.json", "tokenizer_config.json", "tokenizer.json"):
+        mounted_cache_path(root, snapshot / name)
         if not (snapshot / name).is_file():
             raise PrerequisiteError(f"pinned snapshot missing {name}")
     files = []
     for path in sorted(snapshot.rglob("*")):
+        mounted = mounted_cache_path(root, path)
+        require(mounted.is_relative_to(mounted_model), "native snapshot escapes model cache")
         if path.is_symlink():
-            require(path.exists() and path.resolve().is_relative_to(model.resolve()),
+            require(path.exists(),
                     "native snapshot blob missing or escapes model cache")
             require(not path.is_dir(), "native snapshot directory links cannot be inventoried")
         if path.is_file():

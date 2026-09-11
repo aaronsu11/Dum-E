@@ -951,3 +951,31 @@ def test_attached_session_replacement_cannot_dispatch_next_chunk(tmp_path, monke
         assert sum(event[0] == "infer" for event in events) == 2
     finally:
         source.close()
+
+
+
+def test_constructor_settings_cannot_escape_approved_snapshot_on_input_aba(tmp_path):
+    r, ev, live, source, clock, stop, _, _ = setup_run(tmp_path)
+    original_inputs = source.inputs
+    captures, constructed_ports = [], []
+    def inputs():
+        snapshot = original_inputs()
+        captures.append(snapshot)
+        if len(captures) == 2:
+            return {**snapshot, "controller": {"robot_port": "UNAPPROVED-PORT"}}
+        return snapshot
+    source.inputs = inputs
+    class Controller:
+        def __init__(self, *, robot_port, stop):
+            constructed_ports.append(robot_port)
+        def connect(self, calibrate):
+            raise RuntimeError("fake connect boundary; no hardware")
+        def disconnect(self):
+            pass
+    try:
+        r.run(ev, preflight=live, preflight_attempt=1, runtime_source=source,
+              controller_factory=Controller, policy_factory=lambda: SimpleNamespace(),
+              observe=lambda _: {}, clock=clock, stop=stop)
+    except ValueError:
+        pass  # Refusal before construction is also safe.
+    assert "UNAPPROVED-PORT" not in constructed_ports, "constructor must consume the approved captured settings"

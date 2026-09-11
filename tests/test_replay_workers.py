@@ -217,3 +217,68 @@ def test_log_reference_supports_relative_workspace(tmp_path):
     ref = orchestrator.evidence_reference(relative_workspace, log.resolve())
     assert ref["path"] == "worker.log"
     assert ref["sha256"] == contract().sha256_file(log)
+
+
+def native_worker():
+    sys.path.insert(0, str(ROOT / "scripts"))
+    module = importlib.import_module("replay_groot_native")
+    assert hasattr(module, "pinned_native_cache"), "Native loader must provide a pinned local-cache context"
+    return module
+
+
+def cache_fixture(tmp_path):
+    model = tmp_path / "hub/models--nvidia--Cosmos-Reason2-2B"
+    snapshot = model / "snapshots" / contract().BACKBONE_REVISION
+    snapshot.mkdir(parents=True)
+    (model / "refs").mkdir()
+    (model / "refs/main").write_text(contract().BACKBONE_REVISION)
+    for name in ("config.json", "tokenizer_config.json", "tokenizer.json"):
+        (snapshot / name).write_text("{}")
+    return tmp_path / "hub", snapshot
+
+
+def test_pinned_native_cache_preserves_literal_name_and_restores_cwd(tmp_path):
+    module = native_worker()
+    hub, snapshot = cache_fixture(tmp_path)
+    before = Path.cwd()
+    with module.pinned_native_cache(hub):
+        temporary = Path.cwd()
+        local = Path("nvidia/Cosmos-Reason2-2B")
+        assert local.is_dir()
+        assert local.resolve() == snapshot.resolve()
+        assert local.is_symlink()
+    assert Path.cwd() == before
+    assert not temporary.exists()
+    assert snapshot.is_dir()
+
+
+def test_pinned_native_cache_restores_cwd_after_loader_failure(tmp_path):
+    module = native_worker()
+    hub, snapshot = cache_fixture(tmp_path)
+    before = Path.cwd()
+    with pytest.raises(RuntimeError, match="loader failure"):
+        with module.pinned_native_cache(hub):
+            temporary = Path.cwd()
+            raise RuntimeError("loader failure")
+    assert Path.cwd() == before
+    assert not temporary.exists()
+
+
+@pytest.mark.parametrize("corruption", ["missing", "wrong_ref", "escape"])
+def test_pinned_native_cache_rejects_unpinned_or_escaping_snapshot(tmp_path, corruption):
+    module = native_worker()
+    hub, snapshot = cache_fixture(tmp_path)
+    if corruption == "missing":
+        (snapshot / "tokenizer.json").unlink()
+    elif corruption == "wrong_ref":
+        (hub / "models--nvidia--Cosmos-Reason2-2B/refs/main").write_text("0" * 40)
+    else:
+        (snapshot / "config.json").unlink()
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}")
+        (snapshot / "config.json").symlink_to(outside)
+    before = Path.cwd()
+    with pytest.raises((ValueError, contract().PrerequisiteError)):
+        with module.pinned_native_cache(hub):
+            pytest.fail("invalid snapshot admitted")
+    assert Path.cwd() == before

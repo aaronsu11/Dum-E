@@ -8,7 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy_guard.golden import (  # noqa: E402
-    Evidence, STAGE_FILES, compare_native_replay, consume_worker, native_profile,
+    Evidence, STAGE_FILES, calibration_identity, compare_arrays, compare_native_replay,
+    consume_worker, import_previous, native_profile, previous_digest, validate_previous,
     promote_reviewed_candidate, require, timestamp, validate_candidate, validate_golden,
     validate_tolerance_agreement,
 )
@@ -28,14 +29,15 @@ def current_inputs(args):
         "scripts/replay_groot_native.py", "scripts/replay_checkpoint_parity.py",
         "policy_guard/replay_contract.py", "policy_guard/groot_guard.py",
         "policy/factory.py", "policy/gr00t/service.py", "embodiment/so_arm10x/controller.py",
-        "pyproject.toml", "uv.lock",
+        "policy_guard/parity_gate.py", "scripts/approve_parity_evidence.py",
+        "scripts/pose_sweep_units_probe.py", "config.example.yaml", "pyproject.toml", "uv.lock",
     )}
     ev = Evidence(args.workspace)
     from replay_checkpoint_parity import command_output
     image = command_output(["docker", "image", "inspect", args.native_image, "--format", "{{.Id}}"])
-    calibration = ev.json("calibration.json")
+    calibration = calibration_identity(ev)
     return {"input_fingerprint": current["fingerprint"], "source_files": sources,
-            "calibration_sha256": calibration["calibration_sha256"], "image_digest": image}
+            "calibration_sha256": calibration["sha256"], "image_digest": image}
 
 
 def operational_worker(args, cases, schedule_file, suffix):
@@ -54,6 +56,20 @@ def collect(args, ev, worker, probe, clock, *, stage):
     validate_tolerance_agreement(ev, comparison_started_at=start)
     if stage != "candidate":
         validate_golden(ev)
+    live_ref = None
+    if stage == "final":
+        live = ev.record("live-run.json")
+        require(timestamp(live["ended_at"]) < timestamp(start), "final replay must follow this live run")
+        live_ref = ev.reference("live-run.json")
+    previous = None
+    if stage == "candidate":
+        require(bool(args.previous_manifest) == bool(args.previous_sha256),
+                "replacement requires explicit previous path and digest")
+        if args.previous_manifest:
+            previous = import_previous(ev, args.previous_manifest, args.previous_sha256)
+            old = validate_previous(ev, previous)
+            require(timestamp(old.json("golden-manifest.json")["ended_at"]) < timestamp(start),
+                    "replacement must follow old promotion")
     current = probe(args)
     require(current["input_fingerprint"] == identity["input_fingerprint"], "current input lock changed")
     require(current["image_digest"] == native_profile(ev)["image_digest"], "current native image changed")
@@ -70,6 +86,10 @@ def collect(args, ev, worker, probe, clock, *, stage):
         "agreement": ev.reference("tolerance-agreement.json"), "current_inputs": current,
         "current_fingerprint": digest(current), "prerequisite_errors": [],
     }
+    if stage == "candidate":
+        record.update(reason=args.reason, previous=previous)
+    if live_ref is not None:
+        record["live_run"] = live_ref
     try:
         launch, _ = worker(args, schedule, schedule_file, "-golden-" + stage)
         record["worker"] = launch
@@ -77,15 +97,26 @@ def collect(args, ev, worker, probe, clock, *, stage):
             raise PrerequisiteError("native operational worker did not run")
         arrays = consume_worker(ev, launch, schedule)
         record["tensors"] = write_tensors(args.workspace, arrays)
+        after = probe(args)
+        require(after == current, "relevant source/configuration changed during replay")
+        require(Evidence(args.workspace, test_only=ev.test_only).identity() == identity,
+                "locked evidence changed during replay")
         report = ev.json(launch["manifest"])
+        require(timestamp(start) <= timestamp(report["started_at"]), "worker started before this collection")
         record["ended_at"] = max(clock(), report["ended_at"], key=timestamp)
         if stage == "candidate":
-            record.update(reason=args.reason, previous=None, status="complete")
+            record["status"] = "complete"
+            if previous is not None:
+                old = validate_previous(ev, previous)
+                record["previous_comparison"] = compare_arrays(
+                    old.tensors(old.json("golden-candidate.json")["tensors"]), arrays,
+                    old.json("tolerance-proposal.json")["golden"])
         else:
             record.update(candidate=ev.reference("golden-candidate.json"),
                           approval=ev.reference("golden-approval.json"),
                           manifest=ev.reference("golden-manifest.json"))
             record["comparison"] = compare_native_replay(ev, record)
+            record["identity_changed"] = record["comparison"]["identity_changed"]
             record["status"] = "complete" if record["comparison"]["passed"] else "failed"
     except (PrerequisiteError, FileNotFoundError) as exc:
         record["status"] = "not_run"
@@ -111,9 +142,12 @@ def parser():
         command.add_argument("--device", choices=("cuda:0",), default="cuda:0")
         command.add_argument("--worker-timeout", type=int, default=14400)
         if name == "generate":
-            command.add_argument("--reason", required=True)
+            command.add_argument("--reason")
+            command.add_argument("--previous-manifest", type=Path)
+            command.add_argument("--previous-sha256")
         if name in ("review", "promote"):
             command.add_argument("--candidate-sha256", required=True)
+            command.add_argument("--previous-sha256")
         if name in ("verify", "check"):
             command.add_argument("--stage", required=True, choices=tuple(STAGE_FILES))
     return result
@@ -128,14 +162,20 @@ def main(argv=None, *, worker=None, probe=None, prompt=None, clock=now, test_onl
         ev = Evidence(args.workspace, test_only=test_only)
         if args.command in ("generate", "verify"):
             if args.command == "generate":
-                require(bool(args.reason.strip()), "intentional candidate reason required")
+                if args.reason is None and not args.previous_manifest:
+                    args.reason = "Initial operational native candidate; explicit review pending"
+                require(isinstance(args.reason, str) and bool(args.reason.strip()),
+                        "intentional candidate replacement reason required")
             record = collect(args, ev, worker or operational_worker, probe or current_inputs, clock,
                              stage="candidate" if args.command == "generate" else args.stage)
             print(canonical({"status": record["status"], "message": "not run" if record["status"] == "not_run"
                              else record["status"], "errors": record["prerequisite_errors"]}).decode())
             return {"complete": 0, "failed": 1, "not_run": 2}[record["status"]]
         if args.command in ("review", "promote"):
-            validate_candidate(ev)
+            candidate = validate_candidate(ev)
+            require(previous_digest(ev, candidate) == args.previous_sha256, "exact previous manifest digest required")
+            require(digest((probe or current_inputs)(args)) == candidate["current_fingerprint"],
+                    "current source/configuration changed; complete replay and new review required")
             require(ev.reference("golden-candidate.json")["sha256"] == args.candidate_sha256,
                     "exact candidate digest required")
             if args.command == "review":
@@ -150,6 +190,15 @@ def main(argv=None, *, worker=None, probe=None, prompt=None, clock=now, test_onl
             promote_reviewed_candidate(ev, candidate_sha256=args.candidate_sha256, clock=clock)
         else:
             record = ev.record(STAGE_FILES[args.stage])
+            require(record["stage"] == args.stage, "native replay stage mismatch")
+            require(digest((probe or current_inputs)(args)) == record["current_fingerprint"],
+                    "relevant source/configuration changed since replay")
+            require(timestamp(record["ended_at"]) <= timestamp(clock()), "replay has not completed yet")
+            if args.stage == "final":
+                live = ev.record("live-run.json")
+                require(record["live_run"] == ev.reference("live-run.json") and
+                        timestamp(live["ended_at"]) < timestamp(record["started_at"]),
+                        "final replay must follow exact live evidence")
             require(compare_native_replay(ev, record)["passed"], "native golden drift")
         print('{"status":"complete"}')
         return 0

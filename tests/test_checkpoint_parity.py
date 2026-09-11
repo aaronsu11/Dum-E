@@ -375,3 +375,17 @@ def test_independent_collated_categorical_metadata_cannot_hide_behind_matching_a
     assert result["passed"] is False
     assert result["metrics"]["max_abs"] == [0.0] * 6
     assert "independent_collated[0]" in result["failures"]
+
+
+def test_review_offline_requires_archived_worker_witnesses(tmp_path):
+    ev, left, right = fixture(tmp_path)
+    module = importlib.import_module("replay_checkpoint_parity")
+    class Workers:
+        def collect(self, name, schedule, *, common_from=None):
+            bundle = copy.deepcopy(left if name.startswith("native") else right)
+            bundle["profile"] = name
+            # Aggregate-only fixture intentionally has no captured worker evidence.
+            return bundle
+    with pytest.raises((ValueError, KeyError, FileNotFoundError)):
+        module.full(ev, workers=Workers(), stock_check=lambda _: {"status": "complete"},
+                    started_at=ts(8), clock=lambda: ts(9))

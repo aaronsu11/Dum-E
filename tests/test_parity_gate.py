@@ -953,3 +953,36 @@ def test_independent_replay_and_serving_capture_match_and_detect_processor_chang
     unchanged = serving_module().serving_profile(
         serving_server, serving_model, identity, measured, torch.zeros(1, 40, 132))
     assert api().operational_semantics(unchanged) == served_semantics
+
+
+@pytest.mark.parametrize("field", ["workers", "statistics", "raw_max_abs", "preprocessing_max_abs", "instrument_files"])
+def test_review_repeatability_rejects_unverified_measurement_basis(tmp_path, field):
+    fixture_workspace(tmp_path)
+    def corrupt(record):
+        if field == "instrument_files":
+            record[field] = {"policy_guard/parity_gate.py": "0" * 64}
+        elif field == "workers":
+            record["measurements"][0][field] = []
+        elif field == "statistics":
+            record["measurements"][0][field] = {"max_abs": [1000.] * 6}
+        else:
+            record["measurements"][0][field] = 1000.
+    rewrite(tmp_path, "repeatability.json", corrupt)
+    with pytest.raises((ValueError, KeyError, FileNotFoundError)):
+        api().validate_repeatability(api().Evidence(tmp_path, test_only=True))
+
+
+@pytest.mark.parametrize("field", ["matrix", "independent_collated", "common_collated", "provenance",
+                                  "junit", "coverage", "producer_observation", "launches"])
+def test_review_release_requires_complete_numerical_and_stock_witnesses(tmp_path, field):
+    identity, lock, pairs = fixture_workspace(tmp_path)
+    complete_offline(tmp_path, identity, lock, pairs)
+    api().validate_release_evidence(api().Evidence(tmp_path, test_only=True))
+    if field in ("matrix", "independent_collated", "common_collated", "provenance"):
+        rewrite(tmp_path, "offline-report.json", lambda r: r["comparisons"][0].pop(field, None))
+    else:
+        rewrite(tmp_path, "upstream-result.json", lambda r: r.pop(field, None))
+        ref = api().Evidence(tmp_path, test_only=True).reference("upstream-result.json")
+        rewrite(tmp_path, "offline-report.json", lambda r: r.update(upstream=ref))
+    with pytest.raises((ValueError, KeyError, FileNotFoundError)):
+        api().validate_release_evidence(api().Evidence(tmp_path, test_only=True))

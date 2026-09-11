@@ -627,3 +627,69 @@ for the parity phase. No clamp fired at any point during the interpolated pose s
   Both are untracked local data, resolved by the harness from `HF_LEROBOT_CALIBRATION` /
   `HF_LEROBOT_HOME` / `DUME_CHECKPOINT_STATISTICS` or the `--statistics` / `--calibration`
   flags — never from a hardcoded absolute path.
+
+
+## 10. Current calibration re-derived offline (2026-09-11)
+
+This section supersedes the **current-calibration arithmetic** in §§2, 4 and 7,
+not the historical measurements or calibration identities in §9. No arm connection,
+pose sweep, recalibration, or clamp demonstration was performed for this derivation.
+Phase 5’s 9/10 baseline and its ready→initial reset sequence remain unchanged.
+
+The pre-change offline probe exited 1 with 12 range-field drift reports (all six joints).
+The original failure is retained in the Phase 7 execution-attempts directory. The snapshot
+was independently re-derived from the controller’s `resolve_calibration_file` selection;
+the drift verifier does not refresh its pins automatically.
+
+Resolved calibration: `/home/aaron/.cache/huggingface/lerobot/calibration/robots/so_follower/my_awesome_follower_arm.json`.
+
+Calibration SHA-256: `ef68ae670b75d88f57260866653a484f224b1c31fdd8ff1d8e3cf2a1270b6f5b`.
+
+Checkpoint statistics SHA-256: `92f33c314351f6a0facc85b76fd8c5d257410c668c2901e9a97fb6fba170ce58`.
+
+The installed LeRobot 0.6.1 `MotorsBus._normalize`/`_unnormalize` formulas use
+`max_res = 4096 - 1`: degrees = `(tick - midpoint) * 360 / 4095`, and the
+arm scale = `(range_max - range_min) * 360 / (4095 * 200)`. All six drive modes
+are zero. The gripper remains `RANGE_0_100` under both configurations; its
+degree range in the machine record is hypothetical arithmetic, not its active mode.
+
+| Joint | Historical ticks | Current ticks | Degrees per percent | Reachable arm degrees |
+|---|---|---|---|---|
+| `shoulder_pan` | 792–3443 | 841–3433 | 1.13934 | ±113.93407 |
+| `shoulder_lift` | 851–3211 | 860–3208 | 1.03209 | ±103.20879 |
+| `elbow_flex` | 898–3090 | 903–3100 | 0.96571 | ±96.57143 |
+| `wrist_flex` | 926–3219 | 920–3204 | 1.00396 | ±100.39560 |
+| `wrist_roll` | 148–3965 | 0–4095 | 1.80000 | ±180.00000 |
+| `gripper` | 2045–3486 | 2044–3501 | not applicable | not active |
+
+All four unchanged pose vectors (`initial`, `ready`, `remote`, `release_lift`)
+pass `assert_pose_reachable` against this current file. The `initial` prediction
+for shoulder-lift is −102° → −98.83%, still outside/inside the checkpoint envelope
+respectively. Elbow-flex’s current upper endpoint is **tick 3100 → 96.57143° / 100%**.
+This is an **at-limit prediction**, not a new observation; §9.7’s measured
+tick 3090 → 96.3516° belongs to the historical calibration.
+
+The checkpoint retains seven exact ±100 clip bounds. Its recorded elbow maximum
+100 remains above the current reachable degree maximum. However, wrist-roll’s
+−90° now maps to **−50%**, outside the historical episode-0 band
+[−58.952, −50.564]. That cross-check no longer supports the current calibration.
+The remote episode-0 statistics remain unverified offline, and training-time
+calibration is still unknown. The clip and initial-envelope arguments persist;
+the old wrist-roll argument must not be silently reused.
+
+`use_degrees=True`, PID 10/0/5, the 160.0 clamp, controller targets and reset
+sequence remain unchanged. The current wrist-roll ±180° range still contains
+the old clamp-demo target, but no new clamp behavior was measured. This arithmetic
+does not approve motion or validate operational parity.
+
+The evidence was generated once with:
+
+```bash
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/pose_sweep_units_probe.py --skip-hardware --write-derivation corpus/phase7/calibration.json
+```
+
+Completed evidence is immutable: repeating this command at the same destination
+fails. `--write-derivation` rejects motion modes and explicit calibration overrides.
+Missing calibration/statistics and injected single-tick drift fail the prerequisite.
+Any recalibration requires fresh derivation and release review; future approval
+must bind the exact calibration digest above.

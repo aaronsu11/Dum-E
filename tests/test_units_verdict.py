@@ -821,3 +821,17 @@ def test_derivation_cli_rejects_stale_explicit_copy(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exc:
         probe.main()
     assert exc.value.code == 2
+
+
+def test_documented_current_calibration_matches_independent_snapshot():
+    text = (REPO_ROOT/'docs/UNITS-VERDICT.md').read_text().split('## 10.')[1]
+    assert 'ef68ae670b75d88f57260866653a484f224b1c31fdd8ff1d8e3cf2a1270b6f5b' in text
+    for joint in ARM_JOINTS:
+        row = next(line for line in text.splitlines() if line.startswith(f'| `{joint}` |'))
+        cal = CALIBRATION_TICK_RANGES[joint]
+        assert f"{cal['range_min']}–{cal['range_max']}" in row
+        assert f'{deg_per_pct_table()[joint]:.5f}' in row
+        assert f'±{degrees_reachable_range(joint)[1]:.5f}' in row
+    assert 'at-limit prediction' in text
+    assert 'not a new observation' in text
+    assert 'outside the historical episode-0 band' in text

@@ -53,7 +53,7 @@ def rewrite(workspace, name, edit):
 
 
 def observed(backend, purpose):
-    return {
+    result = {
         "backend": backend, "purpose": purpose, "source": {"sha256": digest(backend)},
         "packages": {"torch": "test"}, "image_digest": "sha256:" + digest(backend),
         "checkpoint_fingerprint": digest("checkpoint"), "backbone_fingerprint": digest("backbone"),
@@ -67,13 +67,25 @@ def observed(backend, purpose):
         "noise_dtype": "torch.float32", "raw_dtype": "torch.float32",
         "attention": ["sdpa"], "autocast": False, "tf32": False, "sdpa_calls": 1,
     }
+    if backend == "lerobot" and purpose == "operational":
+        sem = semantics()
+        result.update({key: value for key, value in sem.items() if key not in
+                       ("source_fingerprint", "packages_fingerprint", "seed_policy")})
+        result["serving_seed_policy"] = sem["seed_policy"]
+        result["owned_source_files"] = {name: digest(name) for name in (
+            "policy_guard/groot_guard.py", "policy_guard/replay_contract.py", "docker/lerobot-policy/server.py",
+        )}
+    return result
 
 
 def semantics():
     return {
         "backend": "lerobot", "purpose": "operational",
         "checkpoint_fingerprint": digest("checkpoint"), "backbone_fingerprint": digest("backbone"),
-        "source_fingerprint": digest("source"), "packages_fingerprint": digest("packages"),
+        "source_fingerprint": digest({"source": {"sha256": digest("lerobot")}, "owned": {
+            name: digest(name) for name in (
+                "policy_guard/groot_guard.py", "policy_guard/replay_contract.py", "docker/lerobot-policy/server.py",
+            )}}), "packages_fingerprint": digest({"torch": "test"}),
         "image_digest": "sha256:" + digest("lerobot"),
         "effective_configuration": {"letter_box_transform": True, "actions_per_chunk": 16},
         "parameter_dtypes": ["torch.bfloat16"], "buffer_dtypes": [],
@@ -104,6 +116,12 @@ def runtime(second, instance="first"):
         "semantic_configuration": sem, "configuration_fingerprint": digest(sem),
         "instance": process, "loaded_at": ts(2), "request": request,
         "endpoint": {"host": "0.0.0.0", "port": 8080},
+        "observations": {
+            "noise_shape": [1, 40, 132], "noise_dtype": "torch.bfloat16", "noise_device": "cuda:0",
+            "noise_draws": 1, "sdpa_calls": 1, "kernels": ["aten._scaled_dot_product_attention"],
+            "flow_steps": 4, "floating_operation_count": 1, "raw_shape": [1, 40, 132],
+            "raw_dtype": "torch.float32", "input_dtypes": ["torch.float32"], "backbone_dtypes": ["torch.bfloat16"],
+        },
     }
     host = {
         **process, "image_digest": sem["image_digest"], "running": True,
@@ -698,3 +716,178 @@ def test_complete_predecessor_requires_historical_semantic_validation(tmp_path):
                                  current_calibration_sha256=digest("calibration"), now=ts(43))
         events.append("construct")
     assert events == []
+
+
+def test_serving_attestor_publishes_only_completed_observed_request(tmp_path):
+    import torch
+    from types import SimpleNamespace
+    from lerobot.async_inference.helpers import TimedAction, TimedObservation
+    module = serving_module()
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+            self.backbone = torch.nn.Identity()
+            self.action_head = torch.nn.Module()
+            self.action_head.action_encoder = torch.nn.Identity()
+
+        def get_action(self):
+            inputs = self.backbone(torch.ones((1, 1, 4, 4)))
+            attention = torch.nn.functional.scaled_dot_product_attention(inputs, inputs, inputs)
+            raw = torch.randn((1, 40, 132))
+            for _ in range(4):
+                raw = self.action_head.action_encoder(raw) + attention.mean() + self.weight
+            return {"action_pred": raw}
+
+    class Server(module.DumEGrootPolicyServer):
+        def _predict_action_chunk_impl(self, observation):
+            raw = self.policy._groot_model.get_action()["action_pred"]
+            return [TimedAction(timestamp=observation.get_timestamp(), timestep=i, action=row)
+                    for i, row in enumerate(raw[0, :16, :6])]
+
+    server = Server.__new__(Server)
+    server.config = SimpleNamespace(host="0.0.0.0", port=8080)
+    server.policy = torch.nn.Module()
+    server.policy.config = SimpleNamespace(base_model_path="/fixture/checkpoint")
+    server.policy._groot_model = Model().eval()
+    identity = {"container": {"container_id": digest("first"), "container_started_at": ts(0),
+                               "image_digest": "sha256:" + digest("lerobot")}}
+    current_identity = copy.deepcopy(identity)
+    def profile_reader(server, model, identity, measured, raw):
+        profile = observed("lerobot", "operational")
+        profile.update(parameter_dtypes=["torch.float32"], compute_dtypes=sorted(measured.compute_dtypes),
+                       device=measured.noise_device, flow_steps=measured.flow_steps)
+        return profile
+    moments = iter([ts(2), ts(30), ts(31), ts(40)])
+    attestor = module.ServingAttestor(
+        server, tmp_path / "lerobot.json", identity,
+        identity_reader=lambda *args: current_identity, profile_reader=profile_reader,
+        clock=lambda: next(moments), process_reader=lambda: {
+            k: v for k, v in runtime(30)["host"].items()
+            if k in ("pid", "process_start_ticks", "process_started_at", "boot_id")
+        }, test_only=True,
+    )
+    server._parity_attestor = attestor
+    assert read_json(tmp_path / "lerobot.json")["status"] == "loaded"
+    raw_observation = {key: 0.0 for key in JOINT_ORDER}
+    raw_observation.update({key: np.zeros((480, 640, 3), np.uint8) for key in CAMERA_ORDER})
+    raw_observation["task"] = "fixture banana"
+    obs = TimedObservation(timestamp=30.0, timestep=0, observation=raw_observation, must_go=True)
+    result = server._predict_action_chunk(obs)
+    complete = read_json(tmp_path / "lerobot.json")
+    assert complete["status"] == "complete"
+    assert complete["request"]["observation_sha256"] == api().observation_fingerprint(raw_observation)
+    assert complete["request"]["output_sha256"] == api().array_fingerprint(
+        torch.stack([item.get_action().detach() for item in result]).numpy())
+    assert complete["observations"]["flow_steps"] == 4
+    assert complete["semantic_configuration"]["device"] == "cpu"
+    assert (tmp_path / "lerobot.json").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "lerobot.json").stat().st_uid == tmp_path.stat().st_uid
+    assert b"environment" not in (tmp_path / "lerobot.json").read_bytes()
+    # No stale completion survives an identity change or failed inference.
+    current_identity["container"]["image_digest"] = "sha256:" + digest("changed")
+    with pytest.raises(ValueError, match="changed"):
+        server._predict_action_chunk(obs)
+    assert read_json(tmp_path / "lerobot.json")["status"] == "failed"
+    assert "request" not in read_json(tmp_path / "lerobot.json")
+
+
+def test_arbitrary_model_config_values_are_hashed_not_disclosed():
+    profile = observed("lerobot", "operational")
+    profile["effective_configuration"] = {
+        "model": {"token": "fixture-private-value"},
+        "policy": {"base_model_path": "/fixture/checkpoint"},
+        "serving": {"base_model_path": "/fixture/checkpoint", "served_letter_box_transform": True},
+    }
+    sem = api().operational_semantics(profile)
+    assert "fixture-private-value" not in canonical(sem).decode()
+    assert sem["effective_configuration"]["serving"]["base_model_path"] == "checkpoint-sha256:" + digest("checkpoint")
+
+
+def test_host_snapshot_change_requires_new_immutable_preflight_even_while_recent(tmp_path):
+    live_ref, rv = approved(tmp_path)
+    rv["host"]["checked_at"] = ts(33)
+    with pytest.raises(ValueError, match="persisted preflight"):
+        api().assert_live_release(api().Evidence(tmp_path, test_only=True), live_ref,
+                                 expected_stage="live", runtime=rv,
+                                 current_calibration_sha256=digest("calibration"), now=ts(34))
+
+
+def test_release_recaptures_evidence_even_if_caller_reuses_a_snapshot(tmp_path):
+    live_ref, rv = approved(tmp_path)
+    cached = api().Evidence(tmp_path, test_only=True)
+    api().validate_live_approval(cached)
+    rewrite(tmp_path, "offline-report.json", lambda d: d["caveats"].append("changed after earlier validation"))
+    with pytest.raises(ValueError):
+        api().assert_live_release(cached, live_ref, expected_stage="live", runtime=rv,
+                                 current_calibration_sha256=digest("calibration"), now=ts(33))
+
+
+def test_failed_attempt_can_be_preserved_for_explicit_same_stage_renewal(tmp_path):
+    live_ref, rv = approved(tmp_path)
+    ev = api().Evidence(tmp_path, test_only=True)
+    failed = copy.deepcopy(ev.json(live_ref))
+    failed.update(attempt=2, started_at=ts(40), ended_at=ts(42), status="not_run",
+                  previous=live_ref, reason="Fresh request unavailable", attestation={},
+                  attestation_sha256=digest({}), host={}, request={})
+    ref = api().write_preflight_record(ev, failed)
+    saved = (tmp_path / ref["path"]).read_bytes()
+    renewed, rv = preflight(tmp_path, "live", 50, attempt=3, previous=ref, reason="Explicit retry after unavailable request")
+    api().assert_live_release(api().Evidence(tmp_path, test_only=True), renewed,
+                             expected_stage="live", runtime=rv,
+                             current_calibration_sha256=digest("calibration"), now=ts(53))
+    assert (tmp_path / ref["path"]).read_bytes() == saved
+    with pytest.raises(ValueError):
+        preflight(tmp_path, "run", 60, previous=ref, reason="Cannot construct after failure")
+
+
+def test_opt_in_identity_failure_drops_previous_policy_before_refusal(tmp_path, monkeypatch):
+    module = serving_module()
+    server = module.DumEGrootPolicyServer.__new__(module.DumEGrootPolicyServer)
+    server.policy = server.preprocessor = server.postprocessor = object()
+    monkeypatch.setenv("DUME_PARITY_ATTESTATION_PATH", str(tmp_path / "lerobot.json"))
+    def refused(*args):
+        raise ValueError("fixture content identity changed")
+    monkeypatch.setattr(module, "capture_serving_identity", refused)
+    with pytest.raises(ValueError, match="changed"):
+        server._prepare_parity_attestation("/fixture/checkpoint")
+    assert server.policy is server.preprocessor is server.postprocessor is None
+    assert read_json(tmp_path / "lerobot.json")["status"] == "loading"
+
+
+def test_serving_profile_reads_effective_steps_when_request_uses_checkpoint_default():
+    import torch
+    from types import SimpleNamespace
+    module = serving_module()
+    checkpoint = ROOT / "checkpoints/GR00T-N1.7-3B-SO101"
+    config = module.GrootConfig(base_model_path=str(checkpoint), embodiment_tag="new_embodiment", model_params_fp32=False)
+    assert config.num_inference_timesteps is None
+    module.fixup_policy_features(config, camera_keys=("wrist", "front"), height=480, width=640, state_dim=6, action_dim=6)
+    pre, post = module.make_pre_post_processors(
+        config, pretrained_path=str(checkpoint),
+        preprocessor_overrides={"device_processor": {"device": "cpu"}, **module.serving_preprocessor_overrides()},
+        postprocessor_overrides={"device_processor": {"device": "cpu"}},
+    )
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.zeros(1))
+    attention = SimpleNamespace(_attn_implementation="sdpa")
+    backbone_config = SimpleNamespace(_attn_implementation="sdpa", text_config=attention, vision_config=attention)
+    model.backbone = SimpleNamespace(model=SimpleNamespace(config=backbone_config))
+    model.action_head = SimpleNamespace(num_inference_timesteps=4)
+    model.config = SimpleNamespace(to_dict=lambda: {"num_inference_timesteps": 4})
+    model.eval()
+    server = SimpleNamespace(policy=SimpleNamespace(config=config), preprocessor=pre, postprocessor=post, actions_per_chunk=16)
+    measured = SimpleNamespace(flow_steps=4, noise_draws=1, noise_shape=[1, 40, 132], sdpa_calls=1,
+                               floating_operation_count=1, compute_dtypes={"torch.float32"},
+                               autocast=False, tf32=False, noise_device="cpu")
+    identity = observed("lerobot", "operational")
+    identity["container"] = {"image_digest": identity["image_digest"]}
+    try:
+        profile = module.serving_profile(server, model, identity, measured, torch.zeros(1, 40, 132))
+    except ValueError as exc:
+        pytest.fail(f"Observed four-step inference must accept the pinned None request default: {exc}")
+    assert profile["flow_steps"] == 4
+    assert profile["parameter_dtypes"] == ["torch.float32"]
+    assert profile["effective_configuration"]["processors"]["pre"]
+    assert api().operational_semantics(profile)["effective_configuration"]["processors_sha256"]

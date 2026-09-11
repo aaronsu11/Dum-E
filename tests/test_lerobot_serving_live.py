@@ -62,6 +62,7 @@ import os
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -79,6 +80,7 @@ from policy.lerobot.features import (
 from policy.lerobot.session import LeRobotPolicySession
 
 RUN_LIVE = os.getenv("DUME_RUN_LIVE_LEROBOT_TESTS") == "1"
+RUN_PARITY_ATTESTATION = os.getenv("DUME_RUN_PARITY_ATTESTATION_TESTS") == "1"
 
 pytestmark = pytest.mark.skipif(
     not RUN_LIVE,
@@ -1167,3 +1169,67 @@ def test_live_no_seed_variable_means_no_seed_is_set(unseeded_container):
             f"unseeded action {i} has shape {tuple(timed.get_action().shape)}, expected "
             f"({EXPECTED_ACTION_DIM},)"
         )
+
+
+@pytest.mark.skipif(
+    not RUN_PARITY_ATTESTATION,
+    reason="Plan 04 arm-free attestation measurement requires explicit DUME_RUN_PARITY_ATTESTATION_TESTS=1",
+)
+def test_live_parity_attestation_binds_actual_load_request_and_host():
+    # Run this selection after Plan 04 packages the new server. The runtime
+    # directory must be shared with the opt-in server and explicitly selected:
+    # DUME_PARITY_ATTESTATION_FILE=/host/workspace/runtime/lerobot.json.
+    # This test neither approves evidence nor constructs a robot.
+    from policy_guard.parity_gate import (
+        array_fingerprint, collect_runtime_host, inspect_container_binding,
+        observation_fingerprint, timestamp, validate_runtime_attestation,
+        write_runtime_json,
+    )
+    from policy_guard.replay_contract import capture_bytes, read_json
+
+    selected = os.environ.get("DUME_PARITY_ATTESTATION_FILE")
+    assert selected, "An explicit host path to the shared runtime/lerobot.json is required"
+    path = Path(selected)
+    assert path.name == "lerobot.json"
+    binding = inspect_container_binding(CONTAINER_NAME, SERVER_ADDRESS, CHECKPOINT_MOUNT)
+    write_runtime_json(path.parent / "container.json", binding)
+    session = LeRobotPolicySession(SERVER_ADDRESS)
+    try:
+        session.connect(_specs())
+        loaded = read_json(capture_bytes(path))
+        assert loaded["status"] == "loaded", "Guarded load alone cannot attest completed inference"
+        raw = _synthetic_observation(joint_value=0.314159)
+        started = _utc_now_rfc3339()
+        actions = session.infer(raw)
+        ended = _utc_now_rfc3339()
+        assert len(actions) == 16
+        decoded = torch.stack([item.get_action().detach().cpu().float() for item in actions]).numpy()
+        assert decoded.shape == (16, 6) and np.isfinite(decoded).all()
+        attestation = read_json(capture_bytes(path))
+        assert loaded["instance"] == attestation["instance"]
+        request = {
+            "observation_sha256": observation_fingerprint(raw),
+            "timestamp": actions[0].get_timestamp(), "timestep": actions[0].get_timestep(),
+            "started_at": attestation["request"]["started_at"],
+            "completed_at": attestation["request"]["completed_at"],
+            "output_sha256": array_fingerprint(decoded), "decoded_shape": [16, 6],
+        }
+        assert timestamp(started) <= timestamp(request["started_at"]) <= timestamp(request["completed_at"]) <= timestamp(ended)
+        host = collect_runtime_host(attestation, CONTAINER_NAME, SERVER_ADDRESS, CHECKPOINT_MOUNT)
+        sem = attestation["semantic_configuration"]
+        assert sem["image_digest"] == binding["image_digest"]
+        assert sem["device"] == "cuda:0"
+        assert "torch.bfloat16" in sem["parameter_dtypes"]
+        assert sem["flow_steps"] == attestation["observations"]["flow_steps"] == 4
+        assert sem["raw_shape"] == attestation["observations"]["noise_shape"] == [1, 40, 132]
+        assert attestation["observations"]["sdpa_calls"] > 0
+        assert sem["effective_configuration"]["serving"]["served_letter_box_transform"] is True
+        validate_runtime_attestation(attestation, host=host, request=request,
+                                     expected_configuration=sem, now=_utc_now_rfc3339())
+        # This is measurement, not release approval. Plan 04 must bind these
+        # facts to its independent measured operational profile before agreement.
+        print(json.dumps({"status": "complete", "image_digest": sem["image_digest"],
+                          "configuration_fingerprint": attestation["configuration_fingerprint"],
+                          "request": request, "observations": attestation["observations"]}, sort_keys=True))
+    finally:
+        session.close()

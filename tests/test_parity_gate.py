@@ -66,6 +66,7 @@ def observed(backend, purpose):
         "backbone_dtypes": ["torch.float32"], "compute_dtypes": ["torch.float32"],
         "noise_dtype": "torch.float32", "raw_dtype": "torch.float32",
         "attention": ["sdpa"], "autocast": False, "tf32": False, "sdpa_calls": 1,
+        "tf32_matmul": False, "tf32_cudnn": False,
     }
     if backend == "lerobot" and purpose == "operational":
         sem = semantics()
@@ -94,6 +95,7 @@ def semantics():
         "compute_dtypes": ["torch.bfloat16", "torch.float32"],
         "attention": ["sdpa"], "flow_steps": 4, "eval": True,
         "autocast": False, "tf32": False, "device": "cuda:0",
+        "tf32_matmul": False, "tf32_cudnn": False,
         "seed_policy": {"mode": "ambient", "seed": None},
         "joint_order": list(JOINT_ORDER), "camera_order": list(CAMERA_ORDER),
         "raw_shape": [1, 40, 132], "decoded_shape": [16, 6],
@@ -866,7 +868,7 @@ def configured_capture_server(checkpoint):
     server = SimpleNamespace(policy=SimpleNamespace(config=config), preprocessor=pre, postprocessor=post, actions_per_chunk=16)
     measured = SimpleNamespace(flow_steps=4, noise_draws=1, noise_shape=[1, 40, 132], sdpa_calls=1,
                                floating_operation_count=1, compute_dtypes={"torch.float32"},
-                               autocast=False, tf32=False, noise_device="cpu")
+                               autocast=False, tf32=False, tf32_matmul=False, tf32_cudnn=False, noise_device="cpu")
     return server, model, measured
 
 

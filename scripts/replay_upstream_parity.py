@@ -245,11 +245,13 @@ def observe_stock(workspace, backend, identity):
         def __init__(self):
             super().__init__()
             self.dtypes, self.draws, self.sdpa = set(), [], 0
-            self.autocast = self.tf32 = False
+            self.autocast = self.tf32 = self.tf32_matmul = self.tf32_cudnn = False
 
         def context(self):
             self.autocast |= torch.is_autocast_enabled("cpu") or torch.is_autocast_enabled("cuda")
-            self.tf32 |= torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+            self.tf32_matmul |= torch.backends.cuda.matmul.allow_tf32
+            self.tf32_cudnn |= torch.backends.cudnn.allow_tf32
+            self.tf32 = self.tf32_matmul or self.tf32_cudnn
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             self.context()
@@ -329,6 +331,7 @@ def observe_stock(workspace, backend, identity):
                                      (config, config.text_config, config.vision_config)}),
                 "eval": all(not m.training for m in model.modules()), "observer_inert": inert,
                 "autocast": mode.autocast, "tf32": mode.tf32, "sdpa_calls": mode.sdpa,
+                "tf32_matmul": mode.tf32_matmul, "tf32_cudnn": mode.tf32_cudnn,
                 "noise_draws": len(mode.draws), "noise_shape": list(noise.shape),
                 "noise_dtype": str(noise.dtype), "raw_shape": list(raw.shape), "raw_dtype": str(raw.dtype),
                 "device": str(noise.device), "rng_algorithm": f"torch.default_generator.{noise.device.type}",

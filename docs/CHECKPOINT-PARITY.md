@@ -232,3 +232,11 @@ profile and independent serving attestation. An image default such as cuDNN TF32
 enabled must not be silently changed to make those records agree. A source or
 profile correction requires a new successor session, fresh calibration derivation,
 fresh feasibility profiles and the complete repeatability schedule.
+
+Replay profiles, stock observations and serving semantics bind
+`tf32_matmul` and `tf32_cudnn` independently. Both must be actual booleans; the
+retained `tf32` summary must equal their OR and cannot establish equivalence.
+Changing matmul TF32 while cuDNN TF32 stays enabled changes the operational
+configuration and invalidates the attestation. Diagnostics require both flags
+false. Older evidence lacking the pair is historical context, not a current
+profile or release witness.

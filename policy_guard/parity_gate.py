@@ -57,7 +57,7 @@ from policy_guard.replay_contract import (
     CAMERA_ORDER, JOINT_ORDER, MAX_JSON, DecisionRecord, PrerequisiteError,
     canonical, capture_bytes, contained, fingerprint_configuration, load_numeric,
     now as utc_now, read_json, repeatability_schedule, validate_profile,
-    validate_schedule, write_evidence, write_tensors, profile_configuration,
+    validate_schedule, write_evidence, write_tensors, profile_configuration, validate_tf32_controls,
 )
 
 COMPARISON_PROFILES = {
@@ -82,7 +82,7 @@ SEMANTIC_KEYS = {
     "backend", "purpose", "checkpoint_fingerprint", "backbone_fingerprint",
     "source_fingerprint", "packages_fingerprint", "image_digest",
     "effective_configuration", "parameter_dtypes", "buffer_dtypes", "compute_dtypes",
-    "attention", "flow_steps", "eval", "autocast", "tf32", "device", "seed_policy",
+    "attention", "flow_steps", "eval", "autocast", "tf32", "tf32_matmul", "tf32_cudnn", "device", "seed_policy",
     "joint_order", "camera_order", "raw_shape", "decoded_shape",
 }
 INSTANCE_KEYS = {
@@ -618,7 +618,8 @@ def validate_semantic_configuration(sem):
     for key in ("parameter_dtypes", "compute_dtypes", "attention"):
         require(isinstance(sem[key], list) and sem[key] and len(set(sem[key])) == len(sem[key]), f"missing actual {key}")
     require(isinstance(sem["buffer_dtypes"], list), "observed buffer dtypes required")
-    require(type(sem["autocast"]) is bool and type(sem["tf32"]) is bool, "actual compute controls required")
+    require(type(sem["autocast"]) is bool, "actual autocast control required")
+    validate_tf32_controls(sem)
     require(isinstance(sem["effective_configuration"], dict) and sem["effective_configuration"], "loaded configuration required")
     text(sem["device"], "observed device")
     seed = sem["seed_policy"]
@@ -1565,6 +1566,7 @@ def validate_observation(ev, reference, profile):
     for key in ("source", "packages", "backbone_fingerprint"):
         require(value[key] == profile[key], "stock source/package/backbone identity mismatch")
     measured = value["observed"]
+    validate_tf32_controls(measured)
     for key in ("parameter_dtypes", "input_dtypes", "backbone_dtypes", "compute_dtypes"):
         require(measured[key] == ["torch.float32"], f"stock {key} is not actual fp32")
     require(all(v == "torch.float32" for v in measured["buffer_dtypes"]), "stock buffer precision")
@@ -1572,6 +1574,7 @@ def validate_observation(ev, reference, profile):
         ("flow_steps", 4), ("raw_shape", [2, 40, 132]), ("noise_shape", [2, 40, 132]),
         ("noise_dtype", "torch.float32"), ("raw_dtype", "torch.float32"),
         ("noise_draws", 1), ("autocast", False), ("tf32", False),
+        ("tf32_matmul", False), ("tf32_cudnn", False),
         ("eval", True), ("observer_inert", True), ("attention", ["sdpa"]),
     ):
         require(measured[key] == expected, f"stock effective {key} mismatch")

@@ -46,6 +46,7 @@ def profile():
         "compute_dtypes": ["torch.float32"], "noise_dtype": "torch.float32",
         "raw_dtype": "torch.float32", "attention": ["sdpa"],
         "sdpa_calls": 4, "eval": True, "autocast": False, "tf32": False,
+        "tf32_matmul": False, "tf32_cudnn": False,
         "flow_steps": 4, "raw_shape": [1, 40, 132], "noise_shape": [1, 40, 132],
         "decoded_shape": [16, 6], "noise_draws": 1,
         "seed_at_sampling_boundary": True, "observer_inert": True,

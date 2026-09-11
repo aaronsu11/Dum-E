@@ -275,7 +275,7 @@ class ServingObservation:
         self.kernels = set()
         self.floating_operation_count = 0
         self.autocast = False
-        self.tf32 = False
+        self.tf32 = self.tf32_matmul = self.tf32_cudnn = False
         owner = self
 
         class FunctionObserver(TorchFunctionMode):
@@ -311,7 +311,9 @@ class ServingObservation:
 
     def observe_context(self):
         self.autocast |= torch.is_autocast_enabled("cuda") or torch.is_autocast_enabled("cpu")
-        self.tf32 |= torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+        self.tf32_matmul |= torch.backends.cuda.matmul.allow_tf32
+        self.tf32_cudnn |= torch.backends.cudnn.allow_tf32
+        self.tf32 = self.tf32_matmul or self.tf32_cudnn
 
     def __enter__(self):
         self.stack = contextlib.ExitStack()
@@ -424,6 +426,7 @@ def serving_profile(server, model, identity, observation, raw):
         "compute_dtypes": sorted(observation.compute_dtypes), "attention": attention,
         "flow_steps": observation.flow_steps, "eval": all(not m.training for m in model.modules()),
         "autocast": observation.autocast, "tf32": observation.tf32, "device": observation.noise_device,
+        "tf32_matmul": observation.tf32_matmul, "tf32_cudnn": observation.tf32_cudnn,
         "joint_order": list(JOINT_ORDER), "camera_order": list(CAMERA_ORDER),
         "raw_shape": list(raw.shape), "decoded_shape": [16, 6],
     }

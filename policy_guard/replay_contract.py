@@ -386,7 +386,17 @@ class DecisionRecord:
     rationale: str
 
 
+def validate_tf32_controls(value: dict) -> None:
+    """Require both observed controls; the historical OR bit is descriptive."""
+    for key in ("tf32_matmul", "tf32_cudnn", "tf32"):
+        if type(value.get(key)) is not bool:
+            raise ValueError(f"missing/nonboolean observed {key}")
+    if value["tf32"] != (value["tf32_matmul"] or value["tf32_cudnn"]):
+        raise ValueError("tf32 aggregate differs from independently observed controls")
+
+
 def validate_profile(profile: dict) -> None:
+    validate_tf32_controls(profile)
     if profile.get("backend") not in ("native", "lerobot"):
         raise ValueError("unknown backend")
     if profile.get("purpose") not in ("diagnostic", "operational"):
@@ -411,7 +421,7 @@ def validate_profile(profile: dict) -> None:
             raise ValueError("diagnostic buffer_dtypes are not fp32")
         for key, expected in (
             ("noise_dtype", "torch.float32"), ("raw_dtype", "torch.float32"),
-            ("autocast", False), ("tf32", False), ("attention", ["sdpa"]),
+            ("autocast", False), ("tf32", False), ("tf32_matmul", False), ("tf32_cudnn", False), ("attention", ["sdpa"]),
         ):
             if profile.get(key) != expected:
                 raise ValueError(f"diagnostic {key} mismatch: {profile.get(key)!r}")
@@ -650,7 +660,7 @@ def sampling_observer(seed: int, *, capture: bool = True):
             self.sdpa_calls = 0
             self.compute_dtypes = set()
             self.autocast = False
-            self.tf32 = False
+            self.tf32 = self.tf32_matmul = self.tf32_cudnn = False
             self.noise_device = None
             self.rng_before = None
             self.rng_after = None
@@ -673,7 +683,9 @@ def sampling_observer(seed: int, *, capture: bool = True):
 
         def observe_context(self):
             self.autocast |= torch.is_autocast_enabled("cuda") or torch.is_autocast_enabled("cpu")
-            self.tf32 |= torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+            self.tf32_matmul |= torch.backends.cuda.matmul.allow_tf32
+            self.tf32_cudnn |= torch.backends.cudnn.allow_tf32
+            self.tf32 = self.tf32_matmul or self.tf32_cudnn
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
@@ -800,6 +812,7 @@ def trace_prediction(adapter, arrays, entry, seed: int, identity: dict) -> tuple
         "attention": sorted(adapter.attention_implementations()),
         "sdpa_calls": observer.sdpa_calls, "eval": all(not m.training for m in model.modules()),
         "autocast": observer.autocast, "tf32": observer.tf32,
+        "tf32_matmul": observer.tf32_matmul, "tf32_cudnn": observer.tf32_cudnn,
         "flow_steps": len(steps), "step_buckets": steps,
         "raw_shape": list(raw.shape), "noise_shape": list(observer.noise.shape),
         "decoded_shape": list(decoded.shape), "noise_draws": observer.noise_draws,

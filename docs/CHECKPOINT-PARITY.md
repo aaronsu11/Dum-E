@@ -1,5 +1,32 @@
 # Checkpoint parity: local numerical instrument
 
+## Active milestone scope: 12 observations, one seed (2026-09-11)
+
+The operator cancelled the exhaustive 7,200-inference matrix and prohibited CPU model inference, then explicitly selected **12 observations, one seed**. Select the middle stored observation from each of the 12 recorded episodes and its first locked seed. Both configurations use deployed GPU BF16. This section supersedes the exhaustive workflow documented below, which remains historical context.
+
+The check reuses the preserved native/LeRobot operational GPU captures. It launches **zero new inference runs**; original source evidence and approved numerical bounds remain unchanged. The original full experiment was cancelled, not passed. Its stock producer/consumer result remains a separately preserved pass.
+
+- Frozen selection: `corpus/phase7-stock-tests-20260911/milestone-scope.json`, SHA-256 `fae6835e8df81b453e2bbc19fe9cdbf64982af25d3569982ea4ce2d782172ba2`.
+- Scoped result: `corpus/phase7-stock-tests-20260911/milestone-report.json`, SHA-256 `975b291c46dcbb30e8f7cf097e32dcab3e805f88a32fd314900c937fca5c2af5`.
+- Result: **failed**, 12/12 selected pairs evaluated. Largest decoded difference: **0.985710 percentage points**, against the unchanged **0.1-point** maximum bound. Mean absolute error by joint ranges from **0.057775 to 0.182683 points**, against **0.05**. Signed bias and chunk-index slope bounds also fail. Full per-joint/per-index and per-trace matrices are linked from the report.
+- Raw maximum absolute difference: **0.0370953**; the approved raw atol/rtol check fails. All twelve input comparisons report value and schema differences. These are separately reported; differing backend input schemas alone do not prove a behavioral bug.
+- Native sampler noise is BF16; LeRobot sampler noise is FP32. Captured noise differs even with the selected equal seed. Native attention is FlashAttention2; LeRobot attention is SDPA. The report uses the original independent-noise rule and does not claim that it isolates the cause of output differences.
+- Reduction runtime: **13.55 seconds**. Both original operational GPU captures had already completed 600 cases, in approximately 207/215 seconds; no CPU inference is needed to use this evidence.
+- No common-input isolation rerun, exhaustive precision bridges, reviewed native golden, release readiness, or hardware authorization is claimed. Do not loosen thresholds or choose different samples in response to these results.
+
+The reducer is `scripts/check_milestone_parity.py`; its seven focused tests cover sample membership, partial coverage, local bias cancellation, slope, exact tokens, raw shape/finite values, differing noise, and input-schema reporting. Existing sealed numerical/worker source files were not changed. A read-only review found no remaining blocking issue. The first arithmetic attempt refused differing input keys; it is retained as `milestone-reduction-attempt-01.json`, and the final reducer reports those differences instead of discarding output metrics.
+
+Initial execution (writes the report once and refuses overwrite):
+
+```sh
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/check_milestone_parity.py --workspace corpus/phase7-stock-tests-20260911
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run pytest tests/test_milestone_parity.py -q
+```
+
+Phase 07 remains incomplete because the selected operational check exceeds the agreed bounds. Investigate sampling/preprocessing differences within the small GPU-only scope; any intentional numerical-acceptance change must be explicit and prospective, preserving this failed report. Golden and live steps remain pending.
+
+## Historical exhaustive instrument
+
 Phase 07 Plan 04 Task 1 implements the instrument. Its tests use fabricated
 arrays and tiny fabricated Torch modules only. No real cross-backend comparison,
 stock producer/consumer experiment, repeatability measurement, tolerance agreement,

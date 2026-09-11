@@ -583,3 +583,58 @@ stock wrapper runs BOTH stages in this fresh session. Collection-only and
 producer-feasibility artifacts do not replace the agreement-bound stock run.
 Any failure blocks the full-600 and golden stages; hardware approval remains
 separate. No numerical or physical approval was inferred from packaging approval.
+
+
+## Plan 07 renewed approval and passing stock gate — 2026-09-11
+
+The new response **"Approve"** explicitly approved proposal
+`a8794bcaff088ac1e9638872337ecb336ce6f3156ce5f6f470cfe63c3e18d8cf`
+in `corpus/phase7-stock-tests-20260911`. The canonical `record_decision`
+checkpoint-transcription seam recorded it with `test_only=False`, operator
+`Aaron (session user; explicit chat approval)`, the verbatim response and exact
+proposal/image context. Its own current UTC timestamp is
+`2026-09-11T19:04:08.666885+00:00`; no historical chat time was invented.
+Agreement SHA-256:
+`1b79b1b28d8ee1d9aff349635a8aed677af6617f674eb2a2316ff5e6c214ceea`.
+
+Before recording, current corpus/checkpoint bytes matched the input lock;
+all ten instrument hashes, the pristine external harness, current calibration,
+new-image profiles and independent historical arm-free attestation validated.
+The exact image remains
+`sha256:6758186bd24cd0745b7442dafbb6680cbc2a986fe387eb2de5aaf0b75dce9c98`.
+The existing latest tag and all prior failed-session artifacts are unchanged.
+The canonical tolerance check then exited 0.
+
+The unchanged stock wrapper ran both stages into a fresh private producer
+directory. The producer exited 0 and emitted exactly `new_embodiment`, seed 42.
+The consumer exited 0: **one collected and executed case passed**, zero
+skips/xfails/xpasses or missing cases. Both independently observed full raw and
+noise shapes were `(2,40,132)`; collated inputs and actual noise matched.
+Both sides observed CPU FP32 parameters, buffers, inputs, backbone and compute,
+SDPA (244 calls), four flow steps, eval mode, no autocast, both TF32 flags off,
+and exact observer-disabled control equality. Maximum raw difference was
+`4.768372e-7`, mean absolute difference `2.895536e-8`, within the unchanged
+raw `atol=rtol=1e-3` bounds. No minimum-shape crop hid a mismatch.
+
+The stock command ran `19:04:49.056987`–`19:06:11.040235` UTC, **81.984 seconds**
+including launches and validation. Its immutable `upstream-result.json`
+SHA-256 is
+`6a3a72977a9d9b30415ae0c95096258303019badb99be0dba944cec465ce2faa`.
+The separate strict archived stock check also exited 0 (1.805 seconds).
+
+```sh
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/approve_parity_evidence.py check --stage tolerances --workspace corpus/phase7-stock-tests-20260911
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/replay_upstream_parity.py run --workspace corpus/phase7-stock-tests-20260911
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/replay_upstream_parity.py check --workspace corpus/phase7-stock-tests-20260911
+```
+
+Exact argv, timestamps, exits, logs and pre-approval validation are archived
+under `plan07-execution/` in this workspace; JUnit, coverage, runtime identities
+and numeric captures are under `stock/` and `tensors/`. No new broad hermetic
+suite was run: the unchanged instrument retains its prior validated regression
+evidence, and the explicitly cancelled 120 partial passes remain excluded.
+
+Task 1 is complete. Task 2 must still execute all full 600-case tiers and
+operational bridges before generating the native candidate. Golden approval
+and hardware release remain separate gates. Future threshold changes require
+a fresh prospective proposal and explicit approval before a new experiment.

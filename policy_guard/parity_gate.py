@@ -33,7 +33,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
+import subprocess
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +57,10 @@ COMPARISON_PROFILES = {
     "operational": ["native-operational", "lerobot-operational"],
 }
 PROFILE_NAMES = ("native-diagnostic", "lerobot-diagnostic", "native-operational", "lerobot-operational")
+SERVING_SOURCE_FILES = (
+    "policy_guard/groot_guard.py", "policy_guard/replay_contract.py",
+    "docker/lerobot-policy/server.py",
+)
 DECISIONS = {
     "tolerances": ("tolerance-proposal.json", "tolerance-agreement.json"),
     "golden": ("golden-candidate.json", "golden-approval.json"),
@@ -571,12 +578,68 @@ def validate_release_evidence(workspace):
         raise PrerequisiteError("not run: measured operational serving attestation is missing")
     validate_semantic_configuration(sem)
     require(sem["checkpoint_fingerprint"] == ev.json("input-lock.json")["checkpoint_fingerprint"], "serving checkpoint changed")
+    operational = next(item["observed"] for item in ev.json("profiles.json")["profiles"]
+                       if item["backend"] == "lerobot" and item["purpose"] == "operational")
+    require(sem == operational_semantics(operational),
+            "serving semantics differ from the measured LeRobot operational profile")
     result = {
         **ev.identity(), "status": "complete", "report": ev.reference("offline-report.json"),
         "configuration_fingerprint": fingerprint_configuration(sem),
         "calibration_sha256": calibration, "calibration": calibration_ref,
     }
     ev._validated["release"] = result
+    return result
+
+
+def operational_semantics(profile):
+    """Project measured replay facts onto deployed semantics, without replay RNG.
+
+    Plan 04 must capture serving_seed_policy explicitly from the real server;
+    seed_at_sampling_boundary describes an exogenous replay intervention and is
+    never interpreted as a deployed fixed seed. Common serving sources are the
+    same files in replay and the image; extra replay launcher sources stay in the
+    locked profile identity. Only the content-addressed checkpoint path spelling
+    is normalized between /inputs/checkpoint and /checkpoints/model.
+    """
+    require(profile["backend"] == "lerobot" and profile["purpose"] == "operational",
+            "measured LeRobot operational profile required")
+    require("serving_seed_policy" in profile and "effective_configuration" in profile and
+            "owned_source_files" in profile, "measured operational serving/config/source facts missing")
+    effective = profile["effective_configuration"]
+    checkpoint_path = effective.get("policy", {}).get("base_model_path")
+
+    def normalized(value, key=None):
+        if isinstance(value, dict):
+            return {k: normalized(v, k) for k, v in value.items()}
+        if isinstance(value, list):
+            return [normalized(v) for v in value]
+        if checkpoint_path and key in ("base_model_path", "_name_or_path") and value == checkpoint_path:
+            return "checkpoint-sha256:" + profile["checkpoint_fingerprint"]
+        return value
+
+    special = {"source_fingerprint", "packages_fingerprint", "effective_configuration", "seed_policy"}
+    result = {key: profile[key] for key in SEMANTIC_KEYS - special}
+    effective_value = normalized(effective)
+    if set(effective_value) >= {"model", "policy", "serving"}:
+        # Full configuration still participates in identity; publish only hashes
+        # plus the explicitly allowlisted SAFE-01 facts, never arbitrary kwargs.
+        effective_value = {
+            "model_sha256": fingerprint_configuration(effective_value["model"]),
+            "policy_sha256": fingerprint_configuration(effective_value["policy"]),
+            "serving": effective_value["serving"],
+            **({"processors_sha256": fingerprint_configuration(effective_value["processors"])}
+               if "processors" in effective_value else {}),
+        }
+    result.update(
+        source_fingerprint=fingerprint_configuration({
+            "source": profile["source"],
+            "owned": {name: profile["owned_source_files"][name] for name in SERVING_SOURCE_FILES},
+        }),
+        packages_fingerprint=fingerprint_configuration(profile["packages"]),
+        effective_configuration=effective_value,
+        seed_policy=profile["serving_seed_policy"],
+    )
+    validate_semantic_configuration(result)
     return result
 
 
@@ -604,7 +667,7 @@ def validate_semantic_configuration(sem):
 
 def validate_runtime_attestation(attestation, *, host, request, expected_configuration, now=None, test_only=False):
     require(set(attestation) == {"schema_version", "evidence_kind", "status", "semantic_configuration",
-                                "configuration_fingerprint", "instance", "loaded_at", "request", "endpoint"},
+                                "configuration_fingerprint", "instance", "loaded_at", "request", "endpoint", "observations"},
             "attestation contains missing or non-allowlisted fields")
     require(attestation["schema_version"] == 1 and attestation["status"] == "complete", "completed real inference required")
     require(attestation["evidence_kind"] == ("test_only" if test_only else "real_model"), "test_only runtime is not real_model evidence")
@@ -612,6 +675,21 @@ def validate_runtime_attestation(attestation, *, host, request, expected_configu
     validate_semantic_configuration(sem)
     require(sem == expected_configuration and attestation["configuration_fingerprint"] == fingerprint_configuration(sem),
             "actual loaded configuration changed")
+    measured = attestation["observations"]
+    require(set(measured) == {"noise_shape", "noise_dtype", "noise_device", "noise_draws", "sdpa_calls",
+                              "kernels", "flow_steps", "floating_operation_count", "raw_shape", "raw_dtype",
+                              "input_dtypes", "backbone_dtypes"}, "allowlisted actual inference observations required")
+    for key, value in (("noise_shape", [1, 40, 132]), ("noise_draws", 1), ("raw_shape", sem["raw_shape"]),
+                       ("noise_device", sem["device"]), ("flow_steps", sem["flow_steps"])):
+        require(measured[key] == value, f"actual inference {key} mismatch")
+    require(type(measured["floating_operation_count"]) is int and measured["floating_operation_count"] > 0,
+            "no actual floating compute observed")
+    if "sdpa" in sem["attention"]:
+        require(type(measured["sdpa_calls"]) is int and measured["sdpa_calls"] > 0, "no actual SDPA observed")
+    for key in ("noise_dtype", "raw_dtype"):
+        require(measured[key] in sem["compute_dtypes"], "actual tensor dtype is outside measured compute profile")
+    require(isinstance(measured["kernels"], list) and measured["input_dtypes"] and measured["backbone_dtypes"],
+            "actual kernel/input/backbone observations required")
     instance = attestation["instance"]
     require(set(instance) == INSTANCE_KEYS and set(host) == INSTANCE_KEYS | {
         "image_digest", "running", "endpoint", "container_port", "checked_at",
@@ -633,13 +711,131 @@ def validate_runtime_attestation(attestation, *, host, request, expected_configu
     require(type(request["timestamp"]) in (int, float) and math.isfinite(request["timestamp"]) and
             type(request["timestep"]) is int and request["timestep"] >= 0, "request timestamp/timestep invalid")
     require(request["decoded_shape"] == [16, 6], "completed inference must decode a full chunk")
-    order = [instance["container_started_at"], instance["process_started_at"], attestation["loaded_at"],
+    # procfs boot time is integral seconds and start ticks are quantized. Docker
+    # records StartedAt after process creation. Bind both independent facts while
+    # allowing their documented measurement granularity, never a stale process.
+    require(abs((timestamp(instance["process_started_at"]) - timestamp(instance["container_started_at"])).total_seconds()) <= 2,
+            "container/process start identity differs")
+    order = [instance["process_started_at"], attestation["loaded_at"],
              request["started_at"], request["completed_at"], host["checked_at"]]
     require(all(timestamp(a) <= timestamp(b) for a, b in zip(order, order[1:])), "runtime/request chronology mismatch")
     if now is not None:
-        age = (timestamp(now) - timestamp(host["checked_at"])).total_seconds()
-        require(0 <= age <= 60, "stale runtime attestation")
+        for instant in (host["checked_at"], request["completed_at"]):
+            age = (timestamp(now) - timestamp(instant)).total_seconds()
+            require(0 <= age <= 60, "stale runtime attestation/request")
     return attestation
+
+
+def write_runtime_json(path, payload):
+    """Atomically replace ONLY transient runtime data, with private file mode."""
+    path = Path(path)
+    require(path.name in ("lerobot.json", "container.json"), "runtime filename must be lerobot.json or container.json")
+    require(not path.is_symlink(), "runtime output cannot be a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".attestation-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            if os.geteuid() == 0:
+                owner = path.parent.stat()
+                os.fchown(stream.fileno(), owner.st_uid, owner.st_gid)
+            stream.write(canonical(payload) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def array_fingerprint(array):
+    array = np.asarray(array)
+    require(array.dtype.kind in "biuf" and np.isfinite(array).all(), "finite numeric array required")
+    return fingerprint_configuration({"shape": list(array.shape), "dtype": str(array.dtype),
+                                      "sha256": hashlib.sha256(array.tobytes(order="C")).hexdigest()})
+
+
+def observation_fingerprint(observation):
+    require(set(observation) == set(JOINT_ORDER) | set(CAMERA_ORDER) | {"task"}, "exact observation fields required")
+    state = np.asarray([observation[joint] for joint in JOINT_ORDER], dtype=np.float64)
+    require(state.shape == (6,) and np.isfinite(state).all(), "finite six-joint observation required")
+    text(observation["task"], "instruction")
+    frames = {}
+    for camera in CAMERA_ORDER:
+        frame = np.asarray(observation[camera])
+        require(frame.shape == (480, 640, 3) and frame.dtype == np.uint8, "original camera geometry/dtype required")
+        frames[camera] = array_fingerprint(frame)
+    return fingerprint_configuration({"state": state.tolist(), "frames": frames, "task": observation["task"]})
+
+
+def process_identity(pid=None):
+    """Read actual Linux process identity; no environment or command-line dump."""
+    pid = os.getpid() if pid is None else pid
+    require(type(pid) is int and pid > 0, "positive process PID required")
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    ticks = int(stat[stat.rfind(")") + 2:].split()[19])
+    boot = int(next(line.split()[1] for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime ")))
+    return {"pid": pid, "process_start_ticks": ticks,
+            "process_started_at": datetime.fromtimestamp(boot + ticks / os.sysconf("SC_CLK_TCK"), timezone.utc).isoformat(),
+            "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip()}
+
+
+def container_binding(inspected, endpoint, checkpoint_path):
+    """Reduce actual Docker inspect output to a nonsecret, read-only binding.
+
+    Plan 04/06 writes this to runtime/container.json before the guarded handshake;
+    the opt-in server reads that same mounted directory. Reinspect after the fresh
+    request through collect_runtime_host; image tags and supplied config are not
+    accepted as substitutes for these engine facts.
+    """
+    require(re.fullmatch(r"127\.0\.0\.1:[0-9]{1,5}", endpoint), "loopback endpoint required")
+    host_port = endpoint.rsplit(":", 1)[1]
+    require(1 <= int(host_port) <= 65535, "invalid host port")
+    sha(inspected["Id"])
+    require(re.fullmatch(r"sha256:[a-f0-9]{64}", inspected["Image"]), "actual image ID required")
+    require(inspected["State"]["Running"] is True and inspected["HostConfig"]["NetworkMode"] != "host",
+            "running isolated container required")
+    timestamp(inspected["State"]["StartedAt"])
+    matching = []
+    for port, mappings in inspected["NetworkSettings"]["Ports"].items():
+        if mappings == [{"HostIp": "127.0.0.1", "HostPort": host_port}] and port.endswith("/tcp"):
+            matching.append(int(port.split("/")[0]))
+    require(len(matching) == 1, "selected endpoint must map uniquely and only to loopback")
+    mounts = [m for m in inspected["Mounts"] if m["Destination"] == checkpoint_path]
+    require(len(mounts) == 1 and mounts[0]["RW"] is False, "exact read-only checkpoint mount required")
+    return {"schema_version": 1, "container_id": inspected["Id"], "image_digest": inspected["Image"],
+            "container_started_at": inspected["State"]["StartedAt"], "endpoint": endpoint,
+            "container_port": matching[0], "checkpoint_path": checkpoint_path,
+            "checkpoint_source": mounts[0]["Source"]}
+
+
+def inspect_container_binding(container, endpoint, checkpoint_path):
+    require(re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", container), "explicit container name or ID required")
+    result = subprocess.run(["docker", "inspect", "--type", "container", "--format", "{{json .}}", container],
+                            capture_output=True, timeout=20, check=True)
+    return container_binding(read_json(result.stdout), endpoint, checkpoint_path)
+
+
+def collect_runtime_host(attestation, container, endpoint, checkpoint_path):
+    """Read-only host observation after a fresh arm-free request; no model load."""
+    binding = inspect_container_binding(container, endpoint, checkpoint_path)
+    instance = attestation["instance"]
+    pid = instance["pid"]
+    require(type(pid) is int and pid > 0, "actual server PID required")
+    code = "import json,sys; from policy_guard.parity_gate import process_identity; print(json.dumps(process_identity(int(sys.argv[1]))))"
+    result = subprocess.run(["docker", "exec", binding["container_id"], "python3", "-c", code, str(pid)],
+                            capture_output=True, timeout=20, check=True)
+    process = read_json(result.stdout)
+    # load_id belongs to the completed request; PID/ticks/boot/start are checked
+    # independently through procfs, and the request/output identities bind load_id.
+    return {**process, "load_id": instance["load_id"], "container_id": binding["container_id"],
+            "container_started_at": binding["container_started_at"], "image_digest": binding["image_digest"],
+            "running": True, "endpoint": binding["endpoint"], "container_port": binding["container_port"],
+            "checked_at": utc_now()}
 
 
 @dataclass(frozen=True)
@@ -681,6 +877,9 @@ def _preflight_record(ev, record, *, path, success=True, seen=None):
     seen = set() if seen is None else seen
     require(path not in seen and len(seen) < 100, "cyclic/excessive preflight history")
     seen.add(path)
+    cache_key = "preflight:" + path
+    if cache_key in ev._validated:
+        return record
     previous = record["previous"]
     stage, attempt = record["stage"], record["attempt"]
     if stage == "review" and attempt == 1:
@@ -689,14 +888,14 @@ def _preflight_record(ev, record, *, path, success=True, seen=None):
         require(previous is not None, "explicit preflight predecessor required")
         text(record["reason"], "preflight renewal/transition reason")
         prior = ev.json(previous)
-        _preflight_record(ev, prior, path=previous["path"], success=False, seen=seen)
+        _preflight_record(ev, prior, path=previous["path"], success=prior["status"] == "complete", seen=seen)
         if attempt > 1:
             require(prior["stage"] == stage and prior["attempt"] == attempt - 1, "renewal must link previous attempt of same stage")
         else:
             require(prior["stage"] == STAGES[STAGES.index(stage) - 1] and prior["status"] == "complete",
                     "initial stage must follow successful preceding stage")
         require(timestamp(prior["ended_at"]) < timestamp(record["started_at"]), "predecessor chronology")
-    if not success:
+    if not success and record["status"] != "complete":
         return record
     require(record["status"] == "complete", "failed/not_run preflight cannot release")
     release = validate_release_evidence(ev)
@@ -718,6 +917,7 @@ def _preflight_record(ev, record, *, path, success=True, seen=None):
         require(record["approval"] == ev.reference("live-approval.json") and
                 record["review_preflight"] == ev.json("release-review.json")["review_preflight"], "preflight approval/review link mismatch")
         require(timestamp(approval["decided_at"]) < timestamp(record["started_at"]), "live preflight predates approval")
+    ev._validated[cache_key] = record
     return record
 
 
@@ -760,7 +960,10 @@ def validate_live_approval(workspace, *, decision=None):
 
 def assert_live_release(workspace, preflight, *, expected_stage, runtime,
                         current_calibration_sha256, now=None):
-    ev = evidence(workspace)
+    supplied = evidence(workspace)
+    # A caller may have cached an earlier review/check. Physical release always
+    # captures current bytes again, while sharing each capture within this call.
+    ev = Evidence(supplied.workspace, test_only=supplied.test_only)
     require(expected_stage in STAGES[1:], "review-stage readiness cannot release hardware")
     validate_live_approval(ev)
     record = validate_preflight_record(ev, preflight, expected_stage=expected_stage)
@@ -770,9 +973,11 @@ def assert_live_release(workspace, preflight, *, expected_stage, runtime,
         expected_configuration=ev.json("profiles.json")["serving_configuration"],
         now=now or utc_now(), test_only=ev.test_only,
     )
-    require(record["attestation"] == runtime["attestation"] and record["request"] == runtime["request"],
+    require(record["attestation"] == runtime["attestation"] and record["request"] == runtime["request"] and
+            record["host"] == runtime["host"],
             "persisted preflight is for a stale runtime instance/request")
-    require(timestamp(record["ended_at"]) < timestamp(now or utc_now()), "release must follow persisted preflight")
+    age = (timestamp(now or utc_now()) - timestamp(record["ended_at"])).total_seconds()
+    require(0 < age <= 60, "release requires a fresh persisted preflight; create an explicit new attempt")
     return record
 
 

@@ -174,9 +174,15 @@ release. Treat it as an upstream inconsistency in 0.6.1, not as guidance.
 """
 
 import collections
+import contextlib
+import hashlib
+import importlib.metadata
+import importlib.util
 import os
 import pickle  # nosec B403 - the lerobot wire protocol is pickle in both directions
 import time
+import uuid
+from pathlib import Path
 from typing import NoReturn
 
 import grpc
@@ -232,6 +238,276 @@ from policy_guard.groot_guard import (
     serving_preprocessor_overrides,
     snapshot_from_loaded,
 )
+from policy_guard.replay_contract import (
+    BACKBONE_REVISION, CAMERA_ORDER, JOINT_ORDER, canonical, capture_bytes,
+    checkpoint_inventory, configuration_value, fingerprint_configuration,
+    floating_dtypes, observed_model, package_digest, read_json, sha256_file,
+)
+from policy_guard.parity_gate import (
+    SERVING_SOURCE_FILES, array_fingerprint, observation_fingerprint,
+    operational_semantics, process_identity, require, utc_now, write_runtime_json,
+)
+
+ATTESTATION_ENV_VAR = "DUME_PARITY_ATTESTATION_PATH"
+
+
+class ServingObservation:
+    """Observe actual operations and sampler facts without changing RNG or outputs.
+
+    Pinned PyTorch modes forward each operation exactly once. Module hooks return
+    None; no upstream method is rebound, and no extra random sample is drawn.
+    """
+
+    def __init__(self, model):
+        from torch.overrides import TorchFunctionMode
+        from torch.utils._python_dispatch import TorchDispatchMode
+
+        self.model = model
+        self.flow_steps = 0
+        self.sdpa_calls = 0
+        self.noise_draws = 0
+        self.noise_shape = None
+        self.noise_dtype = None
+        self.noise_device = None
+        self.compute_dtypes = set()
+        self.input_dtypes = set()
+        self.backbone_dtypes = set()
+        self.kernels = set()
+        self.floating_operation_count = 0
+        self.autocast = False
+        self.tf32 = False
+        owner = self
+
+        class FunctionObserver(TorchFunctionMode):
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                owner.observe_context()
+                result = func(*args, **kwargs)
+                if func is torch.randn:
+                    owner.noise_draws += 1
+                    owner.noise_shape = list(result.shape)
+                    owner.noise_dtype = str(result.dtype)
+                    owner.noise_device = str(result.device)
+                if func is torch.nn.functional.scaled_dot_product_attention:
+                    owner.sdpa_calls += 1
+                return result
+
+        class DispatchObserver(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                owner.observe_context()
+                dtypes = floating_dtypes(args) | floating_dtypes(kwargs)
+                result = func(*args, **kwargs)
+                dtypes.update(floating_dtypes(result))
+                if dtypes:
+                    owner.floating_operation_count += 1
+                    owner.compute_dtypes.update(dtypes)
+                if "scaled_dot_product" in str(func):
+                    owner.kernels.add(str(func))
+                return result
+
+        self.function_mode = FunctionObserver()
+        self.dispatch_mode = DispatchObserver()
+
+    def observe_context(self):
+        self.autocast |= torch.is_autocast_enabled("cuda") or torch.is_autocast_enabled("cpu")
+        self.tf32 |= torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+
+    def __enter__(self):
+        self.stack = contextlib.ExitStack()
+        try:
+            def before_backbone(module, args):
+                self.input_dtypes.update(floating_dtypes(args))
+
+            def after_backbone(module, args, result):
+                self.backbone_dtypes.update(floating_dtypes(result))
+
+            def before_step(module, args):
+                self.flow_steps += 1
+
+            for hook in (
+                self.model.backbone.register_forward_pre_hook(before_backbone),
+                self.model.backbone.register_forward_hook(after_backbone),
+                self.model.action_head.action_encoder.register_forward_pre_hook(before_step),
+            ):
+                self.stack.callback(hook.remove)
+            self.stack.enter_context(self.function_mode)
+            self.stack.enter_context(self.dispatch_mode)
+            return self
+        except BaseException:
+            self.stack.close()
+            raise
+
+    def __exit__(self, *exc):
+        return self.stack.__exit__(*exc)
+
+
+def serving_seed_policy():
+    """Deployed policy, separate from the exogenous per-record replay seed."""
+    value = os.environ.get(SEED_ENV_VAR)
+    return {"mode": "ambient", "seed": None} if value in (None, "") else {"mode": "fixed", "seed": int(value)}
+
+
+def capture_serving_identity(checkpoint, binding_path):
+    """Read pinned content and engine-supplied facts; never dump environment."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    binding = read_json(capture_bytes(Path(binding_path)))
+    require(set(binding) == {"schema_version", "container_id", "image_digest", "container_started_at",
+                             "endpoint", "container_port", "checkpoint_path", "checkpoint_source"},
+            "exact host container binding required")
+    require(binding["schema_version"] == 1 and binding["container_id"].startswith(Path("/etc/hostname").read_text().strip()),
+            "host binding belongs to another container")
+    require(binding["checkpoint_path"] == str(Path(checkpoint).resolve()), "checkpoint mount differs from host binding")
+    require(importlib.metadata.version("lerobot") == "0.6.1", "pinned LeRobot 0.6.1 required")
+    checkpoint_files, _ = checkpoint_inventory(Path(checkpoint))
+    model_dir = Path(HF_HUB_CACHE) / "models--nvidia--Cosmos-Reason2-2B"
+    snapshot = model_dir / "snapshots" / BACKBONE_REVISION
+    require((model_dir / "refs/main").read_text().strip() == BACKBONE_REVISION, "backbone revision changed")
+    backbone = []
+    for path in sorted(snapshot.rglob("*")):
+        if path.is_file():
+            require(path.resolve().is_relative_to(model_dir.resolve()), "backbone path escapes pinned cache")
+            backbone.append({"path": str(path.relative_to(snapshot)), "sha256": sha256_file(path)})
+    require(bool(backbone), "pinned backbone content missing")
+    root = Path(__file__).resolve().parents[2]
+    package = Path(importlib.util.find_spec("lerobot").origin).parent
+    return {
+        "container": binding,
+        "checkpoint_fingerprint": fingerprint_configuration(checkpoint_files),
+        "backbone_fingerprint": fingerprint_configuration(backbone),
+        "source": {"package": "lerobot", "sha256": package_digest(package), "native_pin": None},
+        "owned_source_files": {name: sha256_file(root / name) for name in SERVING_SOURCE_FILES},
+        "packages": dict(sorted((dist.metadata["Name"], dist.version) for dist in importlib.metadata.distributions()
+                                if dist.metadata["Name"])),
+    }
+
+
+def serving_profile(server, model, identity, observation, raw):
+    """Measured operational profile, projectable by the same gate as replay."""
+    snapshot = snapshot_from_loaded(server.policy.config, server.preprocessor, server.postprocessor, server.actions_per_chunk)
+    assert_groot_serving_contract(snapshot)
+    config = model.backbone.model.config
+    attention = sorted({config._attn_implementation, config.text_config._attn_implementation,
+                        config.vision_config._attn_implementation})
+    require(observation.flow_steps == model.action_head.num_inference_timesteps == 4,
+            "four effective flow steps required")
+    require(server.policy.config.num_inference_timesteps in (None, observation.flow_steps),
+            "requested flow steps disagree with measured checkpoint default")
+    require(observation.noise_draws == 1 and observation.noise_shape == list(raw.shape) == [1, 40, 132],
+            "actual full raw/noise boundary missing")
+    require(observation.sdpa_calls > 0 and observation.floating_operation_count > 0,
+            "actual SDPA and floating compute observation required")
+    effective = configuration_value({
+        "model": model.config.to_dict(), "policy": server.policy.config, "serving": snapshot,
+        "processors": {
+            "pre": [{"type": type(step).__name__, "config": step.get_config()} for step in server.preprocessor.steps],
+            "post": [{"type": type(step).__name__, "config": step.get_config()} for step in server.postprocessor.steps],
+        },
+    })
+    return {
+        **{key: identity[key] for key in ("checkpoint_fingerprint", "backbone_fingerprint", "source", "owned_source_files", "packages")},
+        "image_digest": identity["container"]["image_digest"], "backend": "lerobot", "purpose": "operational",
+        "effective_configuration": effective, "serving_seed_policy": serving_seed_policy(),
+        "parameter_dtypes": sorted({str(p.dtype) for p in model.parameters() if p.is_floating_point()}),
+        "buffer_dtypes": sorted({str(b.dtype) for b in model.buffers() if b.is_floating_point()}),
+        "compute_dtypes": sorted(observation.compute_dtypes), "attention": attention,
+        "flow_steps": observation.flow_steps, "eval": all(not m.training for m in model.modules()),
+        "autocast": observation.autocast, "tf32": observation.tf32, "device": observation.noise_device,
+        "joint_order": list(JOINT_ORDER), "camera_order": list(CAMERA_ORDER),
+        "raw_shape": list(raw.shape), "decoded_shape": [16, 6],
+    }
+
+
+class ServingAttestor:
+    """Opt-in local observation of one guarded loaded policy and its requests.
+
+    identity_reader/profile_reader/clock/process_reader are explicit hermetic test
+    collaborators. The serving handler always uses their real defaults. No RPC,
+    approval, controller or alternate inference implementation is introduced.
+    """
+
+    def __init__(self, server, path, load_identity, *, identity_reader=capture_serving_identity,
+                 profile_reader=serving_profile, clock=utc_now, process_reader=process_identity,
+                 test_only=False):
+        self.server = server
+        self.path = Path(path)
+        self.identity_reader = identity_reader
+        self.profile_reader = profile_reader
+        self.clock = clock
+        self.test_only = test_only
+        self.identity = load_identity
+        self.checkpoint = str(server.policy.config.base_model_path)
+        require(self.identity_reader(self.checkpoint, self.path.parent / "container.json") == load_identity,
+                "checkpoint/source/image changed during model loading")
+        binding = self.identity["container"]
+        self.instance = {
+            **process_reader(), "container_id": binding["container_id"],
+            "container_started_at": binding["container_started_at"],
+            "load_id": hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+        }
+        self.loaded_at = self.clock()
+        self.model = server.policy._groot_model
+        self.observed = observed_model(self.model)
+        # A constructor-owned collaborator, identical to the replay composition
+        # seam. The wrapper forwards get_action and only retains observed tensors.
+        self.observed.train(self.model.training)
+        server.policy._groot_model = self.observed
+        self.publish("loaded")
+
+    def publish(self, status, **fields):
+        write_runtime_json(self.path, {
+            "schema_version": 1, "evidence_kind": "test_only" if self.test_only else "real_model",
+            "status": status, "instance": self.instance, "loaded_at": self.loaded_at,
+            "endpoint": {"host": self.server.config.host, "port": self.server.config.port},
+            **fields,
+        })
+
+    @contextlib.contextmanager
+    def observe(self, observation):
+        self.observed.last_raw = None
+        self.request_start = self.clock()
+        self.request_observation = observation_fingerprint(observation.get_observation())
+        self.publish("inference_started")
+        try:
+            with ServingObservation(self.model) as measured:
+                yield measured
+        except BaseException:
+            self.publish("failed")
+            raise
+
+    def complete(self, observation, actions, measured):
+        try:
+            raw = self.observed.last_raw
+            require(raw is not None, "no actual full raw output observed")
+            require(len(actions) == 16, "completed full decoded chunk required")
+            decoded = torch.stack([action.get_action().detach().cpu().float() for action in actions]).numpy()
+            require(decoded.shape == (16, 6), "completed action shape mismatch")
+            require(self.identity_reader(self.checkpoint, self.path.parent / "container.json") == self.identity,
+                    "checkpoint/source/image changed after guarded loading")
+            profile = self.profile_reader(self.server, self.model, self.identity, measured, raw)
+            semantics = operational_semantics(profile)
+            request = {
+                "observation_sha256": self.request_observation,
+                "timestamp": observation.get_timestamp(), "timestep": observation.get_timestep(),
+                "started_at": self.request_start, "completed_at": self.clock(),
+                "output_sha256": array_fingerprint(decoded), "decoded_shape": list(decoded.shape),
+            }
+            self.publish(
+                "complete", semantic_configuration=semantics,
+                configuration_fingerprint=fingerprint_configuration(semantics), request=request,
+                observations={
+                    "noise_shape": measured.noise_shape, "noise_dtype": measured.noise_dtype,
+                    "noise_device": measured.noise_device, "noise_draws": measured.noise_draws,
+                    "sdpa_calls": measured.sdpa_calls, "kernels": sorted(measured.kernels),
+                    "flow_steps": measured.flow_steps, "floating_operation_count": measured.floating_operation_count,
+                    "raw_shape": list(raw.shape), "raw_dtype": str(raw.dtype),
+                    "input_dtypes": sorted(measured.input_dtypes), "backbone_dtypes": sorted(measured.backbone_dtypes),
+                },
+            )
+        except BaseException:
+            self.publish("failed")
+            raise
 
 __all__ = [
     "EXPECTED_HORIZON",
@@ -524,6 +800,22 @@ class DumEGrootPolicyServer(PolicyServer):
     STATE_DIM: int = 6
     ACTION_DIM: int = 6
 
+    def _prepare_parity_attestation(self, requested_path):
+        # Subclass-owned state remains outside the copied upstream handshake
+        # state contract. Disabled attestation does no identity IO or wrapping.
+        self._parity_attestor = None
+        path = os.environ.get(ATTESTATION_ENV_VAR)
+        if not path:
+            return None, None
+        self.policy = None
+        self.preprocessor = None
+        self.postprocessor = None
+        write_runtime_json(path, {"schema_version": 1, "status": "loading"})
+        return path, capture_serving_identity(requested_path, Path(path).parent / "container.json")
+
+    def _start_parity_attestation(self, path, load_identity):
+        self._parity_attestor = ServingAttestor(self, path, load_identity)
+
     def SendPolicyInstructions(self, request, context):  # noqa: N802 - upstream gRPC name
         """Build the config, THEN load — the plan's stated fallback.
 
@@ -577,6 +869,10 @@ class DumEGrootPolicyServer(PolicyServer):
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
         requested_path = str(policy_specs.pretrained_name_or_path)
+        try:
+            attestation_path, load_identity = self._prepare_parity_attestation(requested_path)
+        except Exception as exc:
+            return _refuse(context, f"Parity attestation refused: {type(exc).__name__}: {exc}")
 
         # ---- THE CONFIG INJECTION: everything that must be true before the load ----
         config = GrootConfig(
@@ -742,6 +1038,8 @@ class DumEGrootPolicyServer(PolicyServer):
                 self.actions_per_chunk,
             )
             assert_groot_serving_contract(snapshot)
+            if attestation_path:
+                self._start_parity_attestation(attestation_path, load_identity)
         except Exception as exc:  # noqa: BLE001 - a guard that cannot run must refuse, not serve
             self.logger.error("SAFE-01 guard: REFUSED | %s: %s", type(exc).__name__, exc)
             # Drop the un-validated policy BEFORE refusing, UNCONDITIONALLY.
@@ -792,6 +1090,15 @@ class DumEGrootPolicyServer(PolicyServer):
         return services_pb2.Empty()
 
     def _predict_action_chunk(self, observation_t) -> list[TimedAction]:
+        attestor = getattr(self, "_parity_attestor", None)
+        if attestor is None:
+            return self._predict_action_chunk_impl(observation_t)
+        with attestor.observe(observation_t) as measured:
+            result = self._predict_action_chunk_impl(observation_t)
+        attestor.complete(observation_t, result, measured)
+        return result
+
+    def _predict_action_chunk_impl(self, observation_t) -> list[TimedAction]:
         """Upstream's pipeline with steps 4-5 replaced by ONE full-chunk decode.
 
         Steps 1-3 are upstream's, called through the same helpers upstream calls.

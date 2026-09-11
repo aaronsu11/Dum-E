@@ -43,6 +43,9 @@ class Runtime:
     def __init__(self, clock, current):
         self.clock, self.value = clock, current
 
+    def inputs(self):
+        return {"controller": {"robot_port": "FAKE"}, "safety": {"stop_ready": True}}
+
     def current(self):
         return self.value
 
@@ -292,13 +295,27 @@ def test_tracer_blocked_inference_never_dispatches_returned_actions():
     assert errors and not thread.is_alive()
 
 
+def approved_runner(workspace):
+    r = runner()
+    identity, lock, pairs = fixtures.fixture_workspace(workspace)
+    fixtures.complete_offline(workspace, identity, lock, pairs)
+    ev = gate.Evidence(workspace, test_only=True)
+    clock = Clock(19)
+    source = Runtime(clock, fixtures.runtime(15))
+    source.instance = source.value["attestation"]["instance"]
+    review = r.preflight(ev, stage="review", attempt=1, runtime_source=source, clock=clock)
+    fixtures.cli().prepare_live(gate.Evidence(workspace, test_only=True), review["path"], clock=clock)
+    answers = iter(["Fixture operator", "Test-only decision", "approve"])
+    fixtures.cli().record_decision(workspace, "live", prompt=lambda _: next(answers), clock=clock, test_only=True)
+    live = r.preflight(ev, stage="live", attempt=1, previous_preflight=review["path"], reason="Approved transition",
+                       runtime_source=source, clock=clock)
+    return live, source, clock
+
+
 def setup_run(tmp_path):
     r = runner()
-    live, rv = fixtures.approved(tmp_path)
+    live, source, clock = approved_runner(tmp_path)
     ev = gate.Evidence(tmp_path, test_only=True)
-    clock = Clock()
-    source = Runtime(clock, rv)
-    source.instance = rv["attestation"]["instance"]
     events = []
     stop = r.StopLatch()
 
@@ -406,8 +423,8 @@ def test_tracer_actual_skill_reset_and_bounded_chunk(tmp_path, monkeypatch, rese
 
 
 
-def full_run(tmp_path, monkeypatch, *, labels=None, stop_trial=None):
-    r, ev, live, source, clock, stop, events, _ = setup_run(tmp_path)
+def full_run(tmp_path, monkeypatch, *, labels=None, stop_trial=None, prepared=None):
+    r, ev, live, source, clock, stop, events, _ = prepared or setup_run(tmp_path)
     from embodiment.so_arm10x import controller as cm, skills
     delays, targets = [], []
     monkeypatch.setattr(cm, "time", SimpleNamespace(sleep=delays.append))
@@ -560,6 +577,10 @@ def test_review_approval_live_restart_run_lifecycle(tmp_path, monkeypatch):
                     runtime_source=source, clock=clock)
     assert all(p.read_bytes() == value for p, value in old.items())
     assert read_json(tmp_path / renewed["path"])["attestation"] == source.current()["attestation"]
+    result, _, _, _, _ = full_run(tmp_path, monkeypatch, prepared=(
+        r, ev, renewed, source, clock, r.StopLatch(), [], None))
+    assert result["status"] == "complete" and result["live_preflight"] == renewed
+    assert all(p.read_bytes() == value for p, value in old.items())
 
 
 def test_failed_preflight_is_immutable_evidence(tmp_path):
@@ -624,3 +645,151 @@ def test_tracer_transient_configuration_retry_can_recover_normally():
     assert not stop.stopped
     assert len([e for e in events if e[0] == "raw" and e[2] == address]) == 2
     assert events[-1][2:] == (55, 1, [1])
+
+
+
+@pytest.mark.parametrize("kind", ["controller", "safety", "stale", "wrong-stage", "predecessor"])
+def test_changed_release_inputs_refuse_before_construction(tmp_path, kind):
+    r, ev, live, source, clock, stop, events, controller = setup_run(tmp_path)
+    if kind == "controller":
+        source.inputs = lambda: {"controller": {"robot_port": "OTHER"}, "safety": {"stop_ready": True}}
+    elif kind == "safety":
+        source.inputs = lambda: {"controller": {"robot_port": "FAKE"}, "safety": {"stop_ready": False}}
+    elif kind == "stale":
+        clock.second += 61
+    elif kind == "wrong-stage":
+        live = {"path": "preflights/review-0001.json"}
+    else:
+        fixtures.rewrite(tmp_path, "preflights/review-0001.json", lambda row: row.update(reason="mutated predecessor"))
+    with pytest.raises((ValueError, FileNotFoundError)):
+        r.run(ev, preflight=live["path"], preflight_attempt=1, runtime_source=source,
+              clock=clock, stop=stop, controller_factory=controller,
+              policy_factory=lambda: SimpleNamespace(), observe=lambda _: {})
+    assert events == []
+    assert not (tmp_path / "preflights/run-0001.json").exists()
+
+
+def test_readonly_run_check_rejects_chronology_and_journal_tampering(tmp_path, monkeypatch):
+    r = runner()
+    result, _, _, _, ev = full_run(tmp_path, monkeypatch)
+    assert r.check(ev)["status"] == "complete"
+    fixtures.rewrite(tmp_path, "live-run.json", lambda row: row.update(constructed_at=fixtures.ts(1)))
+    with pytest.raises(ValueError, match="chronology"):
+        r.check(ev)
+    (tmp_path / "live-run.json").write_bytes(fixtures.canonical(result))
+    fixtures.rewrite(tmp_path, "live-run.json", lambda row: row["events"][0].update(operation="changed"))
+    with pytest.raises(ValueError, match="journal"):
+        r.check(ev)
+
+
+def test_dispatch_audit_refuses_changed_pinned_source_hash(monkeypatch):
+    r = runner()
+    r.audit_dispatch_paths()
+    monkeypatch.setitem(r.AUDITED_SOURCES, "lerobot.motors.motors_bus", "0" * 64)
+    with pytest.raises(ValueError, match="unaudited"):
+        r.audit_dispatch_paths()
+
+
+def test_named_observations_have_no_default_or_motion_authority():
+    r = runner()
+    answers = iter(["", "Fixture observer", "", "maybe", "yes", "no", "no", "no", ""])
+    result = r.observe_trial(1, prompt=lambda _: next(answers))
+    assert result == {"operator": "Fixture observer", "coherent": True, "wrong_target": False,
+                      "erratic": False, "grasp": False, "stop_reason": ""}
+
+
+def test_actual_attached_policy_maps_observations_and_never_loads_model(tmp_path, monkeypatch):
+    # The production attachment and inherited get_action mapping execute against
+    # a fake owned Session class. Only the runtime validator test_only argument
+    # is injected; every fixture byte stays labelled test_only in this tmpdir.
+    r = runner()
+    import torch
+    from policy.lerobot import session as sm, backend as bm
+    clock = Clock(40)
+    monkeypatch.setattr(r, "utc_now", clock)
+    fixtures.save(tmp_path, "profiles.json", {"serving_configuration": fixtures.semantics()})
+    initial = fixtures.runtime(30)
+    path = tmp_path / "runtime/lerobot.json"
+    path.parent.mkdir()
+    path.write_bytes(fixtures.canonical(initial["attestation"]))
+    events, hosts = [], []
+    decoded = np.arange(96, dtype=np.float32).reshape(16, 6)
+
+    class Session:
+        def __init__(self, address, **kwargs):
+            self.address, self.kwargs = address, kwargs
+            events.append(("session", kwargs))
+
+        def connect(self, specs):
+            pytest.fail("the attachment must never send model-loading policy instructions")
+
+        def probe_ready_or_raise(self):
+            events.append(("ready",))
+
+        def close(self):
+            events.append(("close",))
+
+        def infer(self, observation):
+            events.append(("infer", observation))
+            assert set(observation) == set(JOINT_ORDER) | {"front", "wrist", "task"}
+            rv = fixtures.runtime(clock.second + 1)
+            rv["request"]["observation_sha256"] = gate.observation_fingerprint(observation)
+            rv["request"]["output_sha256"] = gate.array_fingerprint(decoded)
+            rv["attestation"]["request"] = rv["request"]
+            clock.second += 3
+            path.write_bytes(fixtures.canonical(rv["attestation"]))
+            hosts.append(rv["host"])
+            return [SimpleNamespace(get_action=lambda value=value: torch.from_numpy(value),
+                                    get_timestamp=lambda: rv["request"]["timestamp"],
+                                    get_timestep=lambda: rv["request"]["timestep"]) for value in decoded]
+
+    monkeypatch.setattr(sm, "LeRobotPolicySession", Session)
+    monkeypatch.setattr(bm, "LeRobotPolicySession", Session)
+    def host(*args):
+        hosts[-1]["checked_at"] = clock()
+        return hosts[-1]
+    monkeypatch.setattr(gate, "collect_runtime_host", host)
+    actual_validator = gate.validate_runtime_attestation
+    def validate(*args, **kwargs):
+        assert args[0]["evidence_kind"] == "test_only"
+        return actual_validator(*args, **kwargs, test_only=True)
+    monkeypatch.setattr(gate, "validate_runtime_attestation", validate)
+    source = r.RuntimeSource(SimpleNamespace(workspace=tmp_path, attestation=path, preflight=None,
+                                            container="fake", endpoint="127.0.0.1:8080", checkpoint_mount="/checkpoint"))
+    observation = {**dict.fromkeys(JOINT_ORDER, 0.0), "front": np.zeros((480, 640, 3), np.uint8),
+                   "wrist": np.ones((480, 640, 3), np.uint8)}
+    try:
+        actions = source.policy.get_action(observation, r.INSTRUCTION)
+        assert len(actions) == 16
+        assert actions[-1] == dict(zip(JOINT_ORDER, decoded[-1], strict=True))
+        assert [event[0] for event in events].count("ready") == 1
+        assert source._policy._session.kwargs == {"max_attempts": 1, "handshake_max_attempts": 1}
+        assert source._runtime["attestation"]["evidence_kind"] == "test_only"
+    finally:
+        source.close()
+
+
+
+def test_controller_inputs_hash_and_consume_the_same_config_bytes(tmp_path, monkeypatch):
+    r = runner()
+    config = tmp_path / "robot.yaml"
+    before = b"controller: {robot_type: so101_follower, robot_id: fake, robot_port: OLD}"
+    after = before.replace(b"OLD", b"NEW")
+    config.write_bytes(before)
+    calibration = tmp_path / "calibration/robots/so_follower/fake.json"
+    calibration.parent.mkdir(parents=True)
+    calibration.write_text("{}")
+    fixtures.save(tmp_path, "session.json", {"session_id": "test-only"})
+    fixtures.save(tmp_path, "calibration.json", {"robot_identity": {"robot_type": "so101_follower", "robot_id": "fake"}})
+    monkeypatch.setenv("DUME_CONFIG", str(config))
+    monkeypatch.setenv("HF_LEROBOT_CALIBRATION", str(tmp_path / "calibration"))
+    monkeypatch.setattr(gate, "validate_release_evidence", lambda _: {"calibration_sha256": r.sha256_file(calibration)})
+    capture = r.capture_bytes
+    def changed_at_capture(path):
+        if path == config:
+            config.write_bytes(after)
+        return capture(path)
+    monkeypatch.setattr(r, "capture_bytes", changed_at_capture)
+    snapshot = r.controller_inputs(tmp_path)
+    assert snapshot["config_sha256"] == r.hashlib.sha256(after).hexdigest()
+    assert snapshot["controller"]["robot_port"] == "NEW", "settings must derive from the captured, hashed bytes"

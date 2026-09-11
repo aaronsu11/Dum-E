@@ -82,7 +82,7 @@ def fake_bus(r, stop, *, interrupt=None, retry=False):
             events.append(("raw", motor, address, length, list(data)))
             if interrupt:
                 interrupt(events, stop)
-            return (-1 if retry else 0), 0
+            return (-1 if (retry(events) if callable(retry) else retry) else 0), 0
 
         def getTxRxResult(self, result):
             return str(result)
@@ -589,3 +589,38 @@ def test_production_cli_rejects_fixture_evidence_before_runtime(tmp_path):
     assert callable(getattr(r, "main", None)), "Production CLI must fail closed on test_only evidence"
     fixtures.approved(tmp_path)
     assert r.main(["check", "--workspace", str(tmp_path)]) != 0
+
+
+
+def test_tracer_configuration_failure_latches_before_torque_cleanup():
+    r = runner()
+    stop = r.StopLatch()
+    from lerobot.motors.motors_bus import get_address
+    address = get_address(r.StopGuardedBus.model_ctrl_table, "sts3215", "P_Coefficient")[0]
+    bus, events = fake_bus(r, stop, retry=lambda journal: journal[-1][2] == address)
+    bus.connect()
+    with pytest.raises((ConnectionError, r.SafetyStop)):
+        with bus.torque_disabled():
+            bus.write("P_Coefficient", "shoulder_pan", 10, num_retry=2)
+    failed_writes = [i for i, event in enumerate(events) if event[0] == "raw" and event[2] == address]
+    assert len(failed_writes) == 3, "preserve the inherited retry budget before latching exhausted failure"
+    assert not [event for event in events[failed_writes[-1] + 1:] if event[0] in ("raw", "sync")], (
+        "failed configuration must latch before inherited torque_disabled finally enables torque"
+    )
+    assert stop.stopped
+
+
+def test_tracer_transient_configuration_retry_can_recover_normally():
+    r = runner()
+    stop = r.StopLatch()
+    from lerobot.motors.motors_bus import get_address
+    address = get_address(r.StopGuardedBus.model_ctrl_table, "sts3215", "P_Coefficient")[0]
+    def retry(journal):
+        return journal[-1][2] == address and len([e for e in journal if e[0] == "raw" and e[2] == address]) == 1
+    bus, events = fake_bus(r, stop, retry=retry)
+    bus.connect()
+    with bus.torque_disabled():
+        bus.write("P_Coefficient", "shoulder_pan", 10, num_retry=2)
+    assert not stop.stopped
+    assert len([e for e in events if e[0] == "raw" and e[2] == address]) == 2
+    assert events[-1][2:] == (55, 1, [1])

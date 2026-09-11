@@ -608,3 +608,43 @@ def test_golden_worker_schedule_binding_reaches_case_producer(tmp_path):
     assert row["started_at"] == "2026-09-11T00:00:02+00:00"
     assert row["ended_at"] == "2026-09-11T00:00:03+00:00"
     assert api.read_json(tmp_path / row["evidence"]["path"])["execution"] == binding
+
+
+@pytest.mark.parametrize("purpose, expected", [("diagnostic", False), ("operational", True)])
+def test_shared_worker_preserves_deployed_tf32_before_model_load(tmp_path, monkeypatch, purpose, expected):
+    import sys
+    import torch
+    api = contract()
+    lock = {**schedule_lock(), "checkpoint_fp32_tensor_bytes": 1}
+    api.write_evidence(tmp_path, "session.json", {"schema_version": 1, "session_id": "test-controls"})
+    api.write_evidence(tmp_path, "input-lock.json", lock)
+    api.write_evidence(tmp_path, "schedule.json", {
+        "kind": "tracer", "session": "test-controls",
+        "input_fingerprint": lock["fingerprint"], "cases": lock["schedule"][:1],
+    })
+    argv = ["worker"]
+    for key, value in {
+        "workspace": tmp_path, "corpus": tmp_path, "checkpoint": tmp_path,
+        "input-lock": tmp_path / "input-lock.json", "schedule": tmp_path / "schedule.json",
+        "output-manifest": "workers/test-control.json", "image-digest": "sha256:" + "d" * 64,
+        "profile": purpose, "device": "cpu",
+    }.items():
+        argv += ["--" + key, str(value)]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(api, "load_input_lock", lambda *args: lock)
+    monkeypatch.setattr(api, "runtime_identity", lambda *args: {})
+    seen = []
+
+    def stop_before_load(*args):
+        seen.append((torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32))
+        raise api.PrerequisiteError("intentional test stop before model construction")
+
+    prior = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.get_num_threads())
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        assert api.worker_main("native", stop_before_load) == 2
+        assert seen == [(expected, expected)], "Native operational/golden worker must preserve deployed TF32"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = prior[:2]
+        torch.set_num_threads(prior[2])

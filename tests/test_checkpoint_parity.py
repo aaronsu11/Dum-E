@@ -418,3 +418,52 @@ def test_review_valid_arithmetic_cannot_replace_actual_case_aggregate(tmp_path):
     module = importlib.import_module("replay_checkpoint_parity")
     with pytest.raises(ValueError, match="comparison aggregate"):
         module.check_offline(Evidence(tmp_path, test_only=True))
+
+
+@pytest.mark.parametrize("purpose, expected", [("diagnostic", False), ("operational", True)])
+def test_numerical_worker_preserves_operational_tf32_before_model_load(tmp_path, monkeypatch, purpose, expected):
+    """Only diagnostics may override deployed controls; no model is constructed."""
+    import torch
+    from types import SimpleNamespace
+    from policy_guard.replay_contract import PrerequisiteError, write_evidence
+    module = importlib.import_module("replay_checkpoint_parity")
+    native = importlib.import_module("replay_groot_native")
+    records = [{"file": f"record_{i:04d}.npz", "seeds": list(range(5))} for i in range(120)]
+    lock = {
+        "fingerprint": "a" * 64, "joint_order": list(JOINT_ORDER),
+        "camera_order": list(CAMERA_ORDER), "records": records,
+        "schedule": [{"record": r["file"], "seed": s} for r in records for s in r["seeds"]],
+        "checkpoint_fp32_tensor_bytes": 1,
+    }
+    output = "workers/test-control.json"
+    write_evidence(tmp_path, "session.json", {"schema_version": 1, "session_id": "test-controls"})
+    write_evidence(tmp_path, "input-lock.json", lock)
+    write_evidence(tmp_path, "schedule.json", {
+        "kind": "tracer", "session": "test-controls", "input_fingerprint": lock["fingerprint"],
+        "cases": lock["schedule"][:1], "execution": {
+            "id": "b" * 32, "collection": "numerical-tracer",
+            "started_at": ts(1), "worker_manifest": output,
+        },
+    })
+    seen = []
+
+    def observe_before_load(*args):
+        seen.append((torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32))
+        raise PrerequisiteError("intentional test stop before any model load")
+
+    monkeypatch.setattr(module, "load_input_lock", lambda *args: lock)
+    monkeypatch.setattr(native, "NativeReplay", observe_before_load)
+    prior = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32, torch.get_num_threads())
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        result = module.numerical_worker(SimpleNamespace(
+            workspace=tmp_path, output_manifest=output, schedule=tmp_path / "schedule.json",
+            corpus=tmp_path, checkpoint=tmp_path, backend="native", profile=purpose,
+            device="cpu", image_digest="sha256:" + "d" * 64,
+        ))
+        assert result == 2
+        assert seen == [(expected, expected)], "Operational replay must retain the deployed TF32 flags"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = prior[:2]
+        torch.set_num_threads(prior[2])

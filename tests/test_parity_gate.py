@@ -505,3 +505,22 @@ def test_closeout_requires_final_replay_and_exact_three_trial_links(tmp_path, er
         assert not (tmp_path / "closeout.json").exists()
     else:
         assert api().validate_closeout(ev)["status"] == "complete"
+
+
+def test_actual_plan02_calibration_schema_consumes_validated_bytes(tmp_path):
+    """Exercise the production schema using local pinned inputs, without hardware."""
+    import scripts.pose_sweep_units_probe as probe
+    calibration_path = tmp_path / "calibration-input.json"
+    statistics_path = tmp_path / "statistics.json"
+    calibration_path.write_bytes(canonical(probe.CALIBRATION_TICK_RANGES))
+    statistics_path.write_bytes(canonical({"new_embodiment": {
+        "state": probe.CHECKPOINT_STATE_STATS, "action": probe.CHECKPOINT_ACTION_STATS,
+    }}))
+    record = probe.derive_current_calibration(calibration_path, statistics_path)
+    record.update(session_id="test-session", started_at=ts(1), ended_at=ts(2))
+    save(tmp_path, "session.json", {"schema_version": 1, "session_id": "test-session"})
+    save(tmp_path, "calibration.json", record)
+    assert api()._calibration(api().Evidence(tmp_path))[0] == record["calibration"]["sha256"]
+    rewrite(tmp_path, "calibration.json", lambda d: d["scale_deg_per_pct"].update(wrist_roll=99))
+    with pytest.raises(ValueError, match="scale"):
+        api()._calibration(api().Evidence(tmp_path))

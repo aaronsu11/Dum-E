@@ -1192,3 +1192,49 @@ def test_review_numerical_worker_execution_cannot_be_relabelled(tmp_path, fault)
             g.Evidence(tmp_path, test_only=True), {"worker": worker_ref, "launch": launch_ref},
             measured["profile"], worker["expected_cases"], kind="repeatability", start=ts(3), end=ts(4),
         )
+
+
+def test_runtime_rejects_matmul_tf32_drift_while_cudnn_remains_enabled():
+    g = api()
+    expected_profile = observed("lerobot", "operational")
+    expected_profile.update(tf32=True, tf32_matmul=False, tf32_cudnn=True)
+    changed_profile = copy.deepcopy(expected_profile)
+    changed_profile["tf32_matmul"] = True
+    expected = g.operational_semantics(expected_profile)
+    actual = g.operational_semantics(changed_profile)
+    assert expected["tf32"] is actual["tf32"] is True
+    rv = runtime(30)
+    rv["attestation"].update(semantic_configuration=actual, configuration_fingerprint=digest(actual))
+    with pytest.raises(ValueError, match="configuration changed"):
+        g.validate_runtime_attestation(rv["attestation"], host=rv["host"], request=rv["request"],
+                                       expected_configuration=expected, now=ts(33), test_only=True)
+
+
+def test_serving_observer_captures_tf32_flags_independently():
+    import torch
+    from types import SimpleNamespace
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Identity()
+    model.action_head = torch.nn.Module()
+    model.action_head.action_encoder = torch.nn.Identity()
+    prior = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = True
+        with serving_module().ServingObservation(model) as measured:
+            torch.randn(1, 40, 132)
+        assert (getattr(measured, "tf32_matmul", None), getattr(measured, "tf32_cudnn", None)) == (False, True)
+        assert measured.tf32 is True
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = prior
+
+
+def test_serving_profile_retains_each_observed_tf32_flag():
+    import torch
+    module = serving_module()
+    server, model, measured = configured_capture_server(ROOT / "checkpoints/GR00T-N1.7-3B-SO101")
+    measured.tf32, measured.tf32_matmul, measured.tf32_cudnn = True, False, True
+    identity = observed("lerobot", "operational")
+    identity["container"] = {"image_digest": identity["image_digest"]}
+    actual = module.serving_profile(server, model, identity, measured, torch.zeros(1, 40, 132))
+    assert (actual.get("tf32_matmul"), actual.get("tf32_cudnn")) == (False, True)

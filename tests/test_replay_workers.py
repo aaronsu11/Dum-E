@@ -648,3 +648,32 @@ def test_shared_worker_preserves_deployed_tf32_before_model_load(tmp_path, monke
     finally:
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = prior[:2]
         torch.set_num_threads(prior[2])
+
+
+@pytest.mark.parametrize("fault", ["missing_matmul", "missing_cudnn", "nonboolean", "collapsed"])
+def test_profile_requires_independently_measured_tf32_pair(fault):
+    value = profile()
+    value.update(purpose="operational", tf32=True, tf32_matmul=False, tf32_cudnn=True)
+    contract().validate_profile(value)
+    if fault.startswith("missing_"):
+        value.pop("tf32_" + fault.removeprefix("missing_"))
+    elif fault == "nonboolean":
+        value["tf32_matmul"] = 0
+    else:
+        value["tf32"] = False
+    with pytest.raises(ValueError, match="tf32"):
+        contract().validate_profile(value)
+
+
+def test_sampling_observer_captures_tf32_flags_independently():
+    import torch
+    prior = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = True
+        with contract().sampling_observer(42) as measured:
+            torch.randn(1, 40, 132)
+        assert (getattr(measured, "tf32_matmul", None), getattr(measured, "tf32_cudnn", None)) == (False, True)
+        assert measured.tf32 is True
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = prior

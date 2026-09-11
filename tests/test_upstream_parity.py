@@ -133,6 +133,9 @@ def test_stock_observer_is_inert_and_retains_full_noise_and_raw(tmp_path):
     assert len(observations) == 1
     value = observations[0]
     assert value["observed"]["observer_inert"]
+    assert (value["observed"].get("tf32_matmul"), value["observed"].get("tf32_cudnn")) == (
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+
     assert value["observed"]["flow_steps"] == 4
     assert value["observed"]["noise_shape"] == [2, 40, 132]
     assert value["observed"]["compute_dtypes"] == ["torch.float32"]

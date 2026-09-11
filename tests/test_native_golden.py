@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from policy_guard.replay_contract import (
-    ReplayManifest, execute_cases, fingerprint_configuration as digest,
+    BACKBONE_REVISION, ReplayManifest, execute_cases, fingerprint_configuration as digest,
     read_json, write_evidence, write_tensors,
 )
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,7 +48,10 @@ def setup(workspace, *, session="test-session", attention="sdpa"):
     def configure(profiles):
         profiles["session"] = session
         native = profiles["profiles"][2]["observed"]
+        files = [{"path": name, "sha256": digest("TEST_ONLY_" + name)} for name in
+                 ("config.json", "tokenizer.json", "tokenizer_config.json")]
         native.update(
+            backbone_revision=BACKBONE_REVISION, backbone_files=files, backbone_fingerprint=digest(files),
             path=NATIVE_PATH, attention=[attention], parameter_dtypes=["torch.bfloat16"],
             compute_dtypes=["torch.bfloat16", "torch.float32"],
             noise_dtype="torch.bfloat16", device="cuda:0",
@@ -142,6 +145,8 @@ def snapshot(args):
     return {
         "input_fingerprint": lock["fingerprint"],
         "source_files": {"TEST_ONLY.py": digest("test source")},
+        **{key: value for key, value in read_json(args.workspace / "profiles.json")["profiles"][2]["observed"].items()
+           if key in ("backbone_revision", "backbone_files", "backbone_fingerprint")},
         "calibration_sha256": digest("test calibration"),
         "image_digest": read_json(args.workspace / "profiles.json")["profiles"][2]["observed"]["image_digest"],
     }
@@ -555,7 +560,7 @@ def test_review_redated_candidate_cases_cannot_erase_actual_replay_drift(tmp_pat
     original = {name: (tmp_path / name).read_bytes() for name in
                 ("golden-candidate.json", "golden-approval.json", "golden-manifest.json")}
     worker = copy.deepcopy(ev.json(candidate["worker"]["manifest"]))
-    case_bytes = {row["evidence"]["path"]: ev.bytes(row["evidence"]) for row in worker["cases"]}
+    case_bytes = {row["evidence"]["path"]: ev.bytes(row["evidence"]["path"], row["evidence"]["sha256"]) for row in worker["cases"]}
     worker.update(started_at=ts(41), ended_at=ts(42))
     wrapper = write_evidence(tmp_path, "workers/TEST_ONLY-redated-candidate.json", worker)
     rewrite(tmp_path, "golden-replay.json", lambda record: record.update(
@@ -651,7 +656,9 @@ def test_review_production_probe_hashes_mounted_backbone_bytes(tmp_path, asset):
     (fixture["snapshot"] / asset).write_bytes(b"TEST_ONLY changed mounted bytes")
     status, after = production_probe(fixture)
     assert status == 0
-    assert digest(before) != digest(after), "Mounted backbone bytes must invalidate current identity"
+    assert before["backbone_files"] != after["backbone_files"]
+    assert before["backbone_fingerprint"] != after["backbone_fingerprint"], (
+        "Mounted backbone bytes must invalidate current identity")
 
 
 @pytest.mark.parametrize("problem", ["missing-tokenizer", "wrong-revision", "alternate-cache",
@@ -683,3 +690,36 @@ def test_review_production_probe_rejects_unavailable_or_changed_cache(tmp_path, 
     else:
         assert status == (2 if problem in ("missing-tokenizer", "wrong-revision") else 1), (
             "Missing or invalid mounted prerequisites must not produce a passing fingerprint")
+
+
+
+def test_production_probe_inventory_matches_worker_content_contract(tmp_path):
+    from policy_guard.replay_contract import sha256_file
+    fixture = production_probe_fixture(tmp_path)
+    status, value = production_probe(fixture)
+    assert status == 0
+    rows = [{"path": str(path.relative_to(fixture["snapshot"])), "sha256": sha256_file(path)}
+            for path in sorted(fixture["snapshot"].rglob("*")) if path.is_file()]
+    assert value["backbone_revision"] == BACKBONE_REVISION
+    assert value["backbone_files"] == rows and value["backbone_fingerprint"] == digest(rows)
+    assert any(row["path"] == "model.safetensors" for row in rows)
+
+
+@pytest.mark.parametrize("command", ["generate", "review", "promote", "check"])
+def test_current_backbone_must_match_independently_measured_profile(approved_copy, tmp_path, command):
+    workspace = approved_copy
+    if command == "generate":
+        workspace = tmp_path / "fresh"
+        setup(workspace)
+    ev = api().Evidence(workspace, test_only=True)
+    def changed(args):
+        value = snapshot(args)
+        value["backbone_files"][0]["sha256"] = digest("TEST_ONLY changed backbone")
+        value["backbone_fingerprint"] = digest(value["backbone_files"])
+        return value
+    options = ["--stage", "pre-live"] if command == "check" else []
+    if command in ("review", "promote"):
+        options = ["--candidate-sha256", ev.reference("golden-candidate.json")["sha256"]]
+    worker = HermeticWorker()
+    assert run(workspace, command, worker=worker, second=50, probe=changed, extra=options) == 1
+    assert not worker.calls

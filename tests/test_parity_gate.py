@@ -856,11 +856,11 @@ def test_opt_in_identity_failure_drops_previous_policy_before_refusal(tmp_path, 
     assert read_json(tmp_path / "lerobot.json")["status"] == "loading"
 
 
-def test_serving_profile_reads_effective_steps_when_request_uses_checkpoint_default():
+def configured_capture_server(checkpoint):
+    """Real pinned configs/processors with a weight-free model collaborator."""
     import torch
     from types import SimpleNamespace
     module = serving_module()
-    checkpoint = ROOT / "checkpoints/GR00T-N1.7-3B-SO101"
     config = module.GrootConfig(base_model_path=str(checkpoint), embodiment_tag="new_embodiment", model_params_fp32=False)
     assert config.num_inference_timesteps is None
     module.fixup_policy_features(config, camera_keys=("wrist", "front"), height=480, width=640, state_dim=6, action_dim=6)
@@ -875,12 +875,19 @@ def test_serving_profile_reads_effective_steps_when_request_uses_checkpoint_defa
     backbone_config = SimpleNamespace(_attn_implementation="sdpa", text_config=attention, vision_config=attention)
     model.backbone = SimpleNamespace(model=SimpleNamespace(config=backbone_config))
     model.action_head = SimpleNamespace(num_inference_timesteps=4)
-    model.config = SimpleNamespace(to_dict=lambda: {"num_inference_timesteps": 4})
+    model.config = SimpleNamespace(to_dict=lambda: {"num_inference_timesteps": 4, "_name_or_path": str(checkpoint)})
     model.eval()
     server = SimpleNamespace(policy=SimpleNamespace(config=config), preprocessor=pre, postprocessor=post, actions_per_chunk=16)
     measured = SimpleNamespace(flow_steps=4, noise_draws=1, noise_shape=[1, 40, 132], sdpa_calls=1,
                                floating_operation_count=1, compute_dtypes={"torch.float32"},
                                autocast=False, tf32=False, noise_device="cpu")
+    return server, model, measured
+
+
+def test_serving_profile_reads_effective_steps_when_request_uses_checkpoint_default():
+    import torch
+    module = serving_module()
+    server, model, measured = configured_capture_server(ROOT / "checkpoints/GR00T-N1.7-3B-SO101")
     identity = observed("lerobot", "operational")
     identity["container"] = {"image_digest": identity["image_digest"]}
     try:
@@ -891,3 +898,58 @@ def test_serving_profile_reads_effective_steps_when_request_uses_checkpoint_defa
     assert profile["parameter_dtypes"] == ["torch.float32"]
     assert profile["effective_configuration"]["processors"]["pre"]
     assert api().operational_semantics(profile)["effective_configuration"]["processors_sha256"]
+
+
+@pytest.mark.parametrize("mutation", ["preprocessor_config", "postprocessor_order"])
+def test_independent_replay_and_serving_capture_match_and_detect_processor_changes(tmp_path, monkeypatch, mutation):
+    import torch
+    from policy_guard.replay_contract import configuration_value
+
+    monkeypatch.delenv("DUME_POLICY_SEED", raising=False)
+    spec = importlib.util.spec_from_file_location("parity_capture_test_replay", ROOT / "docker/lerobot-policy/replay_checkpoint.py")
+    replay_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(replay_module)
+    mounts = [tmp_path / name for name in ("replay-checkpoint", "serving-checkpoint")]
+    for mount in mounts:
+        mount.symlink_to(ROOT / "checkpoints/GR00T-N1.7-3B-SO101", target_is_directory=True)
+    replay_server, replay_model, _ = configured_capture_server(mounts[0])
+    serving_server, serving_model, measured = configured_capture_server(mounts[1])
+    assert replay_server.preprocessor is not serving_server.preprocessor
+    assert replay_server.postprocessor is not serving_server.postprocessor
+    assert replay_server.policy.config.base_model_path != serving_server.policy.config.base_model_path
+
+    # Invoke the actual adapter capture without constructing/loading a real policy.
+    adapter = replay_module.LeRobotReplay.__new__(replay_module.LeRobotReplay)
+    adapter.server, adapter.raw_model = replay_server, replay_model
+
+    def replay_semantics():
+        profile = observed("lerobot", "operational")
+        profile.update(
+            effective_configuration=configuration_value(adapter.effective_configuration()),
+            parameter_dtypes=sorted({str(p.dtype) for p in replay_model.parameters()}),
+            buffer_dtypes=sorted({str(b.dtype) for b in replay_model.buffers()}),
+            compute_dtypes=["torch.float32"], attention=sorted(adapter.attention_implementations()),
+            device="cpu", serving_seed_policy={"mode": "ambient", "seed": None},
+        )
+        return api().operational_semantics(profile)
+
+    identity = observed("lerobot", "operational")
+    identity["container"] = {"image_digest": identity["image_digest"]}
+    served = serving_module().serving_profile(
+        serving_server, serving_model, identity, measured, torch.zeros(1, 40, 132))
+    served_semantics = api().operational_semantics(served)
+    assert replay_semantics() == served_semantics, (
+        "Independent replay and serving capture must include the same effective processor configuration"
+    )
+    assert served_semantics["effective_configuration"]["processors_sha256"]
+
+    if mutation == "preprocessor_config":
+        pack = next(step for step in replay_server.preprocessor.steps if hasattr(step, "state_dropout_prob"))
+        pack.state_dropout_prob = 0.125
+    else:
+        assert len(replay_server.postprocessor.steps) > 1
+        replay_server.postprocessor.steps = list(reversed(replay_server.postprocessor.steps))
+    assert replay_semantics() != served_semantics
+    unchanged = serving_module().serving_profile(
+        serving_server, serving_model, identity, measured, torch.zeros(1, 40, 132))
+    assert api().operational_semantics(unchanged) == served_semantics

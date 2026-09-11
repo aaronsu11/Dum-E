@@ -632,6 +632,9 @@ class RuntimeSource:
             "embodiment/so_arm10x/skills.py", "policy/lerobot/backend.py",
             "policy/lerobot/session.py", "policy/lerobot/features.py", "policy_guard/parity_gate.py",
         )
+        if gate.is_milestone_release(ev):
+            sources += ("policy_guard/milestone_acceptance.py", "policy_guard/milestone_golden.py",
+                        "scripts/replay_milestone_golden.py")
         snapshot.update(
             input_fingerprint=lock["fingerprint"], source_files={name: sha256_file(ROOT / name) for name in sources},
             client_lock_sha256=sha256_file(ROOT / "uv.lock"),

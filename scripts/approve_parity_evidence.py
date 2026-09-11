@@ -9,7 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy_guard.parity_gate import (  # noqa: E402
-    DECISIONS, DecisionRecord, Evidence, PrerequisiteError, decision_evidence, evidence,
+    DECISIONS, MILESTONE_LIVE_SCOPE, MILESTONE_MODE, DecisionRecord, Evidence, PrerequisiteError,
+    decision_evidence, evidence,
     fingerprint_configuration, require, timestamp, utc_now, validate_closeout,
     validate_golden_approval, validate_golden_candidate, validate_live_approval,
     validate_preflight_record, validate_release_evidence, validate_release_review,
@@ -43,21 +44,35 @@ def record_decision(workspace, kind, *, prompt=input, clock=utc_now, test_only=F
     subject = validate(ev)
     print(f"Review {kind}: {ev.reference(subject_name)['sha256']}")
     print(canonical(subject).decode())
+    milestone_live = kind == "live" and subject["release_evidence"].get("acceptance_mode") == MILESTONE_MODE
     if kind == "live":
-        # Full matrix summaries, not just the positive score: all six joints,
-        # signs, all sixteen indices, per-trace maxima, thresholds and caveats.
         print("joint_order:", ", ".join(ev.json("input-lock.json")["joint_order"]))
-        print("coverage: 120 records / 600 cases per comparison")
-        print("thresholds:", canonical(ev.json("tolerance-proposal.json")).decode())
-        print("deviations, bias, slope, per_index_bias, verdicts and caveats:")
-        report = ev.json("offline-report.json")
-        for comparison in report["comparisons"]:
-            print(canonical({k: comparison[k] for k in ("name", "metrics", "passed")}).decode())
-        print("caveats:", canonical(report["caveats"]).decode())
+        if milestone_live:
+            print("This decision approves the scoped native reference AND the three-trial physical test together.")
+            print("coverage: 12 observations / one seed per observation; exhaustive parity is not established")
+            print("native reference:", canonical(ev.reference("milestone-golden-candidate.json")).decode())
+            print("fresh native verification:", canonical(ev.reference("milestone-golden-replay.json")).decode())
+            accepted = ev.json("milestone-acceptance.json")
+            print("physical criteria:", canonical({k: accepted[k] for k in ("limits", "units")}).decode())
+            print("measured deviations, bias and per-index trends:", canonical(accepted["metrics"]).decode())
+            print("preserved strict result:", ev.json("milestone-report.json")["status"])
+            print("caveats:", canonical(accepted["caveats"]).decode())
+            print("Operator presence must be confirmed before starting motion; this command accesses no hardware.")
+        else:
+            # Preserve the exhaustive report and its original decision scope.
+            print("coverage: 120 records / 600 cases per comparison")
+            print("thresholds:", canonical(ev.json("tolerance-proposal.json")).decode())
+            print("deviations, bias, slope, per_index_bias, verdicts and caveats:")
+            report = ev.json("offline-report.json")
+            for comparison in report["comparisons"]:
+                print(canonical({k: comparison[k] for k in ("name", "metrics", "passed")}).decode())
+            print("caveats:", canonical(report["caveats"]).decode())
     operator = _required(prompt, "Operator identity (required): ")
     rationale = _required(prompt, "Intentional-change/review rationale (required): ")
     while True:
-        answer = _required(prompt, "Type approve or reject for this exact subject (no default): ").lower()
+        question = ("Type approve or reject for this exact scoped native reference AND three-trial physical test (no default): "
+                    if milestone_live else "Type approve or reject for this exact subject (no default): ")
+        answer = _required(prompt, question).lower()
         if answer in ("approve", "reject"):
             break
     record = {
@@ -68,6 +83,8 @@ def record_decision(workspace, kind, *, prompt=input, clock=utc_now, test_only=F
         )), "schema_version": 1, **ev.identity(),
         "evidence_kind": "test_only" if test_only else "real_model",
     }
+    if milestone_live:
+        record["approval_scope"] = list(MILESTONE_LIVE_SCOPE)
     require(timestamp(subject["ended_at"]) <= timestamp(record["decided_at"]), "decision predates subject")
     if record["decision"] == "approved":
         {"tolerances": validate_tolerance_agreement, "golden": validate_golden_approval,

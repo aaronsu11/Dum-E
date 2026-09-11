@@ -77,6 +77,8 @@ DECISIONS = {
     "live": ("release-review.json", "live-approval.json"),
 }
 STAGES = ("review", "live", "run", "trial-01", "trial-02", "trial-03")
+MILESTONE_MODE = "milestone_12"
+MILESTONE_LIVE_SCOPE = ("scoped-native-reference", "three-trial-physical-test")
 PREPROCESSING_KEYS = {"image_front", "image_wrist", "state", "tokens", "mask"}
 SEMANTIC_KEYS = {
     "backend", "purpose", "checkpoint_fingerprint", "backbone_fingerprint",
@@ -347,12 +349,17 @@ def _decision(ev, kind, *, subject=None):
 def decision_evidence(workspace, kind):
     ev = evidence(workspace)
     names = ["session.json", "input-lock.json", "profiles.json", DECISIONS[kind][0]]
-    names += {
-        "tolerances": ["repeatability.json"],
-        "golden": ["tolerance-agreement.json"],
-        "live": ["offline-report.json", "tolerance-agreement.json", "golden-candidate.json",
-                 "golden-approval.json", "golden-replay.json"],
-    }[kind]
+    if kind == "live" and is_milestone_release(ev):
+        names += ["milestone-acceptance.json", "milestone-criteria-authorization.json",
+                  "milestone-scope.json", "milestone-report.json",
+                  "milestone-golden-candidate.json", "milestone-golden-replay.json"]
+    else:
+        names += {
+            "tolerances": ["repeatability.json"],
+            "golden": ["tolerance-agreement.json"],
+            "live": ["offline-report.json", "tolerance-agreement.json", "golden-candidate.json",
+                     "golden-approval.json", "golden-replay.json"],
+        }[kind]
     refs = [ev.reference(name) for name in names]
     if kind == "live":
         refs.append(ev.json("release-review.json")["review_preflight"])
@@ -529,8 +536,38 @@ def _calibration(ev):
     return result
 
 
+def is_milestone_release(workspace):
+    # A broken declared artifact must fail validation, never fall back to legacy.
+    return os.path.lexists(evidence(workspace).workspace / "milestone-acceptance.json")
+
+
+def _milestone_release_evidence(ev):
+    if "release:milestone" in ev._validated:
+        return ev._validated["release:milestone"]
+    from policy_guard.milestone_acceptance import validate_milestone_acceptance
+    try:
+        from policy_guard.milestone_golden import validate_scoped_golden
+    except ModuleNotFoundError as exc:
+        if exc.name != "policy_guard.milestone_golden":
+            raise
+        raise PrerequisiteError("not run: scoped native golden validator unavailable") from exc
+    accepted = validate_milestone_acceptance(ev)
+    golden = validate_scoped_golden(ev)
+    require(accepted["status"] == golden["status"] == "complete", "milestone evidence incomplete")
+    require(accepted["report"] == ev.reference("milestone-acceptance.json"), "milestone acceptance link changed")
+    require(golden["candidate"] == ev.reference("milestone-golden-candidate.json") and
+            golden["replay"] == ev.reference("milestone-golden-replay.json"), "scoped golden links changed")
+    require(golden["ended_at"] == ev.json(golden["replay"])["ended_at"], "scoped golden completion changed")
+    result = {**accepted, "acceptance_mode": MILESTONE_MODE, "scoped_golden": golden,
+              "golden_approval_policy": "included-in-explicit-live-decision"}
+    ev._validated["release:milestone"] = result
+    return result
+
+
 def validate_release_evidence(workspace):
     ev = evidence(workspace)
+    if is_milestone_release(ev):
+        return _milestone_release_evidence(ev)
     if "release" in ev._validated:
         return ev._validated["release"]
     report = validate_offline_evidence(ev)
@@ -874,8 +911,13 @@ def _preflight_record(ev, record, *, path, success=True, seen=None):
             timestamp(record["host"]["checked_at"]) <= timestamp(record["ended_at"]), "request outside preflight interval")
     if stage == "review":
         require(record["approval"] is None and record["review_preflight"] is None, "review readiness cannot claim approval")
-        require(timestamp(ev.json("golden-replay.json")["ended_at"]) < timestamp(record["started_at"]) and
-                timestamp(ev.json("offline-report.json")["archived_at"]) <= timestamp(record["started_at"]), "review precedes archived evidence")
+        if release.get("acceptance_mode") == MILESTONE_MODE:
+            require(timestamp(release["scoped_golden"]["ended_at"]) < timestamp(record["started_at"]) and
+                    timestamp(release["ended_at"]) <= timestamp(record["started_at"]),
+                    "review precedes milestone acceptance or scoped golden replay")
+        else:
+            require(timestamp(ev.json("golden-replay.json")["ended_at"]) < timestamp(record["started_at"]) and
+                    timestamp(ev.json("offline-report.json")["archived_at"]) <= timestamp(record["started_at"]), "review precedes archived evidence")
     else:
         approval = validate_live_approval(ev)
         require(record["approval"] == ev.reference("live-approval.json") and
@@ -918,6 +960,9 @@ def validate_live_approval(workspace, *, decision=None):
     ev = evidence(workspace)
     review = validate_release_review(ev)
     record = _decision(ev, "live", subject=decision)
+    if review["release_evidence"].get("acceptance_mode") == MILESTONE_MODE:
+        require(record.get("approval_scope") == list(MILESTONE_LIVE_SCOPE),
+                "explicit combined scoped-reference and physical-test approval required")
     require(timestamp(review["ended_at"]) < timestamp(record["decided_at"]), "live approval must follow archive/review")
     return record
 

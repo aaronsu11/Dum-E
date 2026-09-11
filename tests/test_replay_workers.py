@@ -282,3 +282,98 @@ def test_pinned_native_cache_rejects_unpinned_or_escaping_snapshot(tmp_path, cor
         with module.pinned_native_cache(hub):
             pytest.fail("invalid snapshot admitted")
     assert Path.cwd() == before
+
+
+@pytest.mark.parametrize("reduction", ["manual", "autocast", "aten"])
+def test_hidden_reduced_precision_compute_cannot_pass_fp32_profile(reduction):
+    import torch
+    import torch.nn.functional as functional
+
+    api = contract()
+    x = torch.ones(1, 8)
+    weight = torch.ones(8, 8)
+    q = torch.ones(1, 1, 3, 8)
+    with api.sampling_observer(42) as observer:
+        functional.scaled_dot_product_attention(q, q, q)
+        if reduction == "autocast":
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                hidden = functional.linear(x, weight)
+        elif reduction == "aten":
+            hidden = torch.ops.aten.mm.default(x.bfloat16(), weight.bfloat16())
+        else:
+            hidden = functional.linear(x.bfloat16(), weight.bfloat16())
+        returned = hidden.float()
+    assert returned.dtype == torch.float32
+    observed = profile()
+    observed.update(compute_dtypes=sorted(observer.compute_dtypes), autocast=observer.autocast)
+    with pytest.raises(ValueError, match="compute|autocast"):
+        api.validate_profile(observed)
+
+
+def test_verified_tensor_bytes_survive_path_mutation(tmp_path):
+    api = contract()
+    target = tmp_path / "record.npz"
+    original = np.zeros((1, 40, 132), np.float32)
+    np.savez(target, raw=original)
+    ref = {"path": target.name, "sha256": api.sha256_file(target)}
+    captured = api.verify_file(tmp_path, ref)
+    np.savez(target, raw=np.ones_like(original))
+    decoded = api.load_numeric(captured, expected_keys={"raw"})
+    assert np.array_equal(decoded["raw"], original), "Must parse the exact bytes whose digest passed"
+
+
+def complete_manifest_fixture(tmp_path):
+    api = contract()
+    expected = [{"record": "record_0000.npz", "seed": 42}]
+    locked = {
+        "fingerprint": "1" * 64, "checkpoint_fingerprint": "3" * 64,
+        "schedule": expected,
+        "records": [{"file": "record_0000.npz", "sha256": "6" * 64, "instruction": "real locked task", "seeds": [42]}],
+        "joint_order": list(api.JOINT_ORDER), "camera_order": list(api.CAMERA_ORDER),
+    }
+    current = profile()
+    current["owned_source_files"] = {"worker.py": "7" * 64}
+    current["owned_source_fingerprint"] = api.fingerprint_configuration(current["owned_source_files"])
+    reference = api.write_tensors(tmp_path, {
+        "raw": np.zeros((1, 40, 132), np.float32), "noise": np.ones((1, 40, 132), np.float32),
+        "decoded": np.zeros((16, 6), np.float32),
+    })
+    report = {
+        "schema_version": 1, "session": "expected-session", "stage": "diagnostic",
+        "status": "complete", "input_fingerprint": locked["fingerprint"],
+        "profile_fingerprint": api.fingerprint_configuration(current), "profile": current,
+        "started_at": "2026-09-11T00:00:00+00:00", "ended_at": "2026-09-11T00:00:01+00:00",
+        "expected_cases": expected, "executed_cases": expected, "prerequisite_errors": [],
+        "evidence_kind": "real_model", "cases": [{"key": expected[0], "record_sha256": "6" * 64,
+        "instruction": "real locked task", "observer_inert": True, "tensors": reference}],
+    }
+    identity = {
+        "expected_session": "expected-session", "input_lock": locked,
+        "backend": "native", "purpose": "diagnostic", "checkpoint_fingerprint": "3" * 64,
+        "image_digest": current["image_digest"], "source_files": current["owned_source_files"], "device": "cpu",
+    }
+    return report, expected, identity
+
+
+@pytest.mark.parametrize("corruption", ["session", "input", "record", "instruction", "backend", "purpose", "checkpoint", "image", "source", "device"])
+def test_manifest_binds_exact_launcher_identity(tmp_path, corruption):
+    api = contract()
+    report, expected, identity = complete_manifest_fixture(tmp_path)
+    import inspect
+
+    assert "expected_session" in inspect.signature(api.validate_replay_manifest).parameters, "Manifest validator must require the launcher identity"
+    api.validate_replay_manifest(report, tmp_path, expected, **identity)
+    if corruption == "session":
+        report["session"] = "another-session"
+    elif corruption == "input":
+        report["input_fingerprint"] = "0" * 64
+    elif corruption == "record":
+        report["cases"][0]["record_sha256"] = "0" * 64
+    elif corruption == "instruction":
+        report["cases"][0]["instruction"] = "different task"
+    else:
+        key = {"checkpoint": "checkpoint_fingerprint", "image": "image_digest", "source": "owned_source_files"}.get(corruption, corruption)
+        report["profile"][key] = {"worker.py": "0" * 64} if corruption == "source" else "different"
+        report["profile_fingerprint"] = api.fingerprint_configuration(report["profile"])
+    with pytest.raises(ValueError):
+        api.validate_replay_manifest(report, tmp_path, expected, **identity)

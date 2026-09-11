@@ -968,8 +968,11 @@ def worker_main(backend: str, adapter_factory, stock_loader=None) -> int:
             free, total = torch.cuda.mem_get_info()
             report.resources.update(device_name=torch.cuda.get_device_name(), free_before_bytes=free, total_bytes=total)
             torch.cuda.reset_peak_memory_stats()
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        # Diagnostics impose strict controls; operational replay must retain
+        # the deployed runtime settings that its independent attestation measures.
+        if args.profile != "operational":
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
         torch.set_num_threads(4)
         if args.profile == "stock-capacity":
             if stock_loader is None:

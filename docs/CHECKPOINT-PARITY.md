@@ -225,3 +225,10 @@ run. It validates the journal hash chain and reconciles stop entries, clamp
 counts, stop reasons and safety flags. A preserved stop event cannot be hidden
 by changing report or trial summaries. The runner uses the same validator, and
 the gate imports no controller or motor modules.
+
+Operational replay preserves the deployed runtime's TF32 flags; only diagnostic
+replay and stock diagnostics force TF32 off. Read the flags from the measured
+profile and independent serving attestation. An image default such as cuDNN TF32
+enabled must not be silently changed to make those records agree. A source or
+profile correction requires a new successor session, fresh calibration derivation,
+fresh feasibility profiles and the complete repeatability schedule.

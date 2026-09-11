@@ -401,8 +401,11 @@ def numerical_worker(args):
     require(timestamp(report.execution["started_at"]) <= timestamp(report.started_at), "worker precedes collection")
     start = time.perf_counter()
     try:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        # Diagnostics impose strict controls; operational replay must retain
+        # the deployed runtime settings that its independent attestation measures.
+        if args.profile != "operational":
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
         torch.set_num_threads(4)
         report.resources.update(requested_device=args.device, checkpoint_fp32_tensor_bytes=lock["checkpoint_fp32_tensor_bytes"], host_meminfo_before=Path("/proc/meminfo").read_text())
         if args.device.startswith("cuda"):

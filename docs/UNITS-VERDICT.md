@@ -693,3 +693,25 @@ fails. `--write-derivation` rejects motion modes and explicit calibration overri
 Missing calibration/statistics and injected single-tick drift fail the prerequisite.
 Any recalibration requires fresh derivation and release review; future approval
 must bind the exact calibration digest above.
+
+### 10.1 Evidence validation correction and replacement session
+
+The first §10 artifact remains preserved at `corpus/phase7/calibration.json` but
+is **superseded for release use**: review found that its validator reread inputs
+rather than validating the bytes hashed, and that the CLI ignored a configured
+robot ID. Neither issue changed the arithmetic on this host, but both could
+produce misleading evidence in another invocation.
+
+The corrected current evidence is
+`corpus/phase7-resume-20260911/calibration.json`, bound to that directory’s
+immutable `session.json`. It records the prior artifact’s path/hash, replacement
+reason, UTC start/end, configured robot identity and actual drift-check results.
+The validator now checks the exact captured bytes it derives from and hashes.
+Missing inputs publish `status: not_run` and return 2. The configured robot ID is
+resolved through the same configuration reader as the live probe, without
+constructing a controller. Input calibration and statistics hashes remain those
+listed above; no hardware was accessed.
+
+```bash
+UV_NO_SYNC=1 UV_PYTHON_DOWNLOADS=never uv run python scripts/pose_sweep_units_probe.py --skip-hardware --write-derivation corpus/phase7-resume-20260911/calibration.json --session-id phase7-resume-20260911 --supersedes corpus/phase7/calibration.json --reason 'Correct calibration snapshot validation, configured robot identity and session provenance after review'
+```

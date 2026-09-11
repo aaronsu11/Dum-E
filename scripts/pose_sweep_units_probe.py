@@ -863,79 +863,43 @@ def resolve_statistics_path(explicit: str | None = None) -> Path:
     return REPO_ROOT / STATISTICS_RELPATH
 
 
+def validate_pinned_snapshot(statistics_bytes: bytes, calibration_bytes: bytes) -> list[str]:
+    """Validate precisely the immutable bytes used for arithmetic and hashes."""
+    stats = json.loads(statistics_bytes)["new_embodiment"]
+    calibration = json.loads(calibration_bytes)
+    notes = []
+    for key, pinned in (("state", CHECKPOINT_STATE_STATS), ("action", CHECKPOINT_ACTION_STATS)):
+        for subgroup, arrays in pinned.items():
+            for stat, values in arrays.items():
+                if list(stats[key][subgroup][stat]) != values:
+                    raise ValueError(f"DRIFT {key}.{subgroup}.{stat}")
+    if set(calibration) != set(JOINT_NAMES):
+        raise ValueError("DRIFT calibration joint membership")
+    for joint, pinned in CALIBRATION_TICK_RANGES.items():
+        for field, value in pinned.items():
+            actual = calibration[joint].get(field)
+            if type(actual) is not int or actual != value:
+                raise ValueError(f"DRIFT calibration {joint}.{field}: pinned {value} != recorded {actual}")
+    notes.extend(["checkpoint statistics match pinned constants",
+                  "calibration tick ranges, IDs and drive modes match pinned constants",
+                  "UNVERIFIED: remote DATASET_EPISODE0_STATE_STATS; training-time calibration unknown"])
+    return notes
+
+
 def check_pinned_constants_against_local_artifacts(
     statistics_path: str | None = None,
     calibration_path: str | None = None,
     robot_name: str = LEROBOT_ROBOT_CLASS_NAME,
     robot_id: str = DEFAULT_ROBOT_ID,
 ) -> tuple[bool, list[str]]:
-    """Compare the pinned constants against the real local data artifacts.
-
-    Returns ``(ok, notes)``. Drift in a RESOLVED artifact is a FAILURE: it means
-    the local statistics or calibration no longer match the numbers this verdict
-    was reasoned from, and the verdict must be re-derived rather than re-asserted.
-    A missing required local artifact fails closed: unchecked constants cannot
-    satisfy a Phase 7 prerequisite. The remote episode-0 caveat remains explicit.
-    """
-    notes: list[str] = []
-    ok = True
-
-    stats_file = resolve_statistics_path(statistics_path)
-    if stats_file.is_file():
-        recorded = json.loads(stats_file.read_text(encoding="utf-8"))["new_embodiment"]
-        for key, pinned in (
-            ("state", CHECKPOINT_STATE_STATS),
-            ("action", CHECKPOINT_ACTION_STATS),
-        ):
-            for subgroup, arrays in pinned.items():
-                for stat, values in arrays.items():
-                    actual = recorded[key][subgroup][stat]
-                    if list(actual) != list(values):
-                        ok = False
-                        notes.append(
-                            f"DRIFT {key}.{subgroup}.{stat}: pinned {values} != "
-                            f"recorded {actual}"
-                        )
-        if ok:
-            notes.append(f"checkpoint statistics match pinned constants ({stats_file})")
-    else:
-        ok = False
-        notes.append(
-            f"UNVERIFIED: checkpoint statistics not resolvable at {stats_file} — "
-            f"set --statistics or DUME_CHECKPOINT_STATISTICS to check for drift"
-        )
-
-    cal_file = resolve_calibration_path(calibration_path, robot_name, robot_id)
-    if cal_file.is_file():
-        recorded_cal = json.loads(cal_file.read_text(encoding="utf-8"))
-        drifted = False
-        for joint, pinned in CALIBRATION_TICK_RANGES.items():
-            actual = recorded_cal.get(joint)
-            if actual is None:
-                ok, drifted = False, True
-                notes.append(f"DRIFT calibration: joint {joint} absent from {cal_file}")
-                continue
-            for field, value in pinned.items():
-                if actual.get(field) != value:
-                    ok, drifted = False, True
-                    notes.append(
-                        f"DRIFT calibration {joint}.{field}: pinned {value} != "
-                        f"recorded {actual.get(field)}"
-                    )
-        if not drifted:
-            notes.append(f"calibration tick ranges match pinned constants ({cal_file})")
-    else:
-        ok = False
-        notes.append(
-            f"UNVERIFIED: calibration not resolvable at {cal_file} — set "
-            f"--calibration or HF_LEROBOT_CALIBRATION to check for drift"
-        )
-
-    notes.append(
-        "UNVERIFIED: DATASET_EPISODE0_STATE_STATS is remote "
-        "(aaronsu11/so101_fruit meta/episodes_stats.jsonl) and is not checked offline"
-    )
-    return ok, notes
+    """Fail closed on missing inputs or drift; never refresh the independent pins."""
+    try:
+        stats_file = resolve_statistics_path(statistics_path)
+        cal_file = resolve_calibration_path(calibration_path, robot_name, robot_id)
+        notes = validate_pinned_snapshot(stats_file.read_bytes(), cal_file.read_bytes())
+        return True, [f"statistics: {stats_file}", f"calibration: {cal_file}", *notes]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return False, [f"UNVERIFIED/DRIFT: {type(exc).__name__}: {exc}"]
 
 
 def derive_current_calibration(calibration_path: Path, statistics_path: Path) -> dict:
@@ -943,16 +907,8 @@ def derive_current_calibration(calibration_path: Path, statistics_path: Path) ->
     paths = {"calibration": Path(calibration_path).resolve(),
              "statistics": Path(statistics_path).resolve()}
     inputs = {name: path.read_bytes() for name, path in paths.items()}
-    ok, notes = check_pinned_constants_against_local_artifacts(
-        str(paths["statistics"]), str(paths["calibration"]))
-    if not ok:
-        raise ValueError("; ".join(notes))
+    notes = validate_pinned_snapshot(inputs["statistics"], inputs["calibration"])
     calibration = json.loads(inputs["calibration"])
-    if set(calibration) != set(JOINT_NAMES):
-        raise ValueError("DRIFT: calibration joint membership changed")
-    for name, path in paths.items():
-        if path.read_bytes() != inputs[name]:
-            raise ValueError(f"DRIFT: {name} changed while deriving")
     scales, ranges, limits, targets = {}, {}, {}, {}
     for joint in JOINT_NAMES:
         lo, hi, drive = calibration_bounds(calibration, joint)
@@ -977,6 +933,7 @@ def derive_current_calibration(calibration_path: Path, statistics_path: Path) ->
         **{name: {"path": str(paths[name]), "sha256": hashlib.sha256(data).hexdigest()}
            for name, data in inputs.items()},
         "joint_order": JOINT_NAMES, "calibration_snapshot": calibration,
+        "checks": {"pinned_snapshot": "passed", "reset_reachability": "passed", "notes": notes},
         "scale_deg_per_pct": scales, "reachable_degrees": ranges,
         "at_limit_predictions": limits, "reset_targets": targets,
         "formula": {"max_res": MAX_RES, "scale": "(range_max-range_min)*360/(4095*200)",
@@ -1656,7 +1613,7 @@ def check_pinned_constants(index: str, args: argparse.Namespace) -> bool:
         # `robot_type`, so passing `robot_type` is exactly the substitution that
         # made this check read a file the bus does not load. `--calibration` is
         # the escape hatch when the derivation is wrong.
-        robot_id=args.robot_id or DEFAULT_ROBOT_ID,
+        robot_id=resolve_live_controller_settings(args)["robot_id"],
     )
     for note in notes:
         print(f"       {note}")
@@ -2018,23 +1975,60 @@ def main() -> int:
     )
     parser.add_argument("--write-derivation", type=Path,
                         help="Write immutable offline calibration evidence; requires --skip-hardware.")
+    parser.add_argument("--session-id", help="Explicit immutable evidence session; defaults to output directory name")
+    parser.add_argument("--supersedes", type=Path, help="Prior evidence file retained by a replacement session")
+    parser.add_argument("--reason", help="Reason for a replacement evidence session")
     args = parser.parse_args()
     if args.write_derivation:
         if not args.skip_hardware or args.pose_sequence or args.demo_clamp:
             parser.error("--write-derivation requires --skip-hardware and refuses motion modes")
         if args.calibration or args.robot_type:
             parser.error("--write-derivation uses the current so_follower resolver; no calibration override")
+        if bool(args.supersedes) != bool(args.reason):
+            parser.error("replacement evidence requires both --supersedes and --reason")
+        started = datetime.now(timezone.utc).isoformat()
+        session_id = args.session_id or args.write_derivation.parent.name
+        session = {"schema_version": 1, "session_id": session_id}
+        if args.supersedes:
+            try:
+                predecessor = args.supersedes.resolve(strict=True)
+                session.update(supersedes={"path": str(predecessor),
+                    "sha256": hashlib.sha256(predecessor.read_bytes()).hexdigest()}, reason=args.reason)
+            except OSError as exc:
+                print(f"not_run: predecessor unavailable: {exc}", file=sys.stderr)
+                return 2
+        code = 0
         try:
+            settings = resolve_live_controller_settings(args)  # reads config only; constructs no hardware
+            if settings["robot_type"] not in ("so101_follower", "so100_follower"):
+                raise ValueError("Derivation requires an SOFollower robot identity")
             record = derive_current_calibration(
-                resolve_calibration_path(robot_id=args.robot_id or DEFAULT_ROBOT_ID),
+                resolve_calibration_path(robot_id=settings["robot_id"]),
                 resolve_statistics_path(args.statistics))
-            write_derivation(args.write_derivation, record)
+            record["robot_identity"] = {"robot_id": settings["robot_id"],
+                "robot_type": settings["robot_type"], "config_file": settings["config_file"]}
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            print(f"Derivation not completed: {type(exc).__name__}: {exc}", file=sys.stderr)
-            return 2 if isinstance(exc, FileNotFoundError) else 1
-        print(f"Offline arithmetic saved to {args.write_derivation}; no hardware accessed")
-        return 0
-
+            code = 2 if isinstance(exc, FileNotFoundError) else 1
+            record = {"schema_version": 1, "kind": "offline_arithmetic",
+                "status": "not_run" if code == 2 else "failed",
+                "error": f"{type(exc).__name__}: {exc}"}
+            print(f"{record['status']}: {record['error']}", file=sys.stderr)
+        record.update(session_id=session_id, started_at=started,
+                      ended_at=datetime.now(timezone.utc).isoformat())
+        record.update({key: session[key] for key in ("supersedes", "reason") if key in session})
+        try:
+            session_path = args.write_derivation.parent / "session.json"
+            if session_path.exists():
+                if json.loads(session_path.read_bytes()) != session:
+                    raise ValueError("Session identity conflict; use an explicitly linked replacement workspace")
+            else:
+                write_derivation(session_path, session)
+            write_derivation(args.write_derivation, record)
+        except (OSError, ValueError) as exc:
+            print(f"Evidence publication refused: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(f"{record['status']}: offline arithmetic saved to {args.write_derivation}; no hardware accessed")
+        return code
 
     poses = [p.strip() for p in args.poses.split(",") if p.strip()]
     sweep_poses = (

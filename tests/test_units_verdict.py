@@ -835,3 +835,34 @@ def test_documented_current_calibration_matches_independent_snapshot():
     assert 'at-limit prediction' in text
     assert 'not a new observation' in text
     assert 'outside the historical episode-0 band' in text
+
+
+def test_derivation_validates_the_bytes_it_hashes_even_under_replacement(derivation_inputs, monkeypatch):
+    import json
+    calibration, statistics = derivation_inputs
+    captured = json.loads(calibration.read_text())
+    captured['elbow_flex']['id'] = 99
+    bad_bytes = json.dumps(captured).encode()
+    original = Path.read_bytes
+    monkeypatch.setattr(Path, 'read_bytes',
+        lambda path: bad_bytes if path == calibration else original(path))
+    # read_text still sees the valid file: old rereading validator accepted this.
+    with pytest.raises(ValueError, match='DRIFT'):
+        probe.derive_current_calibration(calibration, statistics)
+
+
+def test_derivation_cli_uses_configured_robot_and_reports_not_run(tmp_path, monkeypatch, capsys):
+    import json
+    config = tmp_path/'robot.yaml'
+    config.write_text('controller:\n  robot_id: alternate_arm\n  robot_type: so101_follower\n')
+    monkeypatch.setenv('DUME_CONFIG', str(config))
+    monkeypatch.setenv('HF_LEROBOT_CALIBRATION', str(tmp_path/'calibrations'))
+    monkeypatch.setattr(sys, 'argv', ['probe', '--skip-hardware', '--write-derivation', str(tmp_path/'session/calibration.json')])
+    assert probe.main() == 2
+    output = capsys.readouterr()
+    assert 'alternate_arm.json' in output.err
+    assert 'not_run' in output.err
+    record = json.loads((tmp_path/'session/calibration.json').read_text())
+    assert record['status'] == 'not_run'
+    assert record['session_id'] == 'session'
+    assert record['started_at'] <= record['ended_at']

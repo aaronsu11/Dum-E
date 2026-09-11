@@ -113,7 +113,7 @@ def runtime(second, instance="first"):
     return {"attestation": attestation, "host": host, "request": request}
 
 
-def fixture_workspace(workspace):
+def fixture_workspace(workspace, operational_edit=None):
     """Actual schema shape and full membership, all data explicitly test_only."""
     save(workspace, "session.json", {"schema_version": 1, "session_id": "test-session"})
     lock = {
@@ -133,6 +133,8 @@ def fixture_workspace(workspace):
                                   ("native", "operational"), ("lerobot", "operational"))],
         "serving_configuration": semantics(),
     }
+    if operational_edit is not None:
+        operational_edit(profiles["profiles"][3]["observed"])
     save(workspace, "profiles.json", profiles)
     identity = {"schema_version": 1, "session": "test-session", "evidence_kind": "test_only",
                 "input_fingerprint": lock["fingerprint"], "profiles_fingerprint": digest(profiles),
@@ -524,3 +526,175 @@ def test_actual_plan02_calibration_schema_consumes_validated_bytes(tmp_path):
     rewrite(tmp_path, "calibration.json", lambda d: d["scale_deg_per_pct"].update(wrist_roll=99))
     with pytest.raises(ValueError, match="scale"):
         api()._calibration(api().Evidence(tmp_path))
+
+
+def serving_module():
+    name = "parity_observation_test_server"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, ROOT / "docker/lerobot-policy/server.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def test_serving_observation_is_inert_and_measures_actual_compute():
+    import torch
+    from types import SimpleNamespace
+    module = serving_module()
+    assert hasattr(module, "ServingObservation"), "Serving attestation must observe real inference without reseeding it"
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Identity()
+            self.action_head = torch.nn.Module()
+            self.action_head.action_encoder = torch.nn.Identity()
+
+        def get_action(self):
+            inputs = self.backbone(torch.ones((1, 1, 4, 4)))
+            attention = torch.nn.functional.scaled_dot_product_attention(inputs, inputs, inputs)
+            raw = torch.randn((1, 40, 132))
+            for _ in range(4):
+                raw = self.action_head.action_encoder(raw) + attention.mean()
+            return raw
+
+    model = Model().eval()
+    torch.manual_seed(124)
+    reference = model.get_action()
+    rng = torch.get_rng_state().clone()
+    torch.manual_seed(124)
+    with module.ServingObservation(model) as observed:
+        result = model.get_action()
+    assert torch.equal(reference, result)
+    assert torch.equal(rng, torch.get_rng_state())
+    assert observed.flow_steps == 4
+    assert observed.noise_shape == [1, 40, 132]
+    assert observed.noise_draws == 1
+    assert observed.compute_dtypes == {"torch.float32"}
+    assert observed.sdpa_calls == 1
+    assert not model.backbone._forward_hooks
+    assert not model.action_head.action_encoder._forward_pre_hooks
+
+
+def test_serving_disabled_attestation_preserves_result_and_skips_fact_collection(monkeypatch):
+    module = serving_module()
+    assert hasattr(module.DumEGrootPolicyServer, "_predict_action_chunk_impl"), "Optional attestation must wrap the unchanged serving path"
+    result = object()
+    calls = []
+
+    class Server(module.DumEGrootPolicyServer):
+        def _predict_action_chunk_impl(self, observation):
+            calls.append(observation)
+            return result
+
+    monkeypatch.delenv("DUME_PARITY_ATTESTATION_PATH", raising=False)
+    server = Server.__new__(Server)
+    assert server._predict_action_chunk("observation") is result
+    assert calls == ["observation"]
+    assert not hasattr(server, "_parity_attestor")
+
+
+@pytest.mark.parametrize("mutation", [
+    "pid", "container", "image", "checkpoint", "preprocessor", "seed", "incomplete",
+    "endpoint", "request", "stale_request", "secret", "compute", "steps",
+])
+def test_runtime_attestation_rejects_stale_changed_or_incomplete_facts(mutation):
+    g = api()
+    rv = runtime(30)
+    att = rv["attestation"]
+    if mutation == "pid":
+        rv["host"]["pid"] += 1
+    elif mutation == "container":
+        rv["host"]["container_id"] = digest("different")
+    elif mutation == "image":
+        rv["host"]["image_digest"] = "sha256:" + digest("different")
+    elif mutation == "checkpoint":
+        att["semantic_configuration"]["checkpoint_fingerprint"] = digest("different")
+    elif mutation == "preprocessor":
+        att["semantic_configuration"]["effective_configuration"]["letter_box_transform"] = False
+    elif mutation == "seed":
+        att["semantic_configuration"]["seed_policy"] = {"mode": "fixed", "seed": 1}
+    elif mutation == "incomplete":
+        att["status"] = "loaded"
+    elif mutation == "endpoint":
+        att["endpoint"]["port"] = 8081
+    elif mutation == "request":
+        rv["request"] = {**rv["request"], "observation_sha256": digest("different")}
+    elif mutation == "stale_request":
+        rv["host"]["checked_at"] = ts(200)
+    elif mutation == "secret":
+        att["environment"] = {"TOKEN": "must not serialize"}
+    elif mutation == "compute":
+        att["semantic_configuration"]["compute_dtypes"] = []
+    elif mutation == "steps":
+        att["semantic_configuration"]["flow_steps"] = 3
+    with pytest.raises(ValueError):
+        g.validate_runtime_attestation(att, host=rv["host"], request=rv["request"],
+                                       expected_configuration=semantics(), now=ts(201 if mutation == "stale_request" else 33),
+                                       test_only=True)
+
+
+def test_host_container_identity_checks_actual_port_mapping_and_readonly_mount():
+    g = api()
+    assert hasattr(g, "container_binding"), "A tag or requested endpoint cannot stand in for inspected container facts"
+    inspected = {
+        "Id": digest("container"), "Image": "sha256:" + digest("image"),
+        "State": {"Running": True, "StartedAt": ts(0)},
+        "HostConfig": {"NetworkMode": "bridge"},
+        "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8080"}]}},
+        "Mounts": [{"Source": "/fixture/checkpoint", "Destination": "/checkpoints/model", "RW": False}],
+    }
+    binding = g.container_binding(inspected, "127.0.0.1:8080", "/checkpoints/model")
+    assert binding["image_digest"] == inspected["Image"]
+    for field in ("port", "mount", "network", "running"):
+        changed = copy.deepcopy(inspected)
+        if field == "port":
+            changed["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostIp"] = "0.0.0.0"
+        elif field == "mount":
+            changed["Mounts"][0]["RW"] = True
+        elif field == "network":
+            changed["HostConfig"]["NetworkMode"] = "host"
+        else:
+            changed["State"]["Running"] = False
+        with pytest.raises(ValueError):
+            g.container_binding(changed, "127.0.0.1:8080", "/checkpoints/model")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("device", "cpu"), ("parameter_dtypes", ["torch.float32"]),
+    ("compute_dtypes", ["torch.float64"]), ("attention", ["flash_attention_2"]),
+    ("source", {"sha256": "a" * 64}), ("packages", {"torch": "changed"}),
+    ("effective_configuration", {"letter_box_transform": False}),
+    ("serving_seed_policy", {"mode": "fixed", "seed": 999}),
+])
+def test_measured_operational_profile_mismatch_cannot_release(tmp_path, field, value):
+    identity, lock, pairs = fixture_workspace(tmp_path, lambda p: p.update({field: value}))
+    complete_offline(tmp_path, identity, lock, pairs)
+    with pytest.raises(ValueError, match="operational|serving|measured"):
+        api().validate_release_evidence(api().Evidence(tmp_path, test_only=True))
+
+
+def test_old_preflight_cannot_be_revived_by_fresh_host_timestamp(tmp_path):
+    live_ref, rv = approved(tmp_path)
+    rv["host"]["checked_at"] = ts(200)
+    with pytest.raises(ValueError):
+        api().assert_live_release(api().Evidence(tmp_path, test_only=True), live_ref,
+                                 expected_stage="live", runtime=rv,
+                                 current_calibration_sha256=digest("calibration"), now=ts(201))
+
+
+def test_complete_predecessor_requires_historical_semantic_validation(tmp_path):
+    live_ref, rv = approved(tmp_path)
+    rewrite(tmp_path, live_ref["path"], lambda d: d.update(
+        host={}, request={}, approval=None, attestation={}, attestation_sha256=digest({}),
+    ))
+    malformed = api().Evidence(tmp_path, test_only=True).reference(live_ref["path"])
+    events = []
+    with pytest.raises((ValueError, KeyError)):
+        run_ref, current = preflight(tmp_path, "run", 40, previous=malformed, reason="Construction")
+        api().assert_live_release(api().Evidence(tmp_path, test_only=True), run_ref,
+                                 expected_stage="run", runtime=current,
+                                 current_calibration_sha256=digest("calibration"), now=ts(43))
+        events.append("construct")
+    assert events == []

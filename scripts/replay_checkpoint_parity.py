@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -117,6 +118,12 @@ def run_worker(args, backend, purpose, image, cases, schedule_file="tracer-sched
     if destination.exists():
         raise FileExistsError(f"immutable worker evidence exists: {destination}")
     container_name = f"dume-replay-{label}-{os.getpid()}"
+    if getattr(args, "numerical", False) and purpose != "stock-capacity":
+        plan = read_json(contained(args.workspace, schedule_file))
+        plan["execution"] = {"id": uuid.uuid4().hex, "collection": "numerical-" + plan["kind"],
+                             "started_at": now(), "worker_manifest": output}
+        schedule_file = f"schedules/{label}-execution.json"
+        write_evidence(args.workspace, schedule_file, plan)
     argv = worker_argv(args, backend, purpose, image, output, container_name, schedule_file)
     expected_session = read_json(args.workspace / "session.json")["session_id"]
     input_lock = read_json(args.workspace / "input-lock.json")
@@ -171,6 +178,10 @@ def run_worker(args, backend, purpose, image, cases, schedule_file="tracer-sched
             launch["status"] = "failed"
             launch["validation_error"] = str(exc)
     launch["manifest"] = {"path": output, "sha256": sha256_file(destination)}
+    launch["instrument_files"] = instrument_identity()
+    launch["schedule"] = evidence_reference(args.workspace, contained(args.workspace, schedule_file))
+    launch_ref = write_evidence(args.workspace, f"launches/{label}.json", launch)
+    launch["reference"] = launch_ref
     print(json.dumps({"worker": label, "status": launch["status"], "exit_code": exit_code}), flush=True)
     return launch, report
 
@@ -289,23 +300,10 @@ def feasibility(args):
     return {"complete": 0, "failed": 1, "not_run": 2}[report["status"]]
 
 
-INSTRUMENT_FILES = (
-    "policy_guard/replay_contract.py", "policy_guard/parity_gate.py", "policy_guard/parity_report.py",
-    "policy_guard/groot_guard.py", "scripts/replay_checkpoint_parity.py",
-    "scripts/replay_upstream_parity.py", "scripts/replay_groot_native.py",
-    "docker/lerobot-policy/replay_checkpoint.py", "docker/lerobot-policy/server.py",
-    "policy/lerobot/features.py",
+from policy_guard.parity_gate import (
+    INSTRUMENT_FILES, assert_instrument, instrument_identity, numerical_execution_binding, repeatability_basis,
+    validate_bundle, validate_comparison, validate_numerical_worker, validate_offline_evidence,
 )
-
-
-def instrument_identity():
-    return {name: sha256_file(ROOT / name) for name in INSTRUMENT_FILES}
-
-
-def assert_instrument(ev):
-    if not ev.test_only:
-        require(ev.json("tolerance-proposal.json")["instrument_files"] == instrument_identity(),
-                "instrument changed: fresh repeatability and explicit agreement required")
 
 
 def project_preprocessing(inputs):
@@ -398,6 +396,9 @@ def numerical_worker(args):
             "numerical schedule subject changed")
     report = ReplayManifest(session=session_id, stage=args.profile,
                             input_fingerprint=lock["fingerprint"], expected_cases=schedule["cases"])
+    relative = str(args.schedule.resolve().relative_to(workspace.resolve()))
+    report.execution = numerical_execution_binding(schedule, ev.reference(relative), args.output_manifest)
+    require(timestamp(report.execution["started_at"]) <= timestamp(report.started_at), "worker precedes collection")
     start = time.perf_counter()
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -421,6 +422,7 @@ def numerical_worker(args):
             adapter = module.LeRobotReplay(args.checkpoint, args.profile, args.device)
         from policy_guard.parity_gate import process_identity
         report.resources["process_identity"] = process_identity()
+        report.resources["instrument_files"] = instrument_identity()
         identity = runtime_identity(args.backend, args.image_digest, lock)
         effective = configuration_value(adapter.effective_configuration())
         identity.update(effective_configuration=effective,
@@ -520,7 +522,7 @@ class FullWorkers:
             "preprocessing": preprocessing, "common_inputs": preprocessing,
             "common_collated": [item["tensors"] for item in collated],
             "independent_collated": [item["tensors"] for item in collated],
-            "collated": collated, "worker": launch["manifest"],
+            "collated": collated, "worker": launch["manifest"], "launch": launch["reference"],
         }
         bundle["reference"] = write_evidence(self.ev.workspace, f"bundles/{label}.json", bundle)
         return bundle
@@ -530,7 +532,9 @@ def _combined(ev, independent, common):
     from policy_guard.replay_contract import write_tensors
     arrays = dict(ev.tensors(common["tensors"]))
     arrays["decoded"] = ev.tensors(independent["tensors"])["decoded"]
-    return {**common, "preprocessing": independent["preprocessing"],
+    require(independent.get("reference") and common.get("reference"), "archived independent/common workers required")
+    return {**common, "provenance": {"independent": independent["reference"], "common": common["reference"]},
+            "preprocessing": independent["preprocessing"],
             "independent_collated": independent["independent_collated"],
             "tensors": write_tensors(ev.workspace, arrays)}
 
@@ -571,6 +575,8 @@ def full(workspace, *, workers=None, stock_check=None, started_at=None, clock=no
             left = _combined(ev, independent[pair[0]], lcommon)
             right = _combined(ev, independent[pair[1]], rcommon)
             comparison = compare_tiers(ev, name, left, right, started_at=comparison_start, ended_at=clock())
+            comparison["provenance"] = {"left": left["provenance"], "right": right["provenance"]}
+            validate_comparison(ev, comparison, report_start=start, report_end=comparison["ended_at"])
             report["comparisons"].append(comparison)
         report["status"] = "complete" if all(c["passed"] for c in report["comparisons"]) else "failed"
     except Exception as exc:
@@ -580,37 +586,19 @@ def full(workspace, *, workers=None, stock_check=None, started_at=None, clock=no
     report["archived_at"] = clock()
     report["parity_passed"] = report["status"] == "complete"
     report["caveats"] = ev.json("tolerance-proposal.json")["caveats"]
+    if report["status"] == "complete":
+        try:
+            validate_offline_evidence(ev, stock_check=stock_check, report=report)
+        except Exception as exc:
+            report["status"] = "not_run" if isinstance(exc, (FileNotFoundError, PrerequisiteError)) else "failed"
+            report["parity_passed"] = False
+            report["prerequisite_errors"].append({"type": type(exc).__name__, "message": str(exc)})
     write_evidence(ev.workspace, "offline-report.json", report)
     return report
 
 
 def check_offline(workspace, *, stock_check=None):
-    ev = evidence(workspace)
-    require(ev.test_only or stock_check is None, "fixture stock check forbidden")
-    report = ev.record("offline-report.json")
-    require(report.get("parity_passed") is True and report["agreement"] == ev.reference("tolerance-agreement.json") and isinstance(report.get("caveats"), list), "passing archive and exact agreement required")
-    require(timestamp(report["ended_at"]) <= timestamp(report["archived_at"]), "archive chronology mismatch")
-    validate_tolerance_agreement(ev, comparison_started_at=report["started_at"])
-    assert_instrument(ev)
-    from replay_upstream_parity import check as stock
-    (stock_check or stock)(ev)
-    require([c["name"] for c in report["comparisons"]] == list(COMPARISON_PROFILES),
-            "all four complete comparisons required")
-    for stored in report["comparisons"]:
-        require(timestamp(report["started_at"]) <= timestamp(stored["started_at"]) <= timestamp(stored["ended_at"]) <= timestamp(report["ended_at"]), "comparison archive chronology mismatch")
-        bundles = []
-        for side, profile in zip(("left", "right"), stored["profiles"], strict=True):
-            bundles.append({
-                "cases": stored["cases"], "profile": profile,
-                "input_fingerprint": ev.identity()["input_fingerprint"],
-                "joint_order": stored["joint_order"], "camera_order": stored["camera_order"],
-                "tensors": stored[side], **{field: [row[side] for row in stored[field]]
-                                           for field in ("preprocessing", "independent_collated", "common_inputs", "common_collated")},
-            })
-        actual = compare_tiers(ev, stored["name"], *bundles,
-                               started_at=stored["started_at"], ended_at=stored["ended_at"], matrix_reference=stored["matrix"])
-        require(actual == stored and actual["passed"], "archived numerical verdict/metrics differ")
-    return report
+    return validate_offline_evidence(workspace, stock_check=stock_check)
 
 
 def repeatability(args):
@@ -653,19 +641,23 @@ def reduce_repeatability(workspace, collection):
                     if item["backend"] == backend and item["purpose"] == purpose]
         require(len(launches) == len(schedule["groups"]), "repeatability process groups incomplete")
         bound = next(p["observed"] for p in profiles if p["backend"] == backend and p["purpose"] == purpose)
-        values, groups, worker_refs = [], [], []
+        values, groups, worker_refs, launch_refs = [], [], [], []
         raw_max, preprocessing_max = 0.0, 0.0
         all_arrays = []
         starts, ends = [], []
         for launch, group in zip(launches, schedule["groups"], strict=True):
             require(launch["exit_code"] == 0 and launch["status"] == "complete", "repeatability worker failed")
-            worker = ev.json(launch["manifest"])
+            validated = validate_numerical_worker(
+                ev, {"worker": launch["manifest"], "launch": launch["reference"]}, name,
+                group["cases"], kind="repeatability", start=collection["started_at"], end=collection["ended_at"])
+            worker = validated["worker"]
             require(worker["executed_cases"] == group["cases"], "repeatability worker coverage changed")
             require(profile_configuration(worker["profile"]) == profile_configuration(bound),
                     "repeatability profile differs from fresh feasibility")
             process_id = worker["resources"]["process_identity"]
             groups.append({"id": group["id"], "cases": group["cases"], "process_id": fingerprint_configuration(process_id)})
             worker_refs.append(launch["manifest"])
+            launch_refs.append(launch["reference"])
             starts.append(worker["started_at"])
             ends.append(worker["ended_at"])
             for case in worker["cases"]:
@@ -695,7 +687,7 @@ def reduce_repeatability(workspace, collection):
         stats = metrics(joint_deviations(np.stack(reference), np.stack(paired)))
         report["measurements"].append({
             "profile": name, "cases": expected, "groups": groups,
-            "started_at": min(starts), "ended_at": max(ends), "workers": worker_refs,
+            "started_at": min(starts), "ended_at": max(ends), "workers": worker_refs, "launches": launch_refs,
             "tensors": write_tensors(ev.workspace, stacked),
             "statistics": {key: value.tolist() for key, value in stats.items()},
             "raw_max_abs": raw_max, "preprocessing_max_abs": preprocessing_max,
@@ -703,6 +695,9 @@ def reduce_repeatability(workspace, collection):
             "seed_policy": bound.get("serving_seed_policy", {"mode": "native_ambient"}),
             "replay_intervention": "seed at actual sampling boundary; distinct from deployed seed behavior",
         })
+    for measured in report["measurements"]:
+        basis = repeatability_basis(ev, measured, report)
+        require(all(measured[key] == value for key, value in basis.items()), "repeatability reduction differs")
     return report
 
 

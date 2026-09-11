@@ -9,14 +9,22 @@ Stage schema (v1), shared with the future numerical/golden/runner producers:
   profiles_fingerprint (canonical digest of profiles.json), with UTC start/end.
 * profiles.json retains Plan 01's list of observed profiles; Plan 04 adds the
   measured ``serving_configuration`` from the arm-free attestation.
-* repeatability.json adds the exact repeatability_schedule, and four measurements
-  with ordered cases, explicit process groups, decoded/noise numeric tensors.
+* repeatability.json adds the exact repeatability_schedule and four measurements.
+  Each binds immutable worker/launch references, ordered durable case captures,
+  actual process identities, current instrument hashes and decoded/noise tensors.
+  All statistics, raw maxima and preprocessing maxima are independently recomputed.
 * tolerance-proposal.json defines COMPARISON_PROFILES, thresholds, noise policies,
   six units, trace/aggregate OLS definitions, harness pins and measured basis.
 * offline-report.json holds four comparisons. Each has ordered 600 cases, full
   raw/noise/decoded tensor references, independent preprocessing and common-input
   references per case, actual metrics, start/end and the agreement reference.
+  Independent/common bundle references retain worker/launch/schedule provenance;
+  aggregates and the signed matrix are reconstructed from case captures.
   Tensor axes are (case, 40, 132) and (case, 16, 6); no shared-prefix slicing.
+* validate_offline_evidence and validate_upstream_evidence are the only numerical
+  acceptance paths, shared by CLI checks and validate_release_evidence. Stock
+  acceptance includes positive producer output, JUnit, collection/runtime coverage,
+  observed controls, actual inputs/noise, launches and the full raw boundary.
 * golden candidate/replays bind native-operational, the exact 600 cases and
   raw/noise/decoded tensors. Replays link the exact candidate AND decision.
 * decisions are DecisionRecord extensions, archived by canonical content digest
@@ -31,7 +39,9 @@ sufficient: coverage, numerical witnesses, identities and chronology are checked
 
 from __future__ import annotations
 
+import ast
 import hashlib
+from xml.etree import ElementTree
 import math
 import os
 import re
@@ -47,7 +57,7 @@ from policy_guard.replay_contract import (
     CAMERA_ORDER, JOINT_ORDER, MAX_JSON, DecisionRecord, PrerequisiteError,
     canonical, capture_bytes, contained, fingerprint_configuration, load_numeric,
     now as utc_now, read_json, repeatability_schedule, validate_profile,
-    validate_schedule, write_evidence,
+    validate_schedule, write_evidence, write_tensors, profile_configuration,
 )
 
 COMPARISON_PROFILES = {
@@ -231,6 +241,7 @@ def validate_repeatability(workspace):
     if "repeatability" in ev._validated:
         return ev._validated["repeatability"]
     record = ev.record("repeatability.json")
+    require(record.get("instrument_files") == instrument_identity(), "repeatability instrument became stale")
     schedule = repeatability_schedule(ev.json("input-lock.json"))
     require(record.get("schedule") == schedule, "repeatability schedule was not preregistered exactly")
     keys = [key for group in schedule["groups"] for key in group["cases"]]
@@ -247,6 +258,9 @@ def validate_repeatability(workspace):
         require(len(set(process_ids)) == len(process_ids), "cold repeat must run in a new process")
         require(timestamp(record["started_at"]) <= timestamp(measured["started_at"]) <=
                 timestamp(measured["ended_at"]) <= timestamp(record["ended_at"]), "repeatability chronology mismatch")
+        basis = repeatability_basis(ev, measured, record)
+        require(all(measured.get(key) == value for key, value in basis.items()),
+                "reported repeatability statistics differ from validated captures")
         arrays = ev.tensors(measured["tensors"])
         require(set(arrays) == {"decoded", "noise"}, "repeatability must contain actual decoded actions and noise")
         for name, shape in (("decoded", (len(keys), 16, 6)), ("noise", (len(keys), 40, 132))):
@@ -261,6 +275,12 @@ def validate_repeatability(workspace):
                 if name == "noise":
                     require(all(np.array_equal(arrays[name][same[0]], arrays[name][i]) for i in same),
                             "same seed did not reproduce actual noise")
+    process_ids = [g["process_id"] for m in measurements for g in m["groups"]]
+    require(len(set(process_ids)) == len(process_ids), "repeatability reused a process across profiles")
+    launches = [ev.json(ref) for m in measurements for ref in m["launches"]]
+    for before, after in zip(launches, launches[1:]):
+        require(timestamp(before["ended_at"]) <= timestamp(after["started_at"]),
+                "repeatability processes overlap or changed preregistered order")
     ev._validated["repeatability"] = record
     return record
 
@@ -269,6 +289,7 @@ def validate_tolerance_proposal(workspace):
     ev = evidence(workspace)
     proposal = ev.record("tolerance-proposal.json")
     repeat = validate_repeatability(ev)
+    assert_instrument(ev)
     require(proposal["repeatability"] == ev.reference("repeatability.json"), "repeatability subject changed")
     require(timestamp(repeat["ended_at"]) <= timestamp(proposal["started_at"]), "proposal precedes repeatability")
     harness = proposal["harness"]
@@ -435,51 +456,6 @@ def _metrics(delta):
     }
 
 
-def _comparison(ev, record, proposal, agreement):
-    name = record["name"]
-    rule = proposal["comparisons"][name]
-    require(record["profiles"] == rule["profiles"], "report comparison profiles mismatch")
-    require(timestamp(agreement["decided_at"]) < timestamp(record["started_at"]) <= timestamp(record["ended_at"]),
-            "comparison chronology must start after agreement")
-    _coverage(ev, record)
-    require(record["joint_order"] == list(JOINT_ORDER), "report joint ordering mismatch")
-    left, right = _tensor_contract(ev, record["left"], 600), _tensor_contract(ev, record["right"], 600)
-    _preprocessing(ev, record["preprocessing"], record["cases"], rule["thresholds"]["preprocessing"])
-    _preprocessing(ev, record["common_inputs"], record["cases"], rule["thresholds"]["preprocessing"], exact=True)
-    _allclose(left["raw"], right["raw"], rule["thresholds"]["raw"], "raw")
-    if rule["noise_policy"] == "exact":
-        require(np.array_equal(left["noise"], right["noise"]), "actual fp32 sampler noise differs")
-    actual = _metrics(right["decoded"].astype(np.float64) - left["decoded"].astype(np.float64))
-    require(set(record["metrics"]) == set(actual), "complete signed bias and trend metrics required")
-    for key, values in actual.items():
-        recorded = np.asarray(record["metrics"][key], dtype=np.float64)
-        require(recorded.shape == values.shape and np.array_equal(recorded, values), f"reported metric differs: {key}")
-    for key in ("max_abs", "mean_abs", "bias", "slope"):
-        require(np.all(np.abs(actual[key]) <= np.asarray(rule["thresholds"]["decoded"][key])), f"decoded {key} threshold failed")
-    for key, bound in (("trace_bias_max_abs", "bias"), ("trace_slope_max_abs", "slope")):
-        require(np.all(actual[key] <= np.asarray(rule["thresholds"]["decoded"][bound])), f"per-trace {bound} threshold failed")
-    require(record.get("passed") is True, "comparison verdict is not passing")
-
-
-def _upstream(ev, reference, proposal, agreement):
-    result = ev.record(reference)
-    require(result["agreement"] == ev.reference("tolerance-agreement.json"), "upstream agreement mismatch")
-    require(result["harness"] == proposal["harness"], "upstream source pins changed")
-    require(timestamp(agreement["decided_at"]) < timestamp(result["started_at"]), "upstream started before agreement")
-    require(result["seed"] == 42 and result["tag"] == "new_embodiment", "wrong stock seed/embodiment")
-    require(result["checkpoint_fingerprint"] == ev.json("input-lock.json")["checkpoint_fingerprint"], "wrong stock checkpoint")
-    require(type(result["producer_exit"]) is int and result["producer_exit"] == 0 and
-            type(result["consumer_exit"]) is int and result["consumer_exit"] == 0, "stock harness did not execute successfully")
-    require(result["tests"] == [{"name": "new_embodiment", "outcome": "passed"}],
-            "stock consumer requires exactly one expected passed case; no skips/xfails")
-    left, right = ev.tensors(result["left"]), ev.tensors(result["right"])
-    require(set(left) == set(right) == {"raw"} and left["raw"].shape == right["raw"].shape == (2, 40, 132),
-            "stock full pre-crop raw boundary required")
-    require(left["raw"].dtype == right["raw"].dtype == np.float32, "stock raw witness must remain fp32")
-    _allclose(left["raw"], right["raw"], proposal["comparisons"]["diagnostic"]["thresholds"]["raw"], "stock raw")
-    return result
-
-
 def _golden_replay(ev, name):
     record = ev.record(name)
     approval = validate_golden_approval(ev)
@@ -557,20 +533,7 @@ def validate_release_evidence(workspace):
     ev = evidence(workspace)
     if "release" in ev._validated:
         return ev._validated["release"]
-    report = ev.record("offline-report.json")
-    agreement = validate_tolerance_agreement(ev, comparison_started_at=report["started_at"])
-    proposal = ev.json("tolerance-proposal.json")
-    require(report["agreement"] == ev.reference("tolerance-agreement.json"), "report agreement identity mismatch")
-    require([c["name"] for c in report["comparisons"]] == list(COMPARISON_PROFILES), "complete ordered tier/bridge comparisons required")
-    for comparison in report["comparisons"]:
-        _comparison(ev, comparison, proposal, agreement)
-        require(timestamp(report["started_at"]) <= timestamp(comparison["started_at"]) <=
-                timestamp(comparison["ended_at"]) <= timestamp(report["ended_at"]), "comparison/report chronology mismatch")
-    upstream = _upstream(ev, report["upstream"], proposal, agreement)
-    require(report["upstream"] == ev.reference("upstream-result.json"), "exact upstream archive required")
-    require(timestamp(upstream["ended_at"]) <= timestamp(report["ended_at"]) <= timestamp(report["archived_at"]),
-            "report archive chronology mismatch")
-    require(report.get("parity_passed") is True and isinstance(report.get("caveats"), list), "passing archived report and caveats required")
+    report = validate_offline_evidence(ev)
     _golden_replay(ev, "golden-replay.json")
     calibration, calibration_ref = _calibration(ev)
     sem = ev.json("profiles.json").get("serving_configuration")
@@ -981,10 +944,38 @@ def assert_live_release(workspace, preflight, *, expected_stage, runtime,
     return record
 
 
+def validate_run_safety_journal(run):
+    events = run.get("events")
+    require(isinstance(events, list) and bool(events), "operation journal missing")
+    previous, stops = None, []
+    for index, entry in enumerate(events):
+        require(isinstance(entry, dict), "invalid operation journal entry")
+        event = dict(entry)
+        checksum = event.pop("sha256", None)
+        require(type(event.get("index")) is int and event["index"] == index and
+                event.get("previous") == previous and fingerprint_configuration(event) == checksum,
+                "operation journal changed")
+        require(event.get("kind") in ("dispatch", "returned", "stop"), "unknown operation journal event")
+        if event["kind"] == "stop":
+            require(type(event.get("clamp")) is bool, "invalid journal clamp flag")
+            text(event.get("reason"), "journal stop reason")
+            stops.append(entry)
+        previous = checksum
+    require(run.get("stop_events") == stops, "journal stop_events disagree")
+    clamps = sum(event["clamp"] for event in stops)
+    require(type(run.get("safety_stop")) is bool and run["safety_stop"] == bool(stops) and
+            type(run.get("clamp_warnings")) is int and run["clamp_warnings"] == clamps and
+            run.get("stop_reason") == (stops[0]["reason"] if stops else ""),
+            "journal safety summary disagrees")
+    require(not stops and clamps == 0, "journal safety event overrides score")
+
+
+
 def validate_closeout(workspace):
     ev = evidence(workspace)
     validate_live_approval(ev)
     run = ev.record("live-run.json")
+    validate_run_safety_journal(run)
     require(run["approval"] == ev.reference("live-approval.json"), "run approval mismatch")
     require(run["safety_stop"] is False and type(run["clamp_warnings"]) is int and run["clamp_warnings"] == 0,
             "safety event overrides score")
@@ -1019,3 +1010,647 @@ def validate_closeout(workspace):
             timestamp(run["ended_at"]) < timestamp(final["started_at"]), "final full native regression must follow this run")
     return {**ev.identity(), "schema_version": 1, "status": "complete",
             "live_run": ev.reference("live-run.json"), "final_regression": ev.reference("final-regression.json")}
+
+
+HARNESS_COMMIT = "7e241bd630a3719a56157a497ce5d08f244784f1"
+PRODUCER = "tests/policies/groot/utils/dump_original_n1_7.py"
+CONSUMER = "tests/policies/groot/test_groot_vs_original.py"
+CASE = "test_groot_get_action_parity[new_embodiment]"
+ARTIFACT = "original_n1_7_new_embodiment.npz"
+
+
+DTYPE_NAMES = ("torch.bfloat16", "torch.float32", "torch.float64", "torch.float16",
+               "torch.int64", "torch.int32", "torch.int16", "torch.int8", "torch.uint8", "torch.bool")
+
+def validate_coverage(cases, expected):
+    require(bool(expected) and cases == expected, "complete ordered case coverage required")
+    keys = [canonical(key) for key in cases]
+    require(len(set(keys)) == len(keys), "duplicate case identity")
+
+
+def _finite(values):
+    values = np.asarray(values)
+    require(values.dtype.kind in "biuf" and values.size > 0 and np.isfinite(values).all(),
+            "nonempty finite numeric arrays required")
+    return values
+
+
+def joint_deviations(left, right):
+    left, right = _finite(left), _finite(right)
+    require(left.shape == right.shape and left.ndim == 3 and left.shape[1:] == (16, 6),
+            "full decoded trace shape must be (case,16,6)")
+    return right.astype(np.float64) - left.astype(np.float64)
+
+
+def signed_bias(delta):
+    delta = _finite(delta)
+    require(delta.ndim == 3 and delta.shape[1:] == (16, 6), "full decoded delta required")
+    return delta.astype(np.float64).mean(axis=1)
+
+
+def chunk_index_slopes(delta):
+    delta = _finite(delta)
+    require(delta.ndim == 3 and delta.shape[1:] == (16, 6), "full decoded delta required")
+    indices = np.arange(16, dtype=np.float64) - 7.5
+    return np.einsum("ctj,t->cj", delta.astype(np.float64), indices) / np.dot(indices, indices)
+
+
+def metrics(delta):
+    """Same float64 definitions consumed independently by the release validator."""
+    delta = _finite(delta).astype(np.float64)
+    bias, slopes = signed_bias(delta), chunk_index_slopes(delta)
+    return {
+        "max_abs": np.abs(delta).max(axis=(0, 1)),
+        "mean_abs": np.abs(delta).mean(axis=(0, 1)),
+        "bias": bias.mean(axis=0), "slope": slopes.mean(axis=0),
+        "per_index_bias": delta.mean(axis=0),
+        "trace_bias_max_abs": np.abs(bias).max(axis=0),
+        "trace_slope_max_abs": np.abs(slopes).max(axis=0),
+    }
+
+
+def array_comparison(left, right, bounds, *, exact=False):
+    left, right = _finite(left), _finite(right)
+    require(left.shape == right.shape, "unequal full tensor shape")
+    require(left.dtype == right.dtype, "unequal serialized tensor dtype")
+    if exact or left.dtype.kind in "biu":
+        return bool(np.array_equal(left, right))
+    delta = np.abs(right.astype(np.float64) - left.astype(np.float64))
+    return bool(np.all(delta <= bounds["atol"] + bounds["rtol"] * np.abs(left.astype(np.float64))))
+
+
+def _rows(ev, left, right, keys, field, bounds):
+    require(len(left[field]) == len(right[field]) == len(keys), f"partial {field} coverage")
+    rows, failures, checked = [], [], {}
+    for index, (key, lref, rref) in enumerate(zip(keys, left[field], right[field], strict=True)):
+        row = {"key": key, "left": lref, "right": rref}
+        rows.append(row)
+        cache = fingerprint_configuration([lref, rref])
+        if cache not in checked:
+            lvalues, rvalues = ev.tensors(lref), ev.tensors(rref)
+            require(set(lvalues) == set(rvalues), f"{field}: different input keys")
+            if field in ("preprocessing", "common_inputs"):
+                require(set(lvalues) == PREPROCESSING_KEYS, f"{field}: incomplete preprocessing witness")
+            else:
+                require(bool(lvalues), "empty full collated input witness")
+            passed = True
+            for name in lvalues:
+                if name in ("tokens", "mask"):
+                    require(lvalues[name].dtype.kind in "biu", "tokens/masks must be exact integers")
+                passed &= array_comparison(lvalues[name], rvalues[name], bounds,
+                                           exact=field in ("common_inputs", "common_collated"))
+            checked[cache] = passed
+        if not checked[cache]:
+            failures.append(f"{field}[{index}]")
+    return rows, failures
+
+
+def _bundle(ev, bundle, profile, schedule):
+    validate_coverage(bundle["cases"], schedule)
+    require(bundle["profile"] == profile, "comparison profile mismatch")
+    require(bundle["input_fingerprint"] == ev.identity()["input_fingerprint"], "input identity mismatch")
+    require(bundle["joint_order"] == list(JOINT_ORDER), "joint ordering mismatch")
+    require(bundle["camera_order"] == list(CAMERA_ORDER), "camera ordering mismatch")
+    arrays = ev.tensors(bundle["tensors"])
+    require(set(arrays) == {"raw", "noise", "decoded"}, "raw/noise/decoded witnesses required")
+    for name, shape in (("raw", (600, 40, 132)), ("noise", (600, 40, 132)), ("decoded", (600, 16, 6))):
+        require(arrays[name].shape == shape and arrays[name].dtype == np.float32,
+                f"full {name} shape/dtype required")
+        _finite(arrays[name])
+    return arrays
+
+
+def compare_tiers(workspace, name, left, right, *, started_at, ended_at, matrix_reference=None):
+    """Emit discriminating metrics even on numerical failure; structural faults raise."""
+    ev = evidence(workspace)
+    agreement = validate_tolerance_agreement(ev, comparison_started_at=started_at)
+    proposal = validate_tolerance_proposal(ev)
+    require(timestamp(started_at) <= timestamp(ended_at), "comparison chronology reversed")
+    require(name in COMPARISON_PROFILES, "unknown comparison")
+    rule = proposal["comparisons"][name]
+    profiles = {p["backend"] + "-" + p["purpose"]: p["observed"] for p in ev.json("profiles.json")["profiles"] if p["purpose"] != "stock-capacity"}
+    if name == "diagnostic":
+        for key in ("device", "rng_algorithm", "noise_dtype", "noise_shape"):
+            require(profiles[rule["profiles"][0]][key] == profiles[rule["profiles"][1]][key], "diagnostic actual sampler controls differ")
+    schedule = ev.json("input-lock.json")["schedule"]
+    validate_schedule(ev.json("input-lock.json"), schedule, "replay")
+    la = _bundle(ev, left, rule["profiles"][0], schedule)
+    ra = _bundle(ev, right, rule["profiles"][1], schedule)
+    rows, failures = {}, []
+    for field in ("preprocessing", "independent_collated", "common_inputs", "common_collated"):
+        rows[field], issues = _rows(ev, left, right, schedule, field, rule["thresholds"]["preprocessing"])
+        failures.extend(issues)
+    if not array_comparison(la["raw"], ra["raw"], rule["thresholds"]["raw"]):
+        failures.append("raw")
+    noise_equal = bool(np.array_equal(la["noise"], ra["noise"]))
+    if rule["noise_policy"] == "exact" and not noise_equal:
+        failures.append("noise")
+    delta = joint_deviations(la["decoded"], ra["decoded"])
+    actual = metrics(delta)
+    for metric in ("max_abs", "mean_abs", "bias", "slope"):
+        if np.any(np.abs(actual[metric]) > rule["thresholds"]["decoded"][metric]):
+            failures.append("decoded." + metric)
+    for metric, bound in (("trace_bias_max_abs", "bias"), ("trace_slope_max_abs", "slope")):
+        if np.any(actual[metric] > rule["thresholds"]["decoded"][bound]):
+            failures.append("decoded.trace_" + bound)
+    matrix_values = {
+        "delta": delta, "trace_bias": signed_bias(delta), "trace_slope": chunk_index_slopes(delta),
+        "trace_max_abs": np.abs(delta).max(axis=1), "trace_mean_abs": np.abs(delta).mean(axis=1),
+    }
+    if matrix_reference is None:
+        matrix = write_tensors(ev.workspace, matrix_values)
+    else:
+        saved = ev.tensors(matrix_reference)
+        require(set(saved) == set(matrix_values) and all(np.array_equal(saved[k], v) for k, v in matrix_values.items()), "archived signed matrix differs")
+        matrix = matrix_reference
+    return {
+        "name": name, "profiles": rule["profiles"], "cases": schedule,
+        "started_at": started_at, "ended_at": ended_at,
+        "agreement": ev.reference("tolerance-agreement.json"),
+        "agreement_decided_at": agreement["decided_at"],
+        "joint_order": list(JOINT_ORDER), "camera_order": list(CAMERA_ORDER),
+        "left": left["tensors"], "right": right["tensors"], **rows,
+        "metrics": {key: value.tolist() for key, value in actual.items()},
+        "matrix": matrix, "units": proposal["units"],
+        "slope_units": [unit + "/action_index" for unit in proposal["units"]],
+        "axes": ["record_seed_repeat", "chunk_index_0..15", "joint"],
+        "delta_definition": "right-minus-left", "aggregation": proposal["aggregation"],
+        "thresholds": rule["thresholds"], "passed": not failures, "failures": failures,
+        "noise": {"policy": rule["noise_policy"], "equal": noise_equal,
+                  "matched_seed_proves_equal_noise": False,
+                  "profiles": [{key: profiles[p][key] for key in ("device", "rng_algorithm", "noise_dtype", "noise_shape")} for p in rule["profiles"]],
+                  "treatment": rule["rationale"]},
+        "caveats": proposal["caveats"],
+    }
+
+
+# The dependency direction is producers -> gate -> replay_contract. No validator
+# imports an executable producer, a controller, torch, or a model adapter.
+INSTRUMENT_FILES = (
+    "policy_guard/replay_contract.py", "policy_guard/parity_gate.py", "policy_guard/parity_report.py",
+    "policy_guard/groot_guard.py", "scripts/replay_checkpoint_parity.py",
+    "scripts/replay_upstream_parity.py", "scripts/replay_groot_native.py",
+    "docker/lerobot-policy/replay_checkpoint.py", "docker/lerobot-policy/server.py",
+    "policy/lerobot/features.py",
+)
+WORKER_SOURCE_FILES = tuple(name for name in INSTRUMENT_FILES if name not in (
+    "policy_guard/parity_gate.py", "policy_guard/parity_report.py", "scripts/replay_upstream_parity.py",
+))
+
+
+def instrument_identity():
+    root = Path(__file__).resolve().parents[1]
+    return {name: hashlib.sha256(capture_bytes(root / name)).hexdigest() for name in INSTRUMENT_FILES}
+
+
+def assert_instrument(workspace):
+    ev = evidence(workspace)
+    require(ev.json("tolerance-proposal.json").get("instrument_files") == instrument_identity(),
+            "instrument changed: fresh repeatability and explicit agreement required")
+
+
+def _within(start, end, outer_start, outer_end, label):
+    require(timestamp(outer_start) <= timestamp(start) <= timestamp(end) <= timestamp(outer_end),
+            label + " chronology mismatch")
+
+
+def _profile(ev, name):
+    return next(p["observed"] for p in ev.json("profiles.json")["profiles"]
+                if p["backend"] + "-" + p["purpose"] == name)
+
+
+def _same_arrays(left, right, label):
+    require(set(left) == set(right) and bool(left), label + " keys differ")
+    for key in left:
+        require(array_comparison(left[key], right[key], {}, exact=True), label + " bytes differ: " + key)
+
+
+def numerical_execution_binding(plan, schedule_reference, worker_manifest):
+    """Bind numerical collection metadata to the shared execute_cases schema."""
+    value = plan.get("execution")
+    require(isinstance(value, dict) and set(value) == {"id", "collection", "started_at", "worker_manifest"},
+            "complete numerical execution binding required")
+    require(isinstance(value["id"], str) and re.fullmatch(r"[0-9a-f]{32}", value["id"]),
+            "invalid numerical execution identity")
+    require(plan["kind"] in ("tracer", "repeatability", "replay") and
+            value["collection"] == "numerical-" + plan["kind"] and value["worker_manifest"] == worker_manifest,
+            "numerical execution collection/destination mismatch")
+    require(set(schedule_reference) == {"path", "sha256"}, "execution schedule reference missing")
+    sha(schedule_reference["sha256"])
+    timestamp(value["started_at"])
+    return {**value, "schedule": schedule_reference}
+
+
+def validate_numerical_worker(workspace, proof, name, cases, *, kind, start, end, common_from=None):
+    """Validate launch -> immutable worker -> immutable cases before reducing.
+
+    ``proof`` has exactly worker and launch file/hash references. Launches also
+    bind the schedule, current instrument and log. Test fixtures use this same
+    schema and validation; only the required evidence_kind differs.
+    """
+    ev = evidence(workspace)
+    require(set(proof) == {"worker", "launch"}, "worker and launch provenance required")
+    cache_key = ("numerical-worker", fingerprint_configuration([proof, name, cases, kind, common_from]))
+    if cache_key in ev._validated:
+        result = ev._validated[cache_key]
+        _within(result["launch"]["started_at"], result["launch"]["ended_at"], start, end, "worker launch")
+        return result
+    worker, launch = ev.json(proof["worker"]), ev.json(proof["launch"])
+    profile = _profile(ev, name)
+    backend, purpose = name.split("-")
+    identity = ev.identity()
+    instrument = instrument_identity()
+    require(launch["manifest"] == proof["worker"] and launch["status"] == "complete" and
+            type(launch["exit_code"]) is int and launch["exit_code"] == 0, "worker launch failed or changed")
+    require(launch["backend"] == backend and launch["purpose"] == purpose, "worker launch profile mismatch")
+    require(launch["instrument_files"] == instrument and
+            worker["resources"]["instrument_files"] == instrument, "worker instrument became stale")
+    ev.bytes(launch["log"]["path"], launch["log"]["sha256"])
+    plan = ev.json(launch["schedule"])
+    require(plan["schema_version"] == 1 and plan["session"] == identity["session"] and
+            plan["input_fingerprint"] == identity["input_fingerprint"] and plan["kind"] == kind and
+            plan["cases"] == cases and plan.get("common_from") == common_from, "worker schedule provenance mismatch")
+    execution = numerical_execution_binding(plan, launch["schedule"], proof["worker"]["path"])
+    require(worker.get("execution") == execution, "worker execution differs from captured schedule")
+    require(timestamp(execution["started_at"]) <= timestamp(launch["started_at"]),
+            "execution collection postdates worker launch")
+    argv = launch["argv"]
+    require(argv[:2] == ["docker", "run"], "actual worker invocation required")
+    for flag, expected in (
+        ("--schedule", "/evidence/" + launch["schedule"]["path"]),
+        ("--backend", backend), ("--profile", purpose), ("--device", profile["device"]),
+        ("--image-digest", profile["image_digest"]), ("--checkpoint", "/inputs/checkpoint"),
+        ("--output-manifest", proof["worker"]["path"]),
+    ):
+        require(argv.count(flag) == 1 and argv[argv.index(flag) + 1] == expected, "worker argv differs: " + flag)
+    require(argv[argv.index("--entrypoint") + 2] == profile["image_digest"] and
+            "/replay/scripts/replay_checkpoint_parity.py" in argv and "_worker" in argv,
+            "wrong worker image or instrument entrypoint")
+    require(worker["schema_version"] == 1 and worker["status"] == "complete" and
+            not worker.get("prerequisite_errors") and worker["stage"] == purpose and
+            worker["session"] == identity["session"] and worker["input_fingerprint"] == identity["input_fingerprint"] and
+            worker["evidence_kind"] == ("test_only" if ev.test_only else "real_model"),
+            "incomplete or foreign numerical worker")
+    require(worker["expected_cases"] == worker["executed_cases"] == cases and
+            [row["key"] for row in worker["cases"]] == cases, "worker case coverage differs")
+    validate_schedule(ev.json("input-lock.json"), cases, kind)
+    validate_profile(worker["profile"])
+    bound = fingerprint_configuration(profile_configuration(profile))
+    require(fingerprint_configuration(profile_configuration(worker["profile"])) == bound and
+            worker["configuration_fingerprint"] == bound and
+            fingerprint_configuration(worker["profile"]) == worker["profile_fingerprint"],
+            "worker actual profile differs from independently measured profile")
+    sources = {key: instrument[key] for key in WORKER_SOURCE_FILES}
+    require(worker["profile"]["owned_source_files"] == sources and
+            worker["profile"]["owned_source_fingerprint"] == fingerprint_configuration(sources),
+            "worker runtime source profile is stale")
+    _within(launch["started_at"], launch["ended_at"], start, end, "worker launch")
+    _within(worker["started_at"], worker["ended_at"], launch["started_at"], launch["ended_at"], "worker")
+    process = worker["resources"]["process_identity"]
+    require(set(process) == {"pid", "process_start_ticks", "process_started_at", "boot_id"},
+            "complete process identity required")
+    for key in ("pid", "process_start_ticks"):
+        require(type(process[key]) is int and process[key] > 0, "invalid process identity")
+    text(process["boot_id"], "boot identity")
+    # Linux btime is rounded to seconds; permit only that measurement resolution.
+    age = (timestamp(process["process_started_at"]) - timestamp(launch["started_at"])).total_seconds()
+    require(age >= -1 and timestamp(process["process_started_at"]) <= timestamp(worker["started_at"]),
+            "process identity predates launch or postdates worker")
+    locked = {r["file"]: r for r in ev.json("input-lock.json")["records"]}
+    captures = []
+    previous_case_end = worker["started_at"]
+    for index, case in enumerate(worker["cases"]):
+        require(case["evidence"]["path"] == f"workers/cases/{Path(proof['worker']['path']).stem}-{index:04d}.json",
+                "durable case belongs to a different worker stream")
+        saved = ev.json(case["evidence"])
+        require(case.get("execution") == execution, "durable case execution mismatch")
+        _within(case["started_at"], case["ended_at"], previous_case_end, worker["ended_at"], "case")
+        previous_case_end = case["ended_at"]
+        require(all(saved.get(k) == v for k, v in case.items() if k != "evidence"),
+                "durable case differs from manifest")
+        for key, expected in (
+            ("schema_version", 1), ("session", identity["session"]), ("stage", purpose),
+            ("input_fingerprint", identity["input_fingerprint"]), ("status", "complete"),
+            ("evidence_kind", worker["evidence_kind"]), ("error", None),
+        ):
+            require(saved.get(key) == expected, "durable case identity/status mismatch: " + key)
+        entry = locked[case["key"]["record"]]
+        require(case["record_sha256"] == entry["sha256"] and case["instruction"] == entry["instruction"] and
+                case["observer_inert"] is True, "case locked record/instruction/observer mismatch")
+        validate_profile(saved["profile"])
+        require(fingerprint_configuration(saved["profile"]) == case["profile_fingerprint"] and
+                fingerprint_configuration(profile_configuration(saved["profile"])) == bound,
+                "case actual profile differs")
+        arrays = ev.tensors(case["tensors"])
+        for key, shape in (("raw", (1, 40, 132)), ("noise", (1, 40, 132)), ("decoded", (16, 6))):
+            require(arrays[key].shape == shape and arrays[key].dtype == np.float32, "full captured " + key + " required")
+        pre = {k.removeprefix("preprocessing."): v for k, v in arrays.items() if k.startswith("preprocessing.")}
+        collated = {k.removeprefix("collated."): v for k, v in arrays.items() if k.startswith("collated.")}
+        require(set(pre) == PREPROCESSING_KEYS and bool(collated), "complete captured model inputs required")
+        dtype_names = {k.removeprefix("dtype.") for k in arrays if k.startswith("dtype.")}
+        require(dtype_names == set(collated), "captured original input dtypes required")
+        for key in collated:
+            value = arrays["dtype." + key]
+            require(value.shape == () and value.dtype.kind in "iu" and 0 <= int(value) < len(DTYPE_NAMES),
+                    "invalid captured original dtype")
+        require(pre["tokens"].dtype.kind in "biu" and pre["mask"].dtype.kind in "biu", "categorical input dtype")
+        captures.append(arrays)
+    result = {"worker": worker, "launch": launch, "captures": captures, "process_id": fingerprint_configuration(process)}
+    ev._validated[cache_key] = result
+    return result
+
+
+def repeatability_basis(workspace, measured, record):
+    """Derive ALL proposal statistics and aggregates from validated case captures."""
+    ev = evidence(workspace)
+    groups = record["schedule"]["groups"]
+    require(len(measured["workers"]) == len(measured["launches"]) == len(groups), "repeatability workers missing")
+    captures, actual_groups, processes, starts, ends = [], [], [], [], []
+    previous_end = record["started_at"]
+    for group, worker_ref, launch_ref in zip(groups, measured["workers"], measured["launches"], strict=True):
+        result = validate_numerical_worker(ev, {"worker": worker_ref, "launch": launch_ref}, measured["profile"],
+                                          group["cases"], kind="repeatability",
+                                          start=previous_end, end=record["ended_at"])
+        worker, launch = result["worker"], result["launch"]
+        previous_end = launch["ended_at"]
+        starts.append(worker["started_at"])
+        ends.append(worker["ended_at"])
+        processes.append(result["process_id"])
+        actual_groups.append({"id": group["id"], "cases": group["cases"], "process_id": result["process_id"]})
+        captures.extend(result["captures"])
+    require(len(set(processes)) == len(processes), "cold repeat reused a process identity")
+    require(measured["groups"] == actual_groups and measured["started_at"] == min(starts) and
+            measured["ended_at"] == max(ends), "repeatability process/chronology claims differ")
+    keys = [key for group in groups for key in group["cases"]]
+    stacked = {"decoded": np.stack([row["decoded"] for row in captures]),
+               "noise": np.concatenate([row["noise"] for row in captures])}
+    _same_arrays(ev.tensors(measured["tensors"]), stacked, "repeatability aggregate")
+    deltas, raw_max, pre_max = [], 0., 0.
+    for record_name in dict.fromkeys(key["record"] for key in keys):
+        same = [i for i, key in enumerate(keys) if key["record"] == record_name and key["mode"] != "changed"]
+        first = captures[same[0]]
+        for i in same[1:]:
+            current = captures[i]
+            deltas.append(current["decoded"].astype(np.float64) - first["decoded"].astype(np.float64))
+            raw_max = max(raw_max, float(np.abs(current["raw"].astype(np.float64) - first["raw"]).max()))
+            for key in PREPROCESSING_KEYS:
+                a, b = first["preprocessing." + key], current["preprocessing." + key]
+                require(a.shape == b.shape and a.dtype == b.dtype, "repeatability preprocessing shape/dtype differs")
+                if a.dtype.kind in "biu":
+                    require(np.array_equal(a, b), "same-seed categorical preprocessing differs")
+                else:
+                    pre_max = max(pre_max, float(np.abs(b.astype(np.float64) - a).max()))
+    return {"statistics": {k: v.tolist() for k, v in _metrics(np.stack(deltas)).items()},
+            "raw_max_abs": raw_max, "preprocessing_max_abs": pre_max}
+
+
+def validate_bundle(workspace, reference, name, *, start, end, common_from=None):
+    ev = evidence(workspace)
+    cache_key = ("numerical-bundle", fingerprint_configuration([reference, name, common_from]))
+    if cache_key in ev._validated:
+        bundle, result = ev._validated[cache_key]
+        _within(result["launch"]["started_at"], result["launch"]["ended_at"], start, end, "worker launch")
+        return bundle, result
+    bundle = ev.json(reference)
+    schedule = ev.json("input-lock.json")["schedule"]
+    aggregate = _bundle(ev, bundle, name, schedule)
+    proof = {"worker": bundle["worker"], "launch": bundle["launch"]}
+    result = validate_numerical_worker(ev, proof, name, schedule, kind="replay", start=start, end=end,
+                                      common_from=common_from)
+    captures = result["captures"]
+    for key in ("raw", "noise", "decoded"):
+        values = np.stack([row[key][0] if key != "decoded" else row[key] for row in captures])
+        require(array_comparison(aggregate[key], values, {}, exact=True), "bundle aggregate differs from cases: " + key)
+    require(len(bundle["collated"]) == len(schedule), "bundle collated coverage missing")
+    for field, prefix in (("preprocessing", "preprocessing."), ("common_inputs", "preprocessing."),
+                          ("independent_collated", "collated."), ("common_collated", "collated.")):
+        require(len(bundle[field]) == len(schedule), "bundle input coverage differs")
+        checked = set()
+        for ref, arrays, case in zip(bundle[field], captures, result["worker"]["cases"], strict=True):
+            cache = (ref["sha256"], case["tensors"]["sha256"])
+            if cache in checked:
+                continue
+            checked.add(cache)
+            projected = {k.removeprefix(prefix): v for k, v in arrays.items() if k.startswith(prefix)}
+            _same_arrays(ev.tensors(ref), projected, "bundle " + field)
+    for item, ref, arrays in zip(bundle["collated"], bundle["independent_collated"], captures, strict=True):
+        require(item["tensors"] == ref and item["dtypes"] ==
+                {k.removeprefix("collated."): DTYPE_NAMES[int(arrays["dtype." + k.removeprefix("collated.")])]
+                 for k in arrays if k.startswith("collated.")}, "forwarded common input dtype/reference differs")
+    ev._validated[cache_key] = (bundle, result)
+    return bundle, result
+
+
+def validate_comparison(workspace, stored, *, report_start, report_end):
+    ev = evidence(workspace)
+    _within(stored["started_at"], stored["ended_at"], report_start, report_end, "comparison")
+    require(set(stored["provenance"]) == {"left", "right"}, "independent/common worker provenance missing")
+    bundles = []
+    proofs = stored["provenance"]
+    common_source = proofs["left"]["independent"]
+    workers = []
+    for side, profile in zip(("left", "right"), COMPARISON_PROFILES[stored["name"]], strict=True):
+        require(set(proofs[side]) == {"independent", "common"}, "both numerical passes required")
+        independent, first = validate_bundle(ev, proofs[side]["independent"], profile,
+                                            start=report_start, end=stored["started_at"])
+        common, second = validate_bundle(ev, proofs[side]["common"], profile, start=stored["started_at"],
+                                         end=stored["ended_at"], common_from=common_source)
+        workers.extend([first, second])
+        values = ev.tensors(stored[side])
+        expected = dict(ev.tensors(common["tensors"]))
+        expected["decoded"] = ev.tensors(independent["tensors"])["decoded"]
+        _same_arrays(values, expected, "comparison aggregate")
+        bundles.append({**common, "tensors": stored[side],
+                        "preprocessing": independent["preprocessing"],
+                        "independent_collated": independent["independent_collated"]})
+    require(len({item["process_id"] for item in workers}) == 4, "numerical passes reused process identity")
+    source = ev.json(common_source)
+    for bundle in bundles:
+        require(bundle["collated"] == source["collated"], "common pass did not forward exact captured model inputs")
+    actual = compare_tiers(ev, stored["name"], *bundles, started_at=stored["started_at"],
+                           ended_at=stored["ended_at"], matrix_reference=stored["matrix"])
+    actual["provenance"] = proofs
+    require(actual == stored and actual["passed"], "archived numerical verdict/metrics differ")
+    return workers
+
+
+def validate_offline_evidence(workspace, *, stock_check=None, report=None):
+    """Canonical numerical acceptance, used by CLI and physical release.
+
+    A fixture stock collaborator is allowed only on Evidence(test_only=True).
+    Physical release always calls this without a collaborator.
+    """
+    ev = evidence(workspace)
+    require(ev.test_only or stock_check is None, "fixture stock check forbidden")
+    if report is None:
+        report = ev.record("offline-report.json")
+    else:
+        require(report.get("schema_version") == 1 and report.get("status") == "complete" and
+                not report.get("prerequisite_errors") and report.get("evidence_kind") ==
+                ("test_only" if ev.test_only else "real_model"), "invalid prospective offline report")
+        require(all(report.get(k) == v for k, v in ev.identity().items()), "offline identity mismatch")
+        require(timestamp(report["started_at"]) <= timestamp(report["ended_at"]), "offline chronology reversed")
+    require(report.get("parity_passed") is True and
+            report["agreement"] == ev.reference("tolerance-agreement.json") and
+            isinstance(report.get("caveats"), list), "passing archive and exact agreement required")
+    require(report["instrument_files"] == instrument_identity(), "offline instrument became stale")
+    validate_tolerance_agreement(ev, comparison_started_at=report["started_at"])
+    require([c["name"] for c in report["comparisons"]] == list(COMPARISON_PROFILES),
+            "all four complete comparisons required")
+    if stock_check is None:
+        require(report["upstream"] == ev.reference("upstream-result.json"), "exact upstream archive required")
+        upstream = validate_upstream_evidence(ev)
+        require(timestamp(upstream["ended_at"]) <= timestamp(report["started_at"]), "stock must finish before full replay")
+    else:
+        stock_check(ev)
+    all_workers = {}
+    for stored in report["comparisons"]:
+        for result in validate_comparison(ev, stored, report_start=report["started_at"], report_end=report["ended_at"]):
+            ref = fingerprint_configuration(result["launch"]["manifest"])
+            all_workers[ref] = result
+    require(len(all_workers) == 12 and len({v["process_id"] for v in all_workers.values()}) == 12,
+            "four independent plus eight common-input worker runs required")
+    ordered = sorted(all_workers.values(), key=lambda v: timestamp(v["launch"]["started_at"]))
+    for before, after in zip(ordered, ordered[1:]):
+        require(timestamp(before["launch"]["ended_at"]) <= timestamp(after["launch"]["started_at"]),
+                "numerical worker processes overlap")
+    require(timestamp(report["ended_at"]) <= timestamp(report["archived_at"]), "archive chronology mismatch")
+    return report
+
+
+def validate_producer_output(output, exit_code):
+    require(type(exit_code) is int and exit_code == 0, "producer process failed")
+    require(not re.search(r"\[(?:fail|skip)\]|Skipped/failed", output), "producer per-tag failure")
+    summaries = re.findall(r"^Dumped (\d+) tags: (.+)$", output, re.MULTILINE)
+    require(len(summaries) == 1 and summaries[0][0] == "1" and
+            ast.literal_eval(summaries[0][1]) == ["new_embodiment"],
+            "producer must actually dump exactly new_embodiment")
+
+
+def parse_junit(data):
+    require(len(data) <= 4 * 1024 * 1024 and b"<!DOCTYPE" not in data and b"<!ENTITY" not in data,
+            "invalid/bounded JUnit required")
+    root = ElementTree.fromstring(data)
+    cases = root.findall(".//testcase")
+    require(len(cases) == 1 and cases[0].get("name") == CASE, "missing/extra/uncollected stock case")
+    case = cases[0]
+    require(not any(case.find(name) is not None for name in ("skipped", "failure", "error")),
+            "stock skip/xfail/failure/error is not passing coverage")
+    for prop in case.findall(".//property"):
+        require(prop.get("value") not in ("xpassed", "xfailed", "skipped"),
+                "unexpected stock pytest outcome")
+    for suite in root.iter("testsuite"):
+        for count in ("failures", "errors", "skipped"):
+            require(int(suite.get(count, 0)) == 0, "unsuccessful stock suite")
+    return [{"name": "new_embodiment", "outcome": "passed"}]
+
+
+def compare_raw(workspace, left, right, bounds):
+    ev = evidence(workspace)
+    la, ra = ev.tensors(left), ev.tensors(right)
+    require(set(la) == set(ra) == {"raw"}, "stock raw witness required")
+    require(la["raw"].shape == ra["raw"].shape == (2, 40, 132), "stock full pre-crop shape mismatch")
+    require(la["raw"].dtype == ra["raw"].dtype == np.float32, "stock raw storage must be fp32")
+    require(array_comparison(la["raw"], ra["raw"], bounds), "stock raw threshold failed")
+
+
+def validate_observation(ev, reference, profile):
+    value = ev.json(reference)
+    require(value["status"] == "complete" and value["evidence_kind"] ==
+            ("test_only" if ev.test_only else "real_model"), "stock observation incomplete")
+    require(value["backend"] == profile["backend"] and value["image_digest"] == profile["image_digest"],
+            "stock observation environment mismatch")
+    require(value["checkpoint_fingerprint"] == ev.json("input-lock.json")["checkpoint_fingerprint"],
+            "stock observation checkpoint mismatch")
+    for key in ("source", "packages", "backbone_fingerprint"):
+        require(value[key] == profile[key], "stock source/package/backbone identity mismatch")
+    measured = value["observed"]
+    for key in ("parameter_dtypes", "input_dtypes", "backbone_dtypes", "compute_dtypes"):
+        require(measured[key] == ["torch.float32"], f"stock {key} is not actual fp32")
+    require(all(v == "torch.float32" for v in measured["buffer_dtypes"]), "stock buffer precision")
+    for key, expected in (
+        ("flow_steps", 4), ("raw_shape", [2, 40, 132]), ("noise_shape", [2, 40, 132]),
+        ("noise_dtype", "torch.float32"), ("raw_dtype", "torch.float32"),
+        ("noise_draws", 1), ("autocast", False), ("tf32", False),
+        ("eval", True), ("observer_inert", True), ("attention", ["sdpa"]),
+    ):
+        require(measured[key] == expected, f"stock effective {key} mismatch")
+    require(measured["sdpa_calls"] > 0, "stock SDPA was not observed")
+    require(measured["device"] == profile["device"], "stock device differs from approved diagnostic")
+    return value
+
+
+def validate_launches(result, profiles, bounds):
+    require([item["stage"] for item in result["launches"]] == ["producer", "consumer"],
+            "both stock processes must actually execute")
+    for launch, backend in zip(result["launches"], ("native", "lerobot"), strict=True):
+        argv = launch["argv"]
+        require(argv[:2] == ["docker", "run"] and launch["exit_code"] == 0, "stock process invocation mismatch")
+        env_rows = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--env"]
+        env = dict(item.split("=", 1) for item in env_rows)
+        require(len(env) == len(env_rows), "duplicate stock environment override")
+        for key, value in {
+            "GROOT_N1_7_PARITY_DIR": "/evidence/stock/producer",
+            "GROOT_N1_7_LIBERO_CKPT": "/inputs/checkpoint",
+            "GROOT_PARITY_DEVICE": profiles[backend]["device"],
+            "GROOT_PARITY_ATOL": str(bounds["atol"]), "GROOT_PARITY_RTOL": str(bounds["rtol"]),
+            "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+        }.items():
+            require(env.get(key) == value, f"stock unapproved environment: {key}")
+        require(argv[argv.index("--entrypoint") + 2] == profiles[backend]["image_digest"],
+                "stock image differs from measured profile")
+        require(argv[argv.index("--stage") + 1] == launch["stage"], "stock stage invocation mismatch")
+        require(argv[argv.index("--checkpoint") + 1] == "/inputs/checkpoint", "stock checkpoint override")
+        require(timestamp(result["started_at"]) <= timestamp(launch["started_at"]) <=
+                timestamp(launch["ended_at"]) <= timestamp(result["ended_at"]), "stock launch chronology")
+    require(timestamp(result["launches"][0]["ended_at"]) <= timestamp(result["launches"][1]["started_at"]),
+            "stock processes were not serial")
+
+
+def validate_upstream_evidence(workspace, *, result=None):
+    ev = evidence(workspace)
+    assert_instrument(ev)
+    if result is None:
+        result = ev.record("upstream-result.json")
+    else:
+        require(result.get("status") == "complete" and not result.get("prerequisite_errors") and
+                result.get("schema_version") == 1 and result.get("evidence_kind") ==
+                ("test_only" if ev.test_only else "real_model"), "invalid prospective stock result")
+        require(all(result.get(k) == v for k, v in ev.identity().items()), "stock result identity changed")
+        require(timestamp(result["started_at"]) <= timestamp(result["ended_at"]), "stock chronology reversed")
+    validate_tolerance_agreement(ev, comparison_started_at=result["started_at"])
+    proposal = validate_tolerance_proposal(ev)
+    require(result["harness"] == proposal["harness"], "stock source pins differ from agreement")
+    require(result["agreement"] == ev.reference("tolerance-agreement.json"), "stock agreement changed")
+    require(result["seed"] == 42 and result["tag"] == "new_embodiment", "stock scope changed")
+    require(result["checkpoint_fingerprint"] == ev.json("input-lock.json")["checkpoint_fingerprint"],
+            "stock checkpoint mismatch")
+    validate_producer_output(ev.bytes(result["producer_log"]["path"], result["producer_log"]["sha256"]).decode(),
+                             result["producer_exit"])
+    require(type(result["consumer_exit"]) is int and result["consumer_exit"] == 0, "stock consumer failed")
+    ev.bytes(result["consumer_log"]["path"], result["consumer_log"]["sha256"])
+    require(parse_junit(ev.bytes(result["junit"]["path"], result["junit"]["sha256"])) == result["tests"],
+            "stock coverage differs from JUnit")
+    coverage = ev.json(result["coverage"])
+    expected_node = CONSUMER + "::" + CASE
+    require(coverage["collected"] == [expected_node] and coverage["reports"] == [
+        {"nodeid": expected_node, "when": phase, "outcome": "passed", "wasxfail": None}
+        for phase in ("setup", "call", "teardown")
+    ], "stock collection or runtime coverage incomplete/xfail/xpass")
+    profiles = {p["backend"]: p["observed"] for p in ev.json("profiles.json")["profiles"]
+                if p["purpose"] == "diagnostic"}
+    validate_launches(result, profiles, proposal["comparisons"]["diagnostic"]["thresholds"]["raw"])
+    left = validate_observation(ev, result["producer_observation"], profiles["native"])
+    right = validate_observation(ev, result["consumer_observation"], profiles["lerobot"])
+    require(left["observed"]["rng_algorithm"] == right["observed"]["rng_algorithm"],
+            "stock RNG algorithms differ")
+    for field in ("inputs", "noise"):
+        la, ra = ev.tensors(left[field]), ev.tensors(right[field])
+        require(set(la) == set(ra) and bool(la), f"stock {field} keys differ")
+        for key in la:
+            require(array_comparison(la[key], ra[key], {}, exact=True), f"stock actual {field} differ")
+    require(result["left"] == left["raw"] and result["right"] == right["raw"], "stock boundary references changed")
+    compare_raw(ev, result["left"], result["right"],
+                proposal["comparisons"]["diagnostic"]["thresholds"]["raw"])
+    ev.bytes(result["artifact"]["path"], result["artifact"]["sha256"])
+    return result

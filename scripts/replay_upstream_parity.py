@@ -21,7 +21,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy_guard.parity_gate import (  # noqa: E402
     evidence, require, timestamp, validate_tolerance_agreement, validate_tolerance_proposal,
 )
-from policy_guard.parity_report import array_comparison  # noqa: E402
+from policy_guard.parity_gate import (  # noqa: E402
+    array_comparison, compare_raw, parse_junit, validate_launches,
+    validate_observation, validate_producer_output, validate_upstream_evidence,
+)
+
+
+def check(workspace):
+    return validate_upstream_evidence(workspace)
+
 from policy_guard.replay_contract import (  # noqa: E402
     PrerequisiteError, capture_bytes, contained, floating_dtypes, load_input_lock,
     now, read_json, read_tensors, runtime_identity, sha256_file, to_numpy,
@@ -57,136 +65,6 @@ def validate_harness(source, pins):
 
 def create_producer_directory(path):
     Path(path).mkdir(mode=0o700, parents=False, exist_ok=False)
-
-
-def validate_producer_output(output, exit_code):
-    require(type(exit_code) is int and exit_code == 0, "producer process failed")
-    require(not re.search(r"\[(?:fail|skip)\]|Skipped/failed", output), "producer per-tag failure")
-    summaries = re.findall(r"^Dumped (\d+) tags: (.+)$", output, re.MULTILINE)
-    require(len(summaries) == 1 and summaries[0][0] == "1" and
-            ast.literal_eval(summaries[0][1]) == ["new_embodiment"],
-            "producer must actually dump exactly new_embodiment")
-
-
-def parse_junit(data):
-    require(len(data) <= 4 * 1024 * 1024 and b"<!DOCTYPE" not in data and b"<!ENTITY" not in data,
-            "invalid/bounded JUnit required")
-    root = ElementTree.fromstring(data)
-    cases = root.findall(".//testcase")
-    require(len(cases) == 1 and cases[0].get("name") == CASE, "missing/extra/uncollected stock case")
-    case = cases[0]
-    require(not any(case.find(name) is not None for name in ("skipped", "failure", "error")),
-            "stock skip/xfail/failure/error is not passing coverage")
-    for prop in case.findall(".//property"):
-        require(prop.get("value") not in ("xpassed", "xfailed", "skipped"),
-                "unexpected stock pytest outcome")
-    for suite in root.iter("testsuite"):
-        for count in ("failures", "errors", "skipped"):
-            require(int(suite.get(count, 0)) == 0, "unsuccessful stock suite")
-    return [{"name": "new_embodiment", "outcome": "passed"}]
-
-
-def compare_raw(workspace, left, right, bounds):
-    la, ra = read_tensors(workspace, left), read_tensors(workspace, right)
-    require(set(la) == set(ra) == {"raw"}, "stock raw witness required")
-    require(la["raw"].shape == ra["raw"].shape == (2, 40, 132), "stock full pre-crop shape mismatch")
-    require(la["raw"].dtype == ra["raw"].dtype == np.float32, "stock raw storage must be fp32")
-    require(array_comparison(la["raw"], ra["raw"], bounds), "stock raw threshold failed")
-
-
-def validate_observation(ev, reference, profile):
-    value = ev.json(reference)
-    require(value["status"] == "complete" and value["evidence_kind"] ==
-            ("test_only" if ev.test_only else "real_model"), "stock observation incomplete")
-    require(value["backend"] == profile["backend"] and value["image_digest"] == profile["image_digest"],
-            "stock observation environment mismatch")
-    require(value["checkpoint_fingerprint"] == ev.json("input-lock.json")["checkpoint_fingerprint"],
-            "stock observation checkpoint mismatch")
-    for key in ("source", "packages", "backbone_fingerprint"):
-        require(value[key] == profile[key], "stock source/package/backbone identity mismatch")
-    measured = value["observed"]
-    for key in ("parameter_dtypes", "input_dtypes", "backbone_dtypes", "compute_dtypes"):
-        require(measured[key] == ["torch.float32"], f"stock {key} is not actual fp32")
-    require(all(v == "torch.float32" for v in measured["buffer_dtypes"]), "stock buffer precision")
-    for key, expected in (
-        ("flow_steps", 4), ("raw_shape", [2, 40, 132]), ("noise_shape", [2, 40, 132]),
-        ("noise_dtype", "torch.float32"), ("raw_dtype", "torch.float32"),
-        ("noise_draws", 1), ("autocast", False), ("tf32", False),
-        ("eval", True), ("observer_inert", True), ("attention", ["sdpa"]),
-    ):
-        require(measured[key] == expected, f"stock effective {key} mismatch")
-    require(measured["sdpa_calls"] > 0, "stock SDPA was not observed")
-    require(measured["device"] == profile["device"], "stock device differs from approved diagnostic")
-    return value
-
-
-def validate_launches(result, profiles, bounds):
-    require([item["stage"] for item in result["launches"]] == ["producer", "consumer"],
-            "both stock processes must actually execute")
-    for launch, backend in zip(result["launches"], ("native", "lerobot"), strict=True):
-        argv = launch["argv"]
-        require(argv[:2] == ["docker", "run"] and launch["exit_code"] == 0, "stock process invocation mismatch")
-        env_rows = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--env"]
-        env = dict(item.split("=", 1) for item in env_rows)
-        require(len(env) == len(env_rows), "duplicate stock environment override")
-        for key, value in {
-            "GROOT_N1_7_PARITY_DIR": "/evidence/stock/producer",
-            "GROOT_N1_7_LIBERO_CKPT": "/inputs/checkpoint",
-            "GROOT_PARITY_DEVICE": profiles[backend]["device"],
-            "GROOT_PARITY_ATOL": str(bounds["atol"]), "GROOT_PARITY_RTOL": str(bounds["rtol"]),
-            "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
-        }.items():
-            require(env.get(key) == value, f"stock unapproved environment: {key}")
-        require(argv[argv.index("--entrypoint") + 2] == profiles[backend]["image_digest"],
-                "stock image differs from measured profile")
-        require(argv[argv.index("--stage") + 1] == launch["stage"], "stock stage invocation mismatch")
-        require(argv[argv.index("--checkpoint") + 1] == "/inputs/checkpoint", "stock checkpoint override")
-        require(timestamp(result["started_at"]) <= timestamp(launch["started_at"]) <=
-                timestamp(launch["ended_at"]) <= timestamp(result["ended_at"]), "stock launch chronology")
-    require(timestamp(result["launches"][0]["ended_at"]) <= timestamp(result["launches"][1]["started_at"]),
-            "stock processes were not serial")
-
-
-def check(workspace):
-    ev = evidence(workspace)
-    from replay_checkpoint_parity import assert_instrument
-    assert_instrument(ev)
-    result = ev.record("upstream-result.json")
-    validate_tolerance_agreement(ev, comparison_started_at=result["started_at"])
-    proposal = validate_tolerance_proposal(ev)
-    require(result["harness"] == proposal["harness"], "stock source pins differ from agreement")
-    require(result["agreement"] == ev.reference("tolerance-agreement.json"), "stock agreement changed")
-    require(result["seed"] == 42 and result["tag"] == "new_embodiment", "stock scope changed")
-    require(result["checkpoint_fingerprint"] == ev.json("input-lock.json")["checkpoint_fingerprint"],
-            "stock checkpoint mismatch")
-    validate_producer_output(ev.bytes(result["producer_log"]["path"], result["producer_log"]["sha256"]).decode(),
-                             result["producer_exit"])
-    require(result["consumer_exit"] == 0, "stock consumer failed")
-    require(parse_junit(ev.bytes(result["junit"]["path"], result["junit"]["sha256"])) == result["tests"],
-            "stock coverage differs from JUnit")
-    coverage = ev.json(result["coverage"])
-    expected_node = CONSUMER + "::" + CASE
-    require(coverage["collected"] == [expected_node] and coverage["reports"] == [
-        {"nodeid": expected_node, "when": phase, "outcome": "passed", "wasxfail": None}
-        for phase in ("setup", "call", "teardown")
-    ], "stock collection or runtime coverage incomplete/xfail/xpass")
-    profiles = {p["backend"]: p["observed"] for p in ev.json("profiles.json")["profiles"]
-                if p["purpose"] == "diagnostic"}
-    validate_launches(result, profiles, proposal["comparisons"]["diagnostic"]["thresholds"]["raw"])
-    left = validate_observation(ev, result["producer_observation"], profiles["native"])
-    right = validate_observation(ev, result["consumer_observation"], profiles["lerobot"])
-    require(left["observed"]["rng_algorithm"] == right["observed"]["rng_algorithm"],
-            "stock RNG algorithms differ")
-    for field in ("inputs", "noise"):
-        la, ra = ev.tensors(left[field]), ev.tensors(right[field])
-        require(set(la) == set(ra) and bool(la), f"stock {field} keys differ")
-        for key in la:
-            require(array_comparison(la[key], ra[key], {}, exact=True), f"stock actual {field} differ")
-    require(result["left"] == left["raw"] and result["right"] == right["raw"], "stock boundary references changed")
-    compare_raw(ev.workspace, result["left"], result["right"],
-                proposal["comparisons"]["diagnostic"]["thresholds"]["raw"])
-    ev.bytes(result["artifact"]["path"], result["artifact"]["sha256"])
-    return result
 
 
 def stock_argv(args, backend, profile, source, stage, artifact_ref=None):
@@ -314,10 +192,7 @@ def run(workspace, *, executor=None, args=None, source_validator=validate_harnes
     if result["status"] == "complete":
         try:
             compare_raw(ev.workspace, result["left"], result["right"], args.bounds)
-            # Full check uses this prospective snapshot without rewriting disk.
-            ev._json["upstream-result.json"] = result
-            ev._bytes["upstream-result.json"] = __import__("policy_guard.replay_contract", fromlist=["canonical"]).canonical(result)
-            check(ev)
+            validate_upstream_evidence(ev, result=result)
         except Exception as exc:
             result["status"] = "failed"
             result["prerequisite_errors"].append({"type": type(exc).__name__, "message": str(exc)})

@@ -75,6 +75,8 @@ def observed(backend, purpose):
         result["owned_source_files"] = {name: digest(name) for name in (
             "policy_guard/groot_guard.py", "policy_guard/replay_contract.py", "docker/lerobot-policy/server.py",
         )}
+    result["owned_source_files"] = fixture_sources()
+    result["owned_source_fingerprint"] = digest(result["owned_source_files"])
     return result
 
 
@@ -83,7 +85,7 @@ def semantics():
         "backend": "lerobot", "purpose": "operational",
         "checkpoint_fingerprint": digest("checkpoint"), "backbone_fingerprint": digest("backbone"),
         "source_fingerprint": digest({"source": {"sha256": digest("lerobot")}, "owned": {
-            name: digest(name) for name in (
+            name: fixture_sources()[name] for name in (
                 "policy_guard/groot_guard.py", "policy_guard/replay_contract.py", "docker/lerobot-policy/server.py",
             )}}), "packages_fingerprint": digest({"torch": "test"}),
         "image_digest": "sha256:" + digest("lerobot"),
@@ -161,24 +163,8 @@ def fixture_workspace(workspace, operational_edit=None):
         **identity, "calibration_sha256": digest("calibration"),
         "configuration_fingerprint": digest("robot-config"), "drift_errors": [],
     })
-    schedule = repeatability_schedule(lock)
-    keys = [key for group in schedule["groups"] for key in group["cases"]]
-    values = np.zeros((len(keys), 16, 6), np.float32)
-    noise = np.zeros((len(keys), 40, 132), np.float32)
-    for i, key in enumerate(keys):
-        if key["mode"] == "changed":
-            values[i] = 1
-            noise[i] = 1
-    samples = write_tensors(workspace, {"decoded": values, "noise": noise})
-    repeats = []
-    for item in profiles["profiles"]:
-        repeats.append({
-            "profile": item["backend"] + "-" + item["purpose"], "cases": keys,
-            "groups": [{"id": group["id"], "process_id": digest(item["backend"] + item["purpose"] + group["id"]),
-                        "cases": group["cases"]} for group in schedule["groups"]],
-            "tensors": samples, "started_at": ts(3), "ended_at": ts(4),
-        })
-    repeat_ref = save(workspace, "repeatability.json", {**identity, "schedule": schedule, "measurements": repeats})
+    repeat, _ = fabricated_repeats(api().Evidence(workspace, test_only=True), identity)
+    repeat_ref = save(workspace, "repeatability.json", repeat)
     thresholds = {
         "preprocessing": {"atol": 0.0001, "rtol": 0.0001},
         "raw": {"atol": 0.001, "rtol": 0.001},
@@ -192,6 +178,7 @@ def fixture_workspace(workspace, operational_edit=None):
     }
     proposal = {
         **identity, "started_at": ts(5), "ended_at": ts(6), "repeatability": repeat_ref,
+        "instrument_files": api().instrument_identity(),
         "harness": {"commit": "a" * 40, "producer_sha256": digest("producer"), "consumer_sha256": digest("consumer")},
         "comparisons": {name: {"profiles": pair, "thresholds": thresholds,
                                 "noise_policy": "exact" if name == "diagnostic" else "independent",
@@ -229,33 +216,25 @@ def complete_offline(workspace, identity, lock, pairs):
     })
     ev = api().Evidence(workspace, test_only=True)
     agreement = ev.reference("tolerance-agreement.json")
+    independent = {name: fabricated_worker(ev, name, lock["schedule"], "full-independent-" + name,
+                                           second=11.1)[0] for name in api().PROFILE_NAMES}
     comparisons = []
     for name, pair in pairs.items():
-        comparisons.append({
-            "name": name, "profiles": pair, "started_at": ts(11), "ended_at": ts(12),
-            "cases": lock["schedule"], "joint_order": list(JOINT_ORDER),
-            "left": zeros, "right": zeros,
-            "preprocessing": [{"key": key, "left": pre, "right": pre} for key in lock["schedule"]],
-            "common_inputs": [{"key": key, "left": pre, "right": pre} for key in lock["schedule"]],
-            "metrics": {
-                "max_abs": [0.] * 6, "mean_abs": [0.] * 6, "bias": [0.] * 6,
-                "slope": [0.] * 6, "per_index_bias": [[0.] * 6] * 16,
-                "trace_bias_max_abs": [0.] * 6, "trace_slope_max_abs": [0.] * 6,
-            }, "passed": True,
-        })
-    upstream = {
-        **identity, "started_at": ts(11), "ended_at": ts(12), "agreement": agreement,
-        "harness": read_json(workspace / "tolerance-proposal.json")["harness"],
-        "seed": 42, "tag": "new_embodiment", "producer_exit": 0, "consumer_exit": 0,
-        "tests": [{"name": "new_embodiment", "outcome": "passed"}],
-        "left": write_tensors(workspace, {"raw": np.zeros((2, 40, 132), np.float32)}),
-        "right": write_tensors(workspace, {"raw": np.zeros((2, 40, 132), np.float32)}),
-        "checkpoint_fingerprint": lock["checkpoint_fingerprint"],
-    }
-    up_ref = save(workspace, "upstream-result.json", upstream)
+        source = independent[pair[0]]["reference"]
+        bundles, proofs = [], {}
+        for side, profile in zip(("left", "right"), pair):
+            common = fabricated_worker(ev, profile, lock["schedule"], name + "-" + side,
+                                       second=12.1, common_from=source)[0]
+            bundles.append(common)
+            proofs[side] = {"independent": independent[profile]["reference"], "common": common["reference"]}
+        record = api().compare_tiers(ev, name, *bundles, started_at=ts(12), ended_at=ts(12.5))
+        record["provenance"] = proofs
+        comparisons.append(record)
+    up_ref = fabricated_stock(ev, identity)
     save(workspace, "offline-report.json", {
         **identity, "started_at": ts(11), "ended_at": ts(13), "archived_at": ts(14),
         "agreement": agreement, "upstream": up_ref, "comparisons": comparisons,
+        "instrument_files": api().instrument_identity(),
         "caveats": ["Test-only arrays", "Training geometry caveat"], "parity_passed": True,
     })
     save(workspace, "golden-candidate.json", {
@@ -446,7 +425,7 @@ def test_complete_status_does_not_hide_seed_ignoring_repeatability(tmp_path):
     # turn a seed-ignoring measurement into a completed repeatability basis.
     ev = api().Evidence(tmp_path, test_only=True)
     rewrite(tmp_path, "tolerance-proposal.json", lambda d: d.update(repeatability=ev.reference("repeatability.json")))
-    with pytest.raises(ValueError, match="seed"):
+    with pytest.raises(ValueError, match="seed|aggregate"):
         review(tmp_path, "tolerances", 10)
 
 
@@ -465,7 +444,7 @@ def test_true_pass_flag_cannot_hide_numerical_failure(tmp_path):
                                   "raw": np.zeros((600, 40, 132), np.float32),
                                   "noise": np.zeros((600, 40, 132), np.float32)})
     rewrite(tmp_path, "offline-report.json", lambda d: d["comparisons"][0].update(right=bad))
-    with pytest.raises(ValueError, match="numerical|metric|threshold"):
+    with pytest.raises(ValueError, match="numerical|metric|threshold|aggregate"):
         api().validate_release_evidence(api().Evidence(tmp_path, test_only=True))
 
 
@@ -487,10 +466,17 @@ def closeout_fixture(workspace):
     identity = {k: ev.json("offline-report.json")[k] for k in (
         "schema_version", "session", "evidence_kind", "input_fingerprint", "profiles_fingerprint", "status",
     )}
+    events, previous_event = [], None
+    for index in range(3):
+        event = {"index": index, "previous": previous_event, "kind": "returned",
+                 "operation": "fabricated trial", "trial": index + 1}
+        previous_event = digest(event)
+        events.append({**event, "sha256": previous_event})
     save(workspace, "live-run.json", {
         **identity, "started_at": ts(43), "ended_at": ts(79), "constructed_at": ts(43),
         "live_preflight": live_ref, "run_preflight": run_ref, "trials": trials,
         "approval": ev.reference("live-approval.json"), "clamp_warnings": 0, "safety_stop": False,
+        "events": events, "stop_events": [], "stop_reason": "",
         "instruction": "Grab a banana and put it on the plate",
     })
     final = copy.deepcopy(ev.json("golden-replay.json"))
@@ -964,7 +950,7 @@ def test_review_repeatability_rejects_unverified_measurement_basis(tmp_path, fie
         elif field == "workers":
             record["measurements"][0][field] = []
         elif field == "statistics":
-            record["measurements"][0][field] = {"max_abs": [1000.] * 6}
+            record["measurements"][0][field]["max_abs"] = [1000.] * 6
         else:
             record["measurements"][0][field] = 1000.
     rewrite(tmp_path, "repeatability.json", corrupt)
@@ -986,3 +972,223 @@ def test_review_release_requires_complete_numerical_and_stock_witnesses(tmp_path
         rewrite(tmp_path, "offline-report.json", lambda r: r.update(upstream=ref))
     with pytest.raises((ValueError, KeyError, FileNotFoundError)):
         api().validate_release_evidence(api().Evidence(tmp_path, test_only=True))
+
+
+def fabricated_save(workspace, name, value):
+    """Write fabricated temporary files without exercising publication fsync."""
+    import hashlib
+    path = workspace / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = canonical(value) + b"\n"
+    with path.open("xb") as stream:
+        stream.write(data)
+    return {"path": name, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def fixture_sources():
+    current = api().instrument_identity()
+    return {name: current[name] for name in api().WORKER_SOURCE_FILES}
+
+
+def fabricated_worker(ev, name, cases, label, *, second, common_from=None, offset=0):
+    """Full immutable schema, deliberately test_only; never invokes a process."""
+    from policy_guard.replay_contract import profile_configuration
+    g = api()
+    workspace = ev.workspace
+    profile = copy.deepcopy(next(p["observed"] for p in ev.json("profiles.json")["profiles"]
+                                 if p["backend"] + "-" + p["purpose"] == name))
+    backend, purpose = name.split("-")
+    kind = "repeatability" if "mode" in cases[0] else "replay"
+    clock = ts(second)
+    plan = fabricated_save(workspace, f"schedules/{label}.json", {
+        "schema_version": 1, **ev.identity(), "kind": kind, "cases": cases, "common_from": common_from,
+        "execution": {"id": digest(label)[:32], "collection": "numerical-" + kind,
+                      "started_at": clock, "worker_manifest": f"workers/{label}.json"},
+    })
+    execution = {**ev.json(plan)["execution"], "schedule": plan}
+    pre = {
+        "image_front": np.zeros((1, 3, 2, 2), np.float32),
+        "image_wrist": np.ones((1, 3, 2, 2), np.float32),
+        "state": np.zeros((1, 6), np.float32),
+        "tokens": np.ones((1, 4), np.int64), "mask": np.ones((1, 4), np.int64),
+    }
+    pre_ref = write_tensors(workspace, pre)
+    collated = [{ "tensors": pre_ref, "dtypes": {k: "torch." + str(v.dtype) for k, v in pre.items()}}] * len(cases)
+    if common_from is not None:
+        collated = ev.json(common_from)["collated"]
+    rows, samples, sample_refs = [], [], {}
+    profile_hash = digest(profile)
+    lock = ev.json("input-lock.json")
+    records = {r["file"]: r for r in lock["records"]}
+    for index, key in enumerate(cases):
+        changed = key.get("mode") == "changed"
+        code = (changed, key["seed"] if kind == "repeatability" else 0)
+        if code not in sample_refs:
+            arrays = {
+                "raw": np.full((1, 40, 132), offset + int(changed), np.float32),
+                "noise": np.full((1, 40, 132), code[1], np.float32),
+                "decoded": np.full((16, 6), offset + int(changed), np.float32),
+                **{"preprocessing." + k: v for k, v in pre.items()},
+                **{"collated." + k: v for k, v in pre.items()},
+                **{"dtype." + k: np.array(g.DTYPE_NAMES.index("torch." + str(v.dtype)), np.int8)
+                   for k, v in pre.items()},
+            }
+            sample_refs[code] = (write_tensors(workspace, arrays), arrays)
+        ref, arrays = sample_refs[code]
+        samples.append(arrays)
+        record = records[key["record"]]
+        row = {"key": key, "record_sha256": record["sha256"], "instruction": record["instruction"],
+               "tensors": ref, "observer_inert": True, "profile_fingerprint": profile_hash,
+               "execution": execution, "started_at": clock, "ended_at": clock}
+        durable = fabricated_save(workspace, f"workers/cases/{label}-{index:04d}.json", {
+            **row, "schema_version": 1, "session": ev.identity()["session"], "stage": purpose,
+            "input_fingerprint": lock["fingerprint"], "evidence_kind": "test_only",
+            "profile": profile, "status": "complete", "error": None,
+        })
+        rows.append({**row, "evidence": durable})
+    pid = int(digest(label)[:12], 16) + 1
+    worker = {
+        "schema_version": 1, "session": ev.identity()["session"], "stage": purpose,
+        "input_fingerprint": lock["fingerprint"], "evidence_kind": "test_only", "status": "complete",
+        "started_at": clock, "ended_at": clock, "expected_cases": cases, "executed_cases": cases,
+        "cases": rows, "profile": profile, "profile_fingerprint": profile_hash, "execution": execution,
+        "configuration_fingerprint": digest(profile_configuration(profile)),
+        "resources": {"process_identity": {"pid": pid, "process_start_ticks": pid,
+                       "process_started_at": clock, "boot_id": "fabricated-boot"},
+                      "instrument_files": g.instrument_identity()},
+        "prerequisite_errors": [],
+    }
+    worker_ref = fabricated_save(workspace, f"workers/{label}.json", worker)
+    log_path = workspace / f"workers/{label}.log"
+    log_path.write_text("fabricated fixture; no process ran\n")
+    launch = {
+        "backend": backend, "purpose": purpose, "manifest": worker_ref, "status": "complete", "exit_code": 0,
+        "started_at": clock, "ended_at": clock, "schedule": plan,
+        "instrument_files": g.instrument_identity(), "log": ev.reference(str(log_path.relative_to(workspace))),
+        "argv": ["docker", "run", "--entrypoint", "python", profile["image_digest"],
+                 "/replay/scripts/replay_checkpoint_parity.py", "_worker", "--backend", backend,
+                 "--profile", purpose, "--device", profile["device"], "--image-digest", profile["image_digest"],
+                 "--checkpoint", "/inputs/checkpoint", "--schedule", "/evidence/" + plan["path"],
+                 "--output-manifest", worker_ref["path"]],
+    }
+    launch_ref = fabricated_save(workspace, f"launches/{label}.json", launch)
+    bundle = {
+        "cases": cases, "profile": name, "input_fingerprint": lock["fingerprint"],
+        "joint_order": list(JOINT_ORDER), "camera_order": list(CAMERA_ORDER),
+        "tensors": write_tensors(workspace, {k: np.stack([r[k][0] if k != "decoded" else r[k] for r in samples])
+                                            for k in ("raw", "noise", "decoded")}),
+        "preprocessing": [pre_ref] * len(cases), "common_inputs": [pre_ref] * len(cases),
+        "independent_collated": [item["tensors"] for item in collated],
+        "common_collated": [item["tensors"] for item in collated],
+        "collated": collated, "worker": worker_ref, "launch": launch_ref,
+    }
+    bundle["reference"] = fabricated_save(workspace, f"bundles/{label}.json", bundle)
+    return bundle, {**launch, "reference": launch_ref}
+
+
+def fabricated_repeats(ev, identity, *, prefix="repeat", offsets=False):
+    """The between-profile offset proves reductions never pair backends."""
+    g = api()
+    schedule = repeatability_schedule(ev.json("input-lock.json"))
+    measured, launches = [], []
+    for index, name in enumerate(g.PROFILE_NAMES):
+        workers, refs, groups, samples = [], [], [], []
+        for count, group in enumerate(schedule["groups"]):
+            bundle, launch = fabricated_worker(ev, name, group["cases"], f"{prefix}-{name}-{count}",
+                                               second=3.5, offset=index * 1000 if offsets else 0)
+            launches.append(launch)
+            workers.append(bundle["worker"])
+            refs.append(bundle["launch"])
+            worker = ev.json(bundle["worker"])
+            groups.append({"id": group["id"], "cases": group["cases"],
+                           "process_id": digest(worker["resources"]["process_identity"])})
+            samples.append(ev.tensors(bundle["tensors"]))
+        measured.append({
+            "profile": name, "cases": [k for group in schedule["groups"] for k in group["cases"]],
+            "groups": groups, "workers": workers, "launches": refs,
+            "started_at": ts(3.5), "ended_at": ts(3.5),
+            "tensors": write_tensors(ev.workspace, {k: np.concatenate([s[k] for s in samples])
+                                                   for k in ("decoded", "noise")}),
+            "statistics": {"max_abs": [0.] * 6, "mean_abs": [0.] * 6, "bias": [0.] * 6,
+                           "slope": [0.] * 6, "per_index_bias": [[0.] * 6] * 16,
+                           "trace_bias_max_abs": [0.] * 6, "trace_slope_max_abs": [0.] * 6},
+            "raw_max_abs": 0., "preprocessing_max_abs": 0.,
+        })
+    record = {**identity, "schedule": schedule, "measurements": measured, "instrument_files": g.instrument_identity()}
+    return record, {"status": "complete", "started_at": ts(3), "ended_at": ts(4), "workers": launches}
+
+
+def fabricated_stock(ev, identity):
+    g = api()
+    workspace = ev.workspace
+    result = {
+        **identity, "started_at": ts(10.1), "ended_at": ts(10.9),
+        "agreement": ev.reference("tolerance-agreement.json"),
+        "harness": ev.json("tolerance-proposal.json")["harness"], "seed": 42, "tag": "new_embodiment",
+        "checkpoint_fingerprint": ev.json("input-lock.json")["checkpoint_fingerprint"],
+        "producer_exit": 0, "consumer_exit": 0, "tests": [{"name": "new_embodiment", "outcome": "passed"}],
+        "launches": [],
+    }
+    raw = write_tensors(workspace, {"raw": np.zeros((2, 40, 132), np.float32)})
+    noise = write_tensors(workspace, {"noise": np.zeros((2, 40, 132), np.float32)})
+    inputs = write_tensors(workspace, {"state": np.zeros((2, 6), np.float32)})
+    bounds = ev.json("tolerance-proposal.json")["comparisons"]["diagnostic"]["thresholds"]["raw"]
+    for stage, backend, second in (("producer", "native", 10.2), ("consumer", "lerobot", 10.6)):
+        profile = next(p["observed"] for p in ev.json("profiles.json")["profiles"]
+                       if p["backend"] == backend and p["purpose"] == "diagnostic")
+        observed = {**profile, "raw_shape": [2, 40, 132], "noise_shape": [2, 40, 132]}
+        result[stage + "_observation"] = fabricated_save(workspace, f"stock/{stage}-observation.json", {
+            **profile, "status": "complete", "evidence_kind": "test_only", "observed": observed,
+            "raw": raw, "noise": noise, "inputs": inputs,
+        })
+        path = workspace / f"stock/{stage}.log"
+        path.write_text("Dumped 1 tags: ['new_embodiment']\n" if stage == "producer" else "1 passed\n")
+        result[stage + "_log"] = ev.reference(str(path.relative_to(workspace)))
+        env = {
+            "GROOT_N1_7_PARITY_DIR": "/evidence/stock/producer", "GROOT_N1_7_LIBERO_CKPT": "/inputs/checkpoint",
+            "GROOT_PARITY_DEVICE": profile["device"], "GROOT_PARITY_ATOL": str(bounds["atol"]),
+            "GROOT_PARITY_RTOL": str(bounds["rtol"]), "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+        }
+        argv = ["docker", "run", *[v for k, value in env.items() for v in ("--env", k + "=" + value)],
+                "--entrypoint", "python", profile["image_digest"], "--stage", stage,
+                "--checkpoint", "/inputs/checkpoint"]
+        result["launches"].append({"stage": stage, "argv": argv, "exit_code": 0,
+                                   "started_at": ts(second), "ended_at": ts(second + .1)})
+    node = g.CONSUMER + "::" + g.CASE
+    result["coverage"] = fabricated_save(workspace, "stock/coverage.json", {
+        "collected": [node], "reports": [{"nodeid": node, "when": phase, "outcome": "passed", "wasxfail": None}
+                                        for phase in ("setup", "call", "teardown")],
+    })
+    (workspace / "stock/junit.xml").write_text(
+        f'<testsuites><testsuite tests="1"><testcase name="{g.CASE}"/></testsuite></testsuites>')
+    result["junit"] = ev.reference("stock/junit.xml")
+    (workspace / "stock/artifact.npz").write_bytes(b"explicit fabricated producer output")
+    result["artifact"] = ev.reference("stock/artifact.npz")
+    result["left"] = result["right"] = raw
+    return fabricated_save(workspace, "upstream-result.json", result)
+
+
+@pytest.mark.parametrize("fault", ["execution", "case_time"])
+def test_review_numerical_worker_execution_cannot_be_relabelled(tmp_path, fault):
+    fixture_workspace(tmp_path)
+    g = api()
+    ev = g.Evidence(tmp_path, test_only=True)
+    measured = ev.json("repeatability.json")["measurements"][0]
+    worker_ref, launch_ref = measured["workers"][0], measured["launches"][0]
+    worker = ev.json(worker_ref)
+    if fault == "execution":
+        worker["execution"] = {"id": "wrong execution"}
+    else:
+        case = worker["cases"][0]
+        case["started_at"] = ts(99)
+        rewrite(tmp_path, case["evidence"]["path"], lambda row: row.update(started_at=ts(99)))
+        case["evidence"] = g.Evidence(tmp_path, test_only=True).reference(case["evidence"]["path"])
+    rewrite(tmp_path, worker_ref["path"], lambda row: (row.clear(), row.update(worker)))
+    worker_ref = g.Evidence(tmp_path, test_only=True).reference(worker_ref["path"])
+    rewrite(tmp_path, launch_ref["path"], lambda launch: launch.update(manifest=worker_ref))
+    launch_ref = g.Evidence(tmp_path, test_only=True).reference(launch_ref["path"])
+    with pytest.raises(ValueError, match="execution|chronology"):
+        g.validate_numerical_worker(
+            g.Evidence(tmp_path, test_only=True), {"worker": worker_ref, "launch": launch_ref},
+            measured["profile"], worker["expected_cases"], kind="repeatability", start=ts(3), end=ts(4),
+        )

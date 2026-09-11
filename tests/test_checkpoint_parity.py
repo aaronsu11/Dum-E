@@ -12,7 +12,7 @@ import pytest
 
 from policy_guard.parity_gate import Evidence
 from policy_guard.replay_contract import CAMERA_ORDER, JOINT_ORDER, read_json, write_tensors
-from tests.test_parity_gate import fixture_workspace, review, rewrite, ts
+from tests.test_parity_gate import fabricated_repeats, fabricated_worker, fixture_workspace, review, rewrite, ts
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -168,6 +168,7 @@ def test_three_operational_bridges_do_not_claim_seed_implies_noise_equality(tmp_
 
 def test_full_cli_refuses_absent_agreement_before_worker_launch(tmp_path):
     fixture_workspace(tmp_path)
+    before = {p: p.read_bytes() for p in (tmp_path / "workers").rglob("*") if p.is_file()}
     result = subprocess.run([
         sys.executable, str(ROOT / "scripts/replay_checkpoint_parity.py"),
         "full", "--workspace", str(tmp_path),
@@ -175,7 +176,7 @@ def test_full_cli_refuses_absent_agreement_before_worker_launch(tmp_path):
     assert result.returncode == 2
     assert '"status": "not_run"' in result.stdout
     assert "Starting" not in result.stdout
-    assert not list((tmp_path / "workers").glob("*"))
+    assert {p: p.read_bytes() for p in (tmp_path / "workers").rglob("*") if p.is_file()} == before
 
 
 def test_full_fake_workers_require_every_profile_and_common_input_pass(tmp_path):
@@ -187,9 +188,9 @@ def test_full_fake_workers_require_every_profile_and_common_input_pass(tmp_path)
     class Workers:
         def collect(self, name, schedule, *, common_from=None):
             calls.append((name, len(schedule), common_from))
-            bundle = copy.deepcopy(left if name.startswith("native") else right)
-            bundle["profile"] = name
-            return bundle
+            return fabricated_worker(ev, name, schedule, f"full-{len(calls)}",
+                                     second=8.5 if common_from is None else 9,
+                                     common_from=common_from)[0]
 
     # Stock validity is tested independently. Explicit fixture collaborator only.
     result = module.full(ev, workers=Workers(), stock_check=lambda _: {"status": "complete"},
@@ -263,30 +264,9 @@ def test_reduce_repeatability_never_pairs_different_backends(tmp_path):
     from policy_guard.replay_contract import repeatability_schedule, write_evidence
     ev, _, _ = fixture(tmp_path)
     module = importlib.import_module("replay_checkpoint_parity")
-    schedule = repeatability_schedule(ev.json("input-lock.json"))
-    profiles = ev.json("profiles.json")["profiles"]
-    collection = {"status": "complete", "started_at": ts(3), "ended_at": ts(4), "workers": []}
-    for pindex, profile in enumerate(profiles):
-        backend, purpose = profile["backend"], profile["purpose"]
-        for gindex, group in enumerate(schedule["groups"]):
-            rows = []
-            for key in group["cases"]:
-                # Enormous between-profile offsets must not enter repeatability.
-                value = pindex * 1000 + (1 if key["mode"] == "changed" else 0)
-                ref = write_tensors(tmp_path, {
-                    "raw": np.full((1, 40, 132), value, np.float32),
-                    "noise": np.full((1, 40, 132), key["seed"], np.float32),
-                    "decoded": np.full((16, 6), value, np.float32),
-                    "preprocessing.state": np.ones((1, 6), np.float32),
-                })
-                rows.append({"key": key, "tensors": ref})
-            manifest = write_evidence(tmp_path, f"fake/{backend}-{purpose}-{gindex}.json", {
-                "executed_cases": group["cases"], "profile": profile["observed"],
-                "started_at": ts(3), "ended_at": ts(4), "cases": rows,
-                "resources": {"process_identity": {"pid": gindex + 1}},
-            })
-            collection["workers"].append({"backend": backend, "purpose": purpose, "status": "complete",
-                                          "exit_code": 0, "manifest": manifest})
+    identity = {**ev.identity(), "schema_version": 1, "evidence_kind": "test_only",
+                "status": "complete", "started_at": ts(3), "ended_at": ts(4)}
+    _, collection = fabricated_repeats(ev, identity, prefix="offset", offsets=True)
     result = module.reduce_repeatability(ev, collection)
     assert len(result["measurements"]) == 4
     for measurement in result["measurements"]:
@@ -348,10 +328,16 @@ def test_full_archive_agreement_reference_and_parity_flag_are_required(tmp_path)
     module = importlib.import_module("replay_checkpoint_parity")
 
     class Workers:
-        def collect(self, name, schedule, *, common_from=None):
-            return {**copy.deepcopy(left if name.startswith("native") else right), "profile": name}
+        counter = 0
 
-    module.full(ev, workers=Workers(), stock_check=lambda _: {}, started_at=ts(8), clock=lambda: ts(9))
+        def collect(self, name, schedule, *, common_from=None):
+            self.counter += 1
+            return fabricated_worker(ev, name, schedule, f"archive-{self.counter}",
+                                     second=8.5 if common_from is None else 9,
+                                     common_from=common_from)[0]
+
+    result = module.full(ev, workers=Workers(), stock_check=lambda _: {}, started_at=ts(8), clock=lambda: ts(9))
+    assert result["status"] == "complete"
     rewrite(tmp_path, "offline-report.json", lambda r: r.update(parity_passed=False))
     with pytest.raises(ValueError, match="passing archive"):
         module.check_offline(Evidence(tmp_path, test_only=True), stock_check=lambda _: {})
@@ -386,6 +372,49 @@ def test_review_offline_requires_archived_worker_witnesses(tmp_path):
             bundle["profile"] = name
             # Aggregate-only fixture intentionally has no captured worker evidence.
             return bundle
-    with pytest.raises((ValueError, KeyError, FileNotFoundError)):
-        module.full(ev, workers=Workers(), stock_check=lambda _: {"status": "complete"},
-                    started_at=ts(8), clock=lambda: ts(9))
+    result = module.full(ev, workers=Workers(), stock_check=lambda _: {"status": "complete"},
+                         started_at=ts(8), clock=lambda: ts(9))
+    assert result["status"] != "complete"
+
+
+@pytest.mark.parametrize("witness", ["worker", "launch", "case"])
+def test_review_offline_and_release_reject_deleted_process_witness(tmp_path, witness):
+    from tests.test_parity_gate import api as gate, complete_offline
+    identity, lock, pairs = fixture_workspace(tmp_path)
+    complete_offline(tmp_path, identity, lock, pairs)
+    ev = Evidence(tmp_path, test_only=True)
+    module = importlib.import_module("replay_checkpoint_parity")
+    assert module.check_offline(ev)["status"] == "complete"
+    report = ev.json("offline-report.json")
+    bundle = ev.json(report["comparisons"][0]["provenance"]["left"]["independent"])
+    reference = (ev.json(bundle["worker"])["cases"][0]["evidence"]
+                 if witness == "case" else bundle[witness])
+    (tmp_path / reference["path"]).unlink()
+    for validator in (module.check_offline, gate().validate_release_evidence):
+        with pytest.raises(FileNotFoundError):
+            validator(Evidence(tmp_path, test_only=True))
+
+
+def test_review_valid_arithmetic_cannot_replace_actual_case_aggregate(tmp_path):
+    from tests.test_parity_gate import complete_offline
+    identity, lock, pairs = fixture_workspace(tmp_path)
+    complete_offline(tmp_path, identity, lock, pairs)
+    ev = Evidence(tmp_path, test_only=True)
+    report = ev.json("offline-report.json")
+    original = report["comparisons"][0]
+    bundles = []
+    for side, profile in zip(("left", "right"), original["profiles"]):
+        bundle = {**ev.json(original["provenance"][side]["independent"]), "tensors": original[side]}
+        if side == "right":
+            arrays = {k: v.copy() for k, v in ev.tensors(bundle["tensors"]).items()}
+            arrays["decoded"] += np.float32(.001)  # Still within the approved synthetic bound.
+            bundle["tensors"] = write_tensors(tmp_path, arrays)
+        bundles.append(bundle)
+    forged = api().compare_tiers(ev, "diagnostic", *bundles,
+                                started_at=original["started_at"], ended_at=original["ended_at"])
+    assert forged["passed"]
+    forged["provenance"] = original["provenance"]
+    rewrite(tmp_path, "offline-report.json", lambda r: r["comparisons"].__setitem__(0, forged))
+    module = importlib.import_module("replay_checkpoint_parity")
+    with pytest.raises(ValueError, match="comparison aggregate"):
+        module.check_offline(Evidence(tmp_path, test_only=True))

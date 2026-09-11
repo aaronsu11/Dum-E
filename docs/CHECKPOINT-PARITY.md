@@ -162,6 +162,27 @@ Each side's decoded witness comes from its own complete preprocessing/decoding
 path. Common-input raw/noise witnesses are separately captured. The reducer and
 archived recheck are the same implementation used by fabricated tests.
 
+Each comparison archives separate independent/common bundle references for both
+sides. Every bundle binds an immutable launch, schedule, worker manifest and its
+durable case captures. Validation checks the measured profile, record digest and
+instruction, process identity, serial chronology, current instrument hashes and
+all captured inputs. Each numerical launch has a unique execution ID and schedule
+binding; every durable case records that execution and its capture start/end.
+Case times must fit the worker lifetime in order, so redating a worker around
+older captures fails. It reconstructs aggregates from those cases before checking
+the signed matrix and thresholds. Removing worker files while retaining aggregate
+arrays cannot pass.
+
+Repeatability uses the same worker validation. Its decoded/noise aggregates,
+signed statistics and raw/preprocessing maxima are recomputed from captured
+within-profile repetitions before a proposal can use them.
+
+The dependency-layer functions `parity_gate.validate_offline_evidence` and
+`validate_upstream_evidence` are shared by the CLI and canonical release gate.
+Release requires stock JUnit and runtime coverage, full collated inputs, signed
+matrices and complete worker provenance. Test-only fixtures satisfy these schemas
+but remain incapable of authorizing production release.
+
 The stock wrapper executes the unchanged producer and consumer in their
 respective existing containers. It uses seed 42, `new_embodiment`, the SO101
 checkpoint, and agreement-bound raw bounds. A private fresh producer directory
@@ -197,3 +218,10 @@ Tests explicitly use `Evidence(test_only=True)` and injected worker/subprocess
 collaborators. CLI paths cannot enable that fixture mode. A synthetic 600-case
 report proves orchestration membership and refusal behavior; it is not actual
 600-case inference evidence.
+
+Canonical closeout also calls the pure
+`parity_gate.validate_run_safety_journal(run)` immediately after reading the live
+run. It validates the journal hash chain and reconciles stop entries, clamp
+counts, stop reasons and safety flags. A preserved stop event cannot be hidden
+by changing report or trial summaries. The runner uses the same validator, and
+the gate imports no controller or motor modules.

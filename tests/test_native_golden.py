@@ -803,3 +803,54 @@ def test_full_600_cases_have_distinct_candidate_and_replay_execution(approved_co
             assert previous <= api().timestamp(saved["started_at"]) <= api().timestamp(saved["ended_at"])
             previous = api().timestamp(saved["ended_at"])
         assert previous <= api().timestamp(worker["ended_at"])
+
+
+
+@pytest.mark.parametrize("location", ["snapshot-entry", "blob-chain", "blob-directory",
+                                      "snapshot-ancestor", "model-ancestor", "hub-ancestor",
+                                      "revision-file", "revision-directory"])
+def test_cache_mount_rejects_absolute_host_links_to_identical_bytes(tmp_path, location):
+    fixture = production_probe_fixture(tmp_path)
+    before = cli().native_cache_identity(fixture["cache"])
+    link = fixture["snapshot"] / "model.safetensors"
+    assert not link.readlink().is_absolute()
+    status, measured = production_probe(fixture)
+    assert status == 0
+    api().validate_backbone_identity(measured, before)
+    if location == "snapshot-entry":
+        target = link.resolve()
+        link.unlink()
+        link.symlink_to(target)
+    else:
+        path = {
+            "blob-chain": fixture["model"] / "blobs/TEST_ONLY",
+            "blob-directory": fixture["model"] / "blobs",
+            "snapshot-ancestor": fixture["model"] / "snapshots",
+            "model-ancestor": fixture["model"],
+            "hub-ancestor": fixture["cache"] / "hub",
+            "revision-file": fixture["model"] / "refs/main",
+            "revision-directory": fixture["model"] / "refs",
+        }[location]
+        target = path.with_name("TEST_ONLY-moved-" + path.name)
+        path.rename(target)
+        path.symlink_to(target, target_is_directory=target.is_dir())
+    # Host resolution still exposes the exact same bytes. The absolute /tmp
+    # target does not exist under the worker mount at /root/.cache/huggingface.
+    assert link.is_file()
+    status, result = production_probe(fixture)
+    assert status == 1, "Host-only absolute links must not certify mounted cache prerequisites"
+    assert "absolute" in result["message"]
+
+
+def test_cache_mount_accepts_contained_relative_chains_and_ancestors(tmp_path):
+    fixture = production_probe_fixture(tmp_path)
+    before = cli().native_cache_identity(fixture["cache"])
+    for path in (fixture["model"] / "blobs/TEST_ONLY", fixture["model"] / "blobs",
+                 fixture["model"] / "snapshots", fixture["model"] / "refs"):
+        target = path.with_name("TEST_ONLY-moved-" + path.name)
+        path.rename(target)
+        path.symlink_to(target.name, target_is_directory=target.is_dir())
+    status, after = production_probe(fixture)
+    assert status == 0
+    api().validate_backbone_identity(after, before)
+    assert cli().native_cache_identity(fixture["cache"]) == before

@@ -125,17 +125,17 @@ def test_checkpoint_state_space_shows_range_m100_100_clip_fingerprint():
 
 
 def test_degrees_formula_cannot_reach_recorded_elbow_flex_maximum():
-    """elbow_flex's full mechanical span is +/-96.35 deg, but the checkpoint records 100.0.
+    """elbow_flex's full mechanical span is +/-96.57 deg, but the checkpoint records 100.0.
 
     Under RANGE_M100_100 a recorded 100.0 is simply the joint driven to its
     calibrated limit. Under DEGREES it is unreachable, because the joint's tick
-    span converts to at most 96.35 degrees.
+    span converts to at most 96.57 degrees.
     """
     index = JOINT_NAMES.index("elbow_flex")
     low_deg, high_deg = degrees_reachable_range("elbow_flex")
 
-    assert round(high_deg, 2) == 96.35
-    assert round(low_deg, 2) == -96.35
+    assert round(high_deg, 2) == 96.57
+    assert round(low_deg, 2) == -96.57
 
     recorded_max = CHECKPOINT_STATE_STATS["single_arm"]["max"][index]
     recorded_q99 = CHECKPOINT_STATE_STATS["single_arm"]["q99"][index]
@@ -159,20 +159,18 @@ def test_degrees_formula_cannot_reach_recorded_elbow_flex_maximum():
 # --- Argument 3: the wrist_roll cross-check against the dataset -------------
 
 
-def test_wrist_roll_percent_conversion_lands_inside_dataset_band():
-    """Dum-E's hardcoded -90.0 is -53.64 percent, inside the dataset's band.
+def test_current_wrist_roll_conversion_no_longer_supports_historical_band():
+    """Current calibration maps -90 degrees to -50 percent, outside the old band.
 
-    The dataset's episode-0 wrist_roll band is [-58.952, -50.564] with a
-    standard deviation of 2.885. Read as percent, Dum-E's pose lands inside it.
-    Read as degrees, -90.0 is more than 10 standard deviations outside — so the
-    two hypotheses give different answers, which is what makes this evidence.
+    The historical calibration gave -53.64 percent. Its cross-check remains
+    historical evidence; the current arithmetic must not claim to reproduce it.
     """
     index = JOINT_NAMES.index("wrist_roll")
     as_degrees = DUME_POSES["ready"][index]
     assert as_degrees == -90.0
 
     as_percent = degrees_to_percent(DUME_POSES["ready"][:5])[index]
-    assert round(as_percent, 2) == -53.64
+    assert round(as_percent, 2) == -50.0
 
     band_low = DATASET_EPISODE0_STATE_STATS["min"][index]
     band_high = DATASET_EPISODE0_STATE_STATS["max"][index]
@@ -181,8 +179,8 @@ def test_wrist_roll_percent_conversion_lands_inside_dataset_band():
     assert (band_low, band_high) == (-58.952, -50.564)
     assert std == 2.885
 
-    assert band_low <= as_percent <= band_high, (
-        f"the percent reading {as_percent} must land inside the dataset band "
+    assert not (band_low <= as_percent <= band_high), (
+        f"the current percent reading {as_percent} no longer lands inside the historical band "
         f"[{band_low}, {band_high}]"
     )
     assert not (band_low <= as_degrees <= band_high)
@@ -235,7 +233,7 @@ def test_initial_pose_envelope_discriminates_between_conventions():
 
     This is the ONLY envelope check the verdict retains, and it is a boundary
     case: -102 sits just past the q01 of -99.743 as degrees, and just inside it
-    at -98.33 as percent. One step either side of the boundary behaves
+    at -98.83 as percent. One step either side of the boundary behaves
     differently — unlike the ready pose.
     """
     index = JOINT_NAMES.index("shoulder_lift")
@@ -243,7 +241,7 @@ def test_initial_pose_envelope_discriminates_between_conventions():
     as_percent = degrees_to_percent(as_degrees)
 
     assert as_degrees[index] == -102.0
-    assert round(as_percent[index], 2) == -98.33
+    assert round(as_percent[index], 2) == -98.83
 
     inside_as_degrees = envelope_contains(as_degrees)
     inside_as_percent = envelope_contains(as_percent)
@@ -253,7 +251,7 @@ def test_initial_pose_envelope_discriminates_between_conventions():
         "state q01/q99 envelope"
     )
     assert inside_as_percent[index] is True, (
-        "read as percent, shoulder_lift -98.33 must fall INSIDE the envelope"
+        "read as percent, shoulder_lift -98.83 must fall INSIDE the envelope"
     )
     assert inside_as_degrees != inside_as_percent, (
         "the initial pose must discriminate, otherwise no envelope check does"
@@ -318,7 +316,7 @@ def test_deg_per_pct_table_matches_pinned_values():
     table = deg_per_pct_table()
 
     assert [round(table[joint], 5) for joint in ARM_JOINTS] == DEG_PER_PCT_PINNED
-    assert DEG_PER_PCT_PINNED == [1.16527, 1.03736, 0.96352, 1.00791, 1.6778]
+    assert DEG_PER_PCT_PINNED == [1.13934, 1.03209, 0.96571, 1.00396, 1.8]
     assert MAX_RES == 4095, "the servo resolution constant is 4096 minus one"
 
     # The gripper is excluded: it is RANGE_0_100 under both settings, so there is
@@ -333,8 +331,8 @@ def test_deg_per_pct_table_matches_pinned_values():
     divergence = {joint: (factor - 1.0) * 100.0 for joint, factor in table.items()}
     assert min(divergence, key=lambda joint: abs(divergence[joint])) == "wrist_flex"
     assert max(divergence, key=lambda joint: abs(divergence[joint])) == "wrist_roll"
-    assert round(divergence["wrist_flex"], 2) == 0.79
-    assert round(divergence["wrist_roll"], 2) == 67.78
+    assert round(divergence["wrist_flex"], 2) == 0.4
+    assert round(divergence["wrist_roll"], 2) == 80.0
 
     # The scale is exactly (span * 360) / (MAX_RES * 200), in float64, unrounded.
     for joint in ARM_JOINTS:
@@ -412,17 +410,17 @@ def test_assert_pose_reachable_accepts_dume_poses_and_rejects_a_pose_past_a_stop
     (motors_bus.py :904-907) — unbounded. A commanded degree value outside a
     joint's calibrated span therefore becomes an out-of-range tick and drives the
     servo into a stop. Every one of Dum-E's own poses must pass; a value past
-    ``elbow_flex``'s +/-96.35 span must not.
+    ``elbow_flex``'s +/-96.57 span must not.
 
     The calibration is passed in explicitly. On the live path the caller hands it
     ``bus.calibration``; here it is the pinned table, which is what makes the
-    +/-96.35 span in this test's arithmetic well-defined.
+    +/-96.57 span in this test's arithmetic well-defined.
     """
     for pose in DUME_POSES.values():
         assert_pose_reachable(list(pose), CALIBRATION_TICK_RANGES)
 
     low, high = degrees_reachable_range("elbow_flex")
-    assert round(high, 2) == 96.35
+    assert round(high, 2) == 96.57
 
     unreachable = list(DUME_POSES["initial"])
     unreachable[2] = high + 5.0
@@ -658,7 +656,7 @@ def test_envelope_row_discriminates_at_initial_and_does_not_at_ready():
     assert discriminating[0]["percent_inside"] is True
     assert discriminating[0]["degrees_inside"] is False
     assert round(discriminating[0]["as_degrees"], 2) == -102.0
-    assert round(discriminating[0]["as_percent"], 2) == -98.33
+    assert round(discriminating[0]["as_percent"], 2) == -98.83
 
     ready_deg = DUME_POSES["ready"][:5]
     ready_pct = degrees_to_percent(ready_deg)
@@ -787,3 +785,39 @@ def test_current_resolver_cannot_fall_back_to_stale_robot_copy(tmp_path, monkeyp
     assert not current.exists()
     assert not probe.check_pinned_constants_against_local_artifacts(
         calibration_path=str(current))[0]
+
+
+def test_derivation_missing_statistics_is_not_run(derivation_inputs):
+    calibration, statistics = derivation_inputs
+    statistics.unlink()
+    with pytest.raises(FileNotFoundError):
+        probe.derive_current_calibration(calibration, statistics)
+    assert not probe.check_pinned_constants_against_local_artifacts(
+        str(statistics), str(calibration))[0]
+
+
+def test_derivation_publication_is_immutable_and_hashes_exact_inputs(derivation_inputs, tmp_path):
+    import hashlib
+    import json
+    calibration, statistics = derivation_inputs
+    record = probe.derive_current_calibration(calibration, statistics)
+    assert record['calibration']['sha256'] == hashlib.sha256(calibration.read_bytes()).hexdigest()
+    assert record['statistics']['sha256'] == hashlib.sha256(statistics.read_bytes()).hexdigest()
+    assert record['at_limit_predictions']['elbow_flex']['tick'] == 3100
+    assert record['at_limit_predictions']['elbow_flex']['degrees'] == pytest.approx(96.57142857142857)
+    assert not record['wrist_roll_cross_check']['percent_inside_band']
+    target = tmp_path/'evidence/calibration.json'
+    probe.write_derivation(target, record)
+    before = target.read_bytes()
+    with pytest.raises(FileExistsError):
+        probe.write_derivation(target, {**record, 'status': 'failed'})
+    assert target.read_bytes() == before
+    assert json.loads(before)['kind'] == 'offline_arithmetic'
+
+
+def test_derivation_cli_rejects_stale_explicit_copy(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, 'argv', ['probe', '--skip-hardware', '--calibration',
+        str(tmp_path/'stale.json'), '--write-derivation', str(tmp_path/'evidence.json')])
+    with pytest.raises(SystemExit) as exc:
+        probe.main()
+    assert exc.value.code == 2

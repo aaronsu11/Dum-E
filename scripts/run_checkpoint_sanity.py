@@ -733,40 +733,13 @@ class RuntimeSource:
             self._policy.close()
 
 
-def validate_run_safety_journal(run):
-    events = run.get("events")
-    gate.require(isinstance(events, list) and bool(events), "operation journal missing")
-    previous, stops = None, []
-    for index, entry in enumerate(events):
-        gate.require(isinstance(entry, dict), "invalid operation journal entry")
-        event = dict(entry)
-        checksum = event.pop("sha256", None)
-        gate.require(type(event.get("index")) is int and event["index"] == index and
-                event.get("previous") == previous and digest(event) == checksum,
-                "operation journal changed")
-        gate.require(event.get("kind") in ("dispatch", "returned", "stop"), "unknown operation journal event")
-        if event["kind"] == "stop":
-            gate.require(type(event.get("clamp")) is bool, "invalid journal clamp flag")
-            gate.text(event.get("reason"), "journal stop reason")
-            stops.append(entry)
-        previous = checksum
-    gate.require(run.get("stop_events") == stops, "journal stop_events disagree")
-    clamps = sum(event["clamp"] for event in stops)
-    gate.require(type(run.get("safety_stop")) is bool and run["safety_stop"] == bool(stops) and
-            type(run.get("clamp_warnings")) is int and run["clamp_warnings"] == clamps and
-            run.get("stop_reason") == (stops[0]["reason"] if stops else ""),
-            "journal safety summary disagrees")
-    gate.require(not stops and clamps == 0, "journal safety event overrides score")
-
-
-
 def check(workspace):
     ev = fresh_evidence(workspace)
     gate.validate_live_approval(ev)
     if not (ev.workspace / "live-run.json").exists():
         return {"status": "complete", "stage": "live-approval-check", "hardware_verified": False}
     result = ev.record("live-run.json")
-    validate_run_safety_journal(result)
+    gate.validate_run_safety_journal(result)
     gate.require(result["approval"] == ev.reference("live-approval.json"), "run approval changed")
     gate.require(result["instruction"] == INSTRUCTION and result["safety_stop"] is False and
                  result["clamp_warnings"] == 0 and len(result["trials"]) == TRIALS,

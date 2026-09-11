@@ -1179,19 +1179,31 @@ def test_live_parity_attestation_binds_actual_load_request_and_host():
     # Run this selection after Plan 04 packages the new server. The runtime
     # directory must be shared with the opt-in server and explicitly selected:
     # DUME_PARITY_ATTESTATION_FILE=/host/workspace/runtime/lerobot.json.
+    # DUME_PARITY_PROFILES_FILE names the independent measured profiles.json;
+    # the expected configuration must never come from this attestation itself.
     # This test neither approves evidence nor constructs a robot.
     from policy_guard.parity_gate import (
         array_fingerprint, collect_runtime_host, inspect_container_binding,
-        observation_fingerprint, timestamp, validate_runtime_attestation,
+        observation_fingerprint, operational_semantics, timestamp, validate_runtime_attestation,
         write_runtime_json,
     )
-    from policy_guard.replay_contract import capture_bytes, read_json
+    from policy_guard.replay_contract import capture_bytes, read_json, validate_profile
 
     selected = os.environ.get("DUME_PARITY_ATTESTATION_FILE")
     assert selected, "An explicit host path to the shared runtime/lerobot.json is required"
     path = Path(selected)
     assert path.name == "lerobot.json"
+    profile_path = os.environ.get("DUME_PARITY_PROFILES_FILE")
+    assert profile_path, "An explicit independently measured profiles.json path is required"
+    profiles_bytes = capture_bytes(Path(profile_path))
+    profiles = read_json(profiles_bytes)
+    matching = [entry["observed"] for entry in profiles["profiles"]
+                if entry["backend"] == "lerobot" and entry["purpose"] == "operational"]
+    assert len(matching) == 1, "Exactly one measured LeRobot operational profile is required"
+    validate_profile(matching[0])
+    expected_configuration = operational_semantics(matching[0])
     binding = inspect_container_binding(CONTAINER_NAME, SERVER_ADDRESS, CHECKPOINT_MOUNT)
+    assert expected_configuration["image_digest"] == binding["image_digest"]
     write_runtime_json(path.parent / "container.json", binding)
     session = LeRobotPolicySession(SERVER_ADDRESS)
     try:
@@ -1225,10 +1237,10 @@ def test_live_parity_attestation_binds_actual_load_request_and_host():
         assert attestation["observations"]["sdpa_calls"] > 0
         assert sem["effective_configuration"]["serving"]["served_letter_box_transform"] is True
         validate_runtime_attestation(attestation, host=host, request=request,
-                                     expected_configuration=sem, now=_utc_now_rfc3339())
-        # This is measurement, not release approval. Plan 04 must bind these
-        # facts to its independent measured operational profile before agreement.
+                                     expected_configuration=expected_configuration, now=_utc_now_rfc3339())
+        # This compares independent capture paths and is still not an approval.
         print(json.dumps({"status": "complete", "image_digest": sem["image_digest"],
+                          "profiles_sha256": hashlib.sha256(profiles_bytes).hexdigest(),
                           "configuration_fingerprint": attestation["configuration_fingerprint"],
                           "request": request, "observations": attestation["observations"]}, sort_keys=True))
     finally:

@@ -383,10 +383,27 @@ def capture_serving_identity(checkpoint, binding_path):
     }
 
 
-def serving_profile(server, model, identity, observation, raw):
-    """Measured operational profile, projectable by the same gate as replay."""
+def capture_effective_configuration(server, model):
+    """Capture the actual loaded model and ordered processors for both paths.
+
+    Replay and serving each call this on their own constructed objects. Keep
+    processor settings in the same identity as model/policy/SAFE-01 facts; the
+    public attestation projects arbitrary configuration values to hashes later.
+    """
     snapshot = snapshot_from_loaded(server.policy.config, server.preprocessor, server.postprocessor, server.actions_per_chunk)
     assert_groot_serving_contract(snapshot)
+    return configuration_value({
+        "model": model.config.to_dict(), "policy": server.policy.config, "serving": snapshot,
+        "processors": {
+            "pre": [{"type": type(step).__name__, "config": step.get_config()} for step in server.preprocessor.steps],
+            "post": [{"type": type(step).__name__, "config": step.get_config()} for step in server.postprocessor.steps],
+        },
+    })
+
+
+def serving_profile(server, model, identity, observation, raw):
+    """Measured operational profile, projectable by the same gate as replay."""
+    effective = capture_effective_configuration(server, model)
     config = model.backbone.model.config
     attention = sorted({config._attn_implementation, config.text_config._attn_implementation,
                         config.vision_config._attn_implementation})
@@ -398,13 +415,6 @@ def serving_profile(server, model, identity, observation, raw):
             "actual full raw/noise boundary missing")
     require(observation.sdpa_calls > 0 and observation.floating_operation_count > 0,
             "actual SDPA and floating compute observation required")
-    effective = configuration_value({
-        "model": model.config.to_dict(), "policy": server.policy.config, "serving": snapshot,
-        "processors": {
-            "pre": [{"type": type(step).__name__, "config": step.get_config()} for step in server.preprocessor.steps],
-            "post": [{"type": type(step).__name__, "config": step.get_config()} for step in server.postprocessor.steps],
-        },
-    })
     return {
         **{key: identity[key] for key in ("checkpoint_fingerprint", "backbone_fingerprint", "source", "owned_source_files", "packages")},
         "image_digest": identity["container"]["image_digest"], "backend": "lerobot", "purpose": "operational",

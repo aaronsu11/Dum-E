@@ -118,14 +118,9 @@ class LeRobotReplay:
         }
 
     def effective_configuration(self):
-        from policy_guard.groot_guard import snapshot_from_loaded
-        return {
-            "model": self.raw_model.config.to_dict(), "policy": self.server.policy.config,
-            "serving": snapshot_from_loaded(
-                self.server.policy.config, self.server.preprocessor, self.server.postprocessor,
-                configured_actions_per_chunk=self.server.actions_per_chunk,
-            ),
-        }
+        from server import capture_effective_configuration
+
+        return capture_effective_configuration(self.server, self.raw_model)
 
     def predict(self, arrays, entry):
         from lerobot.async_inference.helpers import TimedObservation

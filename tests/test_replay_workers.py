@@ -509,3 +509,24 @@ def test_native_operational_mapping_observes_real_policy_collaborator_changes():
         pytest.fail(f"Operational mapping must be testable through the serving collaborator without diagnostic imports: {exc}")
     assert np.all(changed[:, :5] - original[:, :5] == 3)
     assert np.all(changed[:, 5] == original[:, 5])
+
+
+def test_full_600_case_stream_preserves_order_instructions_and_distinct_seeds(tmp_path):
+    api = contract()
+    lock = schedule_lock()
+    cases = lock["schedule"]
+    api.validate_schedule(lock, cases, "replay")
+    report = api.ReplayManifest("fixture", "diagnostic", lock["fingerprint"], cases, evidence_kind="hermetic_fixture")
+    seen = []
+    def trace(key):
+        seen.append(key)
+        observed, tensors, entry = fixture_trace(key, lock)
+        observed["floating_operation_count"] = 100 + len(seen)
+        return observed, tensors, entry
+    api.execute_cases(report, tmp_path, lock, cases, trace, "fixture")
+    assert seen == cases == report.executed_cases
+    assert len(report.cases) == 600 and not report.failure_ledger
+    assert {case["instruction"] for case in report.cases} == {"banana", "apple", "orange"}
+    assert {case["key"]["seed"] for case in report.cases[:5]} == {42, 43, 44, 45, 46}
+    assert len(list((tmp_path / "workers/cases").glob("*.json"))) == 600
+    assert report.evidence_kind == "hermetic_fixture"

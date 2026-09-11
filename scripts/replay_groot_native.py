@@ -123,10 +123,20 @@ class NativeReplay:
             getattr(config.vision_config, "_attn_implementation"),
         }
 
-    def predict(self, arrays, entry):
-        from gr00t.data.types import MessageType, VLAStepData
-        from gr00t.policy.gr00t_policy import _rec_to_dtype
+    def effective_configuration(self):
+        processor = {name: getattr(self.processor, name) for name in (
+            "use_percentiles", "use_mean_std", "clip_outliers", "apply_sincos_state_encoding",
+            "use_relative_action", "exclude_state", "state_dropout_prob", "letter_box_transform",
+            "formalize_language", "model_name", "model_type", "max_state_dim", "max_action_dim",
+            "max_action_horizon", "image_crop_size", "image_target_size", "shortest_image_edge",
+            "crop_fraction", "use_albumentations", "training",
+        )}
+        processor["modalities"] = self.processor.get_modality_configs()
+        processor["statistics"] = self.processor.statistics
+        processor["tokenizer_padding_side"] = self.processor.processor.tokenizer.padding_side
+        return {"model": self.raw_model.config.to_dict(), "processor": processor}
 
+    def predict(self, arrays, entry):
         state = arrays["state"]
         states = {"single_arm": state[:5][None], "gripper": state[5:6][None]}
         if self.purpose == "operational":
@@ -137,6 +147,9 @@ class NativeReplay:
             }
             actions, _ = self.policy.get_action(observation)
         else:
+            from gr00t.data.types import MessageType, VLAStepData
+            from gr00t.policy.gr00t_policy import _rec_to_dtype
+
             step = VLAStepData(
                 embodiment=self.tag,
                 images={key: arrays[f"video_{key}"][None] for key in CAMERA_ORDER},

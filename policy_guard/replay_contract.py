@@ -18,6 +18,7 @@ import tempfile
 import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -54,12 +55,12 @@ def _unique_object(pairs):
     return result
 
 
-def read_json(path: Path | str) -> dict:
-    path = Path(path)
-    if path.stat().st_size > MAX_JSON:
-        raise ValueError(f"excessive JSON size: {path}")
+def read_json(path: Path | str | bytes) -> dict:
+    data = path if isinstance(path, bytes) else capture_bytes(Path(path), MAX_JSON)
+    if len(data) > MAX_JSON:
+        raise ValueError("excessive JSON size")
     result = json.loads(
-        path.read_text(), object_pairs_hook=_unique_object,
+        data, object_pairs_hook=_unique_object,
         parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
     )
     if not isinstance(result, dict):
@@ -75,6 +76,27 @@ def canonical(value: Any) -> bytes:
 
 def fingerprint_configuration(value: Any) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def configuration_value(value):
+    """Serialize actual configuration without unstable repr/object addresses."""
+    if hasattr(value, "__dataclass_fields__"):
+        return configuration_value(asdict(value))
+    if isinstance(value, Enum):
+        return configuration_value(value.value)
+    if isinstance(value, dict):
+        return {str(key): configuration_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [configuration_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path) or (type(value).__module__ == "torch" and type(value).__name__ == "dtype"):
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"unsupported effective configuration type: {type(value).__name__}")
 
 
 def sha256_file(path: Path | str) -> str:
@@ -237,11 +259,110 @@ class ReplayManifest:
     ended_at: str | None = None
     evidence_kind: str = "real_model"
     profile_fingerprint: str | None = None
+    configuration_fingerprint: str | None = None
     profile: dict = field(default_factory=dict)
     executed_cases: list = field(default_factory=list)
     cases: list = field(default_factory=list)
     prerequisite_errors: list = field(default_factory=list)
     resources: dict = field(default_factory=dict)
+    failure_ledger: list = field(default_factory=list)
+
+
+def base_case(key: dict) -> dict:
+    return {"record": key["record"], "seed": key["seed"]}
+
+
+def validate_schedule(lock: dict, cases: list, kind: str) -> None:
+    if lock["joint_order"] != list(JOINT_ORDER) or lock["camera_order"] != list(CAMERA_ORDER):
+        raise ValueError("joint/camera permutation")
+    records = lock["records"]
+    if len(records) != 120:
+        raise ValueError("exactly 120 records required")
+    expected = []
+    for index, entry in enumerate(records):
+        if entry["file"] != f"record_{index:04d}.npz":
+            raise ValueError("record membership/order changed")
+        seeds = entry["seeds"]
+        if len(seeds) != 5 or len(set(seeds)) != 5 or any(type(seed) is not int for seed in seeds):
+            raise ValueError("five distinct integer seeds required")
+        expected.extend({"record": entry["file"], "seed": seed} for seed in seeds)
+    if lock["schedule"] != expected or len(expected) != 600:
+        raise ValueError("locked schedule differs from exact 600 pairs")
+    if kind == "replay":
+        valid = cases == expected
+    elif kind == "tracer":
+        valid = len(cases) == 1 and cases[0] in expected
+    elif kind == "repeatability":
+        valid = any(cases == group["cases"] for group in repeatability_schedule(lock)["groups"])
+    else:
+        raise ValueError(f"unknown schedule kind: {kind}")
+    if not valid:
+        raise ValueError(f"incomplete or altered {kind} schedule")
+
+
+def repeatability_schedule(lock: dict) -> dict:
+    validate_schedule(lock, lock["schedule"], "replay")
+    warm, cold = [], []
+    for index in (0, 60, 80, 90, 100, 119):
+        record = lock["records"][index]
+        first, second = record["seeds"][:2]
+        warm.extend({"record": record["file"], "seed": first, "mode": "warm", "repeat": i} for i in range(5))
+        warm.append({"record": record["file"], "seed": second, "mode": "changed", "repeat": 0})
+        cold.extend({"id": f"cold-{index:04d}-{i}", "cases": [{"record": record["file"], "seed": first, "mode": "cold", "repeat": i}]} for i in range(2))
+    return {"kind": "repeatability", "groups": [{"id": "warm", "cases": warm}, *cold]}
+
+
+def profile_configuration(profile: dict) -> dict:
+    # Operation counts can vary with the input. Every individual observation is
+    # still retained and validated; it is not part of semantic configuration.
+    return {key: value for key, value in profile.items() if key not in (
+        "sdpa_calls", "floating_operation_count", "non_fp32_operations",
+    )}
+
+
+def execute_cases(report, workspace, lock, cases, trace_case, label):
+    """Serialize each complete prediction/decode, publishing before the next case."""
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", label) or not cases:
+        raise ValueError("invalid case stream label or empty schedule")
+    for index, key in enumerate(cases):
+        try:
+            profile, tensors, entry = trace_case(key)
+            reference = write_tensors(workspace, tensors)
+            case = {"key": key, "record_sha256": entry["sha256"],
+                    "instruction": entry["instruction"], "tensors": reference,
+                    "observer_inert": profile["observer_inert"],
+                    "profile_fingerprint": fingerprint_configuration(profile)}
+            current = fingerprint_configuration(profile_configuration(profile))
+            issue = None
+            try:
+                validate_profile(profile)
+            except ValueError as exc:
+                issue = PrerequisiteError(f"observed required profile unsupported: {exc}")
+            if report.configuration_fingerprint and current != report.configuration_fingerprint:
+                issue = ValueError("mixed effective configuration in case stream")
+            if not report.profile:
+                report.profile = profile
+                report.profile_fingerprint = case["profile_fingerprint"]
+                report.configuration_fingerprint = current
+            payload = {**case, "schema_version": 1, "session": report.session,
+                       "stage": report.stage, "input_fingerprint": report.input_fingerprint,
+                       "evidence_kind": report.evidence_kind, "profile": profile,
+                       "status": "complete" if issue is None else "not_run",
+                       "error": None if issue is None else str(issue)}
+            case["evidence"] = write_evidence(workspace, f"workers/cases/{label}-{index:04d}.json", payload)
+            report.cases.append(case)
+            report.executed_cases.append(key)
+            if issue is not None:
+                raise issue
+        except Exception as exc:
+            failure = write_evidence(workspace, f"workers/failures/{label}-{index:04d}.json", {
+                "schema_version": 1, "session": report.session, "key": key,
+                "evidence_kind": report.evidence_kind, "input_fingerprint": report.input_fingerprint,
+                "status": "not_run" if prerequisite_exception(exc) else "failed",
+                "type": type(exc).__name__, "message": str(exc), "recorded_at": now(),
+            })
+            report.failure_ledger.append(failure)
+            raise
 
 
 @dataclass(frozen=True)
@@ -326,20 +447,41 @@ def validate_replay_manifest(
     validate_profile(report["profile"])
     if fingerprint_configuration(report["profile"]) != report["profile_fingerprint"]:
         raise ValueError("profile fingerprint mismatch")
+    if report.get("configuration_fingerprint") and fingerprint_configuration(profile_configuration(report["profile"])) != report["configuration_fingerprint"]:
+        raise ValueError("manifest configuration differs from bound profile")
     for expected, case in zip(expected_cases, report["cases"], strict=True):
         if case["key"] != expected:
             raise ValueError("case coverage mismatch")
-        if expected not in input_lock["schedule"]:
+        if base_case(expected) not in input_lock["schedule"]:
             raise ValueError("case is outside locked schedule")
         record = next((r for r in input_lock["records"] if r["file"] == expected["record"]), None)
         if record is None or case.get("record_sha256") != record["sha256"]:
             raise ValueError("case record digest differs from locked record")
         if case.get("instruction") != record["instruction"]:
             raise ValueError("case instruction differs from locked record")
+        if "evidence" in case:
+            saved = read_json(verify_file(workspace, case["evidence"]))
+            for key, value in case.items():
+                if key != "evidence" and saved.get(key) != value:
+                    raise ValueError("durable case evidence differs from manifest")
+            for key, value in (("session", expected_session), ("stage", purpose),
+                               ("input_fingerprint", input_lock["fingerprint"]),
+                               ("status", "complete"), ("evidence_kind", "real_model")):
+                if saved.get(key) != value:
+                    raise ValueError(f"durable case {key} differs from launcher")
+            validate_profile(saved["profile"])
+            if fingerprint_configuration(saved["profile"]) != case["profile_fingerprint"]:
+                raise ValueError("durable profile digest mismatch")
+            if fingerprint_configuration(profile_configuration(saved["profile"])) != report["configuration_fingerprint"]:
+                raise ValueError("mixed effective configuration in manifest")
+        elif len(expected_cases) > 1 or report.get("configuration_fingerprint"):
+            raise ValueError("missing durable per-case evidence")
         arrays = read_tensors(workspace, case["tensors"])
         for key, shape in (("raw", RAW_SHAPE), ("noise", RAW_SHAPE), ("decoded", DECODED_SHAPE)):
             if key not in arrays or arrays[key].shape != shape:
                 raise ValueError(f"missing/wrong full {key} shape")
+            if arrays[key].dtype != np.float32:
+                raise ValueError(f"unexpected serialized {key} dtype")
         if not case.get("observer_inert") or not case.get("record_sha256"):
             raise ValueError("missing input/observer evidence")
 
@@ -409,10 +551,12 @@ def load_input_lock(corpus: Path | str, checkpoint: Path | str) -> dict:
         "historical_seed_options_sent": manifest["seed_options_sent"],
     }
     result["fingerprint"] = fingerprint_configuration(result)
+    validate_schedule(result, schedule, "replay")
     return result
 
 
 def load_case(corpus: Path, lock: dict, key: dict) -> tuple[dict, dict]:
+    key = base_case(key)
     if key not in lock["schedule"]:
         raise ValueError("case not in locked schedule")
     entry = next(item for item in lock["records"] if item["file"] == key["record"])
@@ -751,7 +895,8 @@ def worker_main(backend: str, adapter_factory, stock_loader=None) -> int:
     try:
         session = read_json(workspace / "session.json")
         lock = read_json(args.input_lock)
-        schedule = read_json(args.schedule)["cases"]
+        schedule_record = read_json(args.schedule)
+        schedule = schedule_record["cases"]
         report = ReplayManifest(
             session=session["session_id"], stage=args.profile,
             input_fingerprint=lock["fingerprint"], expected_cases=schedule,
@@ -759,9 +904,11 @@ def worker_main(backend: str, adapter_factory, stock_loader=None) -> int:
         current = load_input_lock(args.corpus, args.checkpoint)
         if current != lock:
             raise ValueError("input lock changed before worker inference")
-        if len(schedule) != 1:
-            raise PrerequisiteError("Task 1 accepts one case; expansion gate not crossed")
-        arrays, entry = load_case(Path(args.corpus), lock, schedule[0])
+        validate_schedule(lock, schedule, schedule_record.get("kind", "tracer"))
+        if schedule_record.get("session") != session["session_id"]:
+            raise ValueError("schedule belongs to another session")
+        if schedule_record.get("input_fingerprint", lock["fingerprint"]) != lock["fingerprint"]:
+            raise ValueError("schedule belongs to another input lock")
         import torch
 
         identity = runtime_identity(backend, args.image_digest, lock)
@@ -802,20 +949,14 @@ def worker_main(backend: str, adapter_factory, stock_loader=None) -> int:
         else:
             adapter = adapter_factory(Path(args.checkpoint), args.profile, args.device)
             report.resources["load_seconds"] = time.perf_counter() - start
-            profile, tensors = trace_prediction(adapter, arrays, entry, schedule[0]["seed"], identity)
-            report.profile = profile
-            report.profile_fingerprint = fingerprint_configuration(profile)
-            reference = write_tensors(workspace, tensors)
-            report.cases.append({
-                "key": schedule[0], "record_sha256": entry["sha256"],
-                "instruction": entry["instruction"], "tensors": reference,
-                "observer_inert": profile["observer_inert"],
-            })
-            report.executed_cases.append(schedule[0])
-            try:
-                validate_profile(profile)
-            except ValueError as exc:
-                raise PrerequisiteError(f"observed required profile unsupported: {exc}") from exc
+            effective = configuration_value(adapter.effective_configuration())
+            identity["effective_configuration"] = effective
+            identity["effective_configuration_fingerprint"] = fingerprint_configuration(effective)
+            def trace_case(key):
+                arrays, entry = load_case(Path(args.corpus), lock, key)
+                profile, tensors = trace_prediction(adapter, arrays, entry, key["seed"], identity)
+                return profile, tensors, entry
+            execute_cases(report, workspace, lock, schedule, trace_case, Path(args.output_manifest).stem)
             report.status = "complete"
     except Exception as exc:
         if report is None:

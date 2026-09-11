@@ -13,7 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from policy_guard.replay_contract import (  # noqa: E402
     PrerequisiteError, contained, fingerprint_configuration, load_input_lock,
-    now, read_json, sha256_file, validate_replay_manifest, write_evidence,
+    now, read_json, repeatability_schedule, sha256_file, validate_replay_manifest,
+    validate_schedule, write_evidence,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +54,7 @@ def profile_device(args, purpose):
     return args.device
 
 
-def worker_argv(args, backend, purpose, image, output, container_name):
+def worker_argv(args, backend, purpose, image, output, container_name, schedule_file="tracer-schedule.json"):
     device = profile_device(args, purpose)
     script = "/replay/scripts/replay_groot_native.py" if backend == "native" else "/replay/docker/lerobot-policy/replay_checkpoint.py"
     argv = [
@@ -95,7 +96,7 @@ def worker_argv(args, backend, purpose, image, output, container_name):
         argv += ["--env", f"{key}={value}"]
     argv += [
         "--entrypoint", "python" if backend == "native" else "python3", image, script,
-        "--input-lock", "/evidence/input-lock.json", "--schedule", "/evidence/tracer-schedule.json",
+        "--input-lock", "/evidence/input-lock.json", "--schedule", f"/evidence/{schedule_file}",
         "--corpus", "/inputs/corpus", "--checkpoint", "/inputs/checkpoint",
         "--workspace", "/evidence", "--profile", purpose, "--output-manifest", output,
         "--image-digest", image, "--device", device,
@@ -103,14 +104,14 @@ def worker_argv(args, backend, purpose, image, output, container_name):
     return argv
 
 
-def run_worker(args, backend, purpose, image, cases):
-    label = f"{backend}-{purpose}"
+def run_worker(args, backend, purpose, image, cases, schedule_file="tracer-schedule.json", suffix=""):
+    label = f"{backend}-{purpose}{suffix}"
     output = f"workers/{label}.json"
     destination = contained(args.workspace, output)
     if destination.exists():
         raise FileExistsError(f"immutable worker evidence exists: {destination}")
     container_name = f"dume-replay-{label}-{os.getpid()}"
-    argv = worker_argv(args, backend, purpose, image, output, container_name)
+    argv = worker_argv(args, backend, purpose, image, output, container_name, schedule_file)
     expected_session = read_json(args.workspace / "session.json")["session_id"]
     input_lock = read_json(args.workspace / "input-lock.json")
     source_files = {name: sha256_file(ROOT / name) for name in (
@@ -153,12 +154,16 @@ def run_worker(args, backend, purpose, image, cases):
         launch["status"] = "failed"
         launch["error"] = "nonzero worker exit cannot complete"
     if report["status"] == "complete" and purpose != "stock-capacity":
-        validate_replay_manifest(
-            report, args.workspace, cases, expected_session=expected_session,
-            input_lock=input_lock, backend=backend, purpose=purpose,
-            checkpoint_fingerprint=input_lock["checkpoint_fingerprint"],
-            image_digest=image, source_files=source_files, device=device,
-        )
+        try:
+            validate_replay_manifest(
+                report, args.workspace, cases, expected_session=expected_session,
+                input_lock=input_lock, backend=backend, purpose=purpose,
+                checkpoint_fingerprint=input_lock["checkpoint_fingerprint"],
+                image_digest=image, source_files=source_files, device=device,
+            )
+        except ValueError as exc:
+            launch["status"] = "failed"
+            launch["validation_error"] = str(exc)
     launch["manifest"] = {"path": output, "sha256": sha256_file(destination)}
     print(json.dumps({"worker": label, "status": launch["status"], "exit_code": exit_code}), flush=True)
     return launch, report
@@ -166,7 +171,10 @@ def run_worker(args, backend, purpose, image, cases):
 
 def feasibility(args):
     started = now()
-    report = {"schema_version": 1, "stage": "feasibility", "status": "not_run", "started_at": started, "workers": [], "prerequisite_errors": []}
+    stage = args.stage
+    schedule_name = "tracer-schedule.json" if stage == "feasibility" else f"{stage}-schedule.json"
+    profiles_name = "profiles.json" if stage == "feasibility" else f"{stage}-profiles.json"
+    report = {"schema_version": 1, "stage": stage, "status": "not_run", "started_at": started, "workers": [], "prerequisite_errors": [], "purpose": "trace collection only"}
     workspace_ready = False
     try:
         # Absent inputs report not_run even before a session/workspace exists.
@@ -177,7 +185,7 @@ def feasibility(args):
         session = read_json(session_path)
         if session.get("schema_version") != 1 or not session.get("session_id"):
             raise ValueError("invalid existing session identity")
-        for name in ("input-lock.json", "profiles.json", "feasibility.json", "tracer-schedule.json"):
+        for name in (profiles_name, f"{stage}.json", schedule_name):
             if (args.workspace / name).exists():
                 raise FileExistsError(f"immutable stage conflict: {args.workspace / name}; select an explicit successor session")
         workspace_ready = True
@@ -186,17 +194,44 @@ def feasibility(args):
         report["session"] = session["session_id"]
         report["session_reference"] = {"path": "session.json", "sha256": sha256_file(session_path)}
         lock = load_input_lock(args.corpus, args.checkpoint)
-        entry = next((item for item in lock["records"] if item["file"] == args.record), None)
-        if entry is None:
-            raise ValueError("record not in locked corpus")
-        cases = [{"record": args.record, "seed": entry["seeds"][0]}]
-        write_evidence(args.workspace, "input-lock.json", lock)
-        write_evidence(args.workspace, "tracer-schedule.json", {
-            "schema_version": 1, "session": session["session_id"], "cases": cases,
-            "profiles": PROFILE_SCHEDULE,
+        if (args.workspace / "input-lock.json").exists():
+            if read_json(args.workspace / "input-lock.json") != lock:
+                raise ValueError("existing input lock differs from current immutable inputs")
+        else:
+            write_evidence(args.workspace, "input-lock.json", lock)
+        if stage == "feasibility":
+            entry = next((item for item in lock["records"] if item["file"] == args.record), None)
+            if entry is None:
+                raise ValueError("record not in locked corpus")
+            groups = [{"id": "tracer", "cases": [{"record": args.record, "seed": entry["seeds"][0]}]}]
+            kind = "tracer"
+        elif stage == "repeatability":
+            groups = repeatability_schedule(lock)["groups"]
+            kind = "repeatability"
+        else:
+            groups = [{"id": "full", "cases": lock["schedule"]}]
+            kind = "replay"
+        schedule = {
+            "schema_version": 1, "session": session["session_id"], "kind": kind,
+            "input_fingerprint": lock["fingerprint"], "groups": groups,
+            "profiles": [(backend, purpose) for backend, purpose in PROFILE_SCHEDULE
+                         if stage == "feasibility" or purpose != "stock-capacity"],
             "devices": {purpose: profile_device(args, purpose) for _, purpose in PROFILE_SCHEDULE},
             "observer_control": "same seed, same backend, capture disabled",
-        })
+        }
+        if len(groups) == 1:
+            schedule["cases"] = groups[0]["cases"]
+        write_evidence(args.workspace, schedule_name, schedule)
+        group_files = []
+        for group in groups:
+            validate_schedule(lock, group["cases"], kind)
+            if len(groups) == 1:
+                group_files.append(schedule_name)
+            else:
+                group_id = group["id"]
+                relative = f"schedules/{stage}-{group_id}.json"
+                write_evidence(args.workspace, relative, {**schedule, "cases": group["cases"], "group": group["id"]})
+                group_files.append(relative)
         report["input_fingerprint"] = lock["fingerprint"]
         sources = {}
         for path in (
@@ -216,13 +251,15 @@ def feasibility(args):
         if report["resources_before"]["compute_processes"]:
             raise PrerequisiteError("GPU already owned by a compute process; release it before an explicit new session")
         profiles = []
-        for backend, purpose in PROFILE_SCHEDULE:
-            if device_snapshot()["compute_processes"]:
-                raise PrerequisiteError("previous GPU owner still alive; sequential worker contract refused")
-            launch, worker_report = run_worker(args, backend, purpose, images[backend], cases)
-            report["workers"].append(launch)
-            profiles.append({"backend": backend, "purpose": purpose, "status": launch["status"], "observed": worker_report.get("profile"), "manifest": launch["manifest"]})
-        write_evidence(args.workspace, "profiles.json", {"schema_version": 1, "session": session["session_id"], "profiles": profiles})
+        for backend, purpose in schedule["profiles"]:
+            for group, schedule_file in zip(groups, group_files, strict=True):
+                if device_snapshot()["compute_processes"]:
+                    raise PrerequisiteError("previous GPU owner still alive; sequential worker contract refused")
+                suffix = "" if stage == "feasibility" else "-" + stage + "-" + group["id"]
+                launch, worker_report = run_worker(args, backend, purpose, images[backend], group["cases"], schedule_file, suffix)
+                report["workers"].append(launch)
+                profiles.append({"backend": backend, "purpose": purpose, "group": group["id"], "status": launch["status"], "observed": worker_report.get("profile"), "manifest": launch["manifest"]})
+        write_evidence(args.workspace, profiles_name, {"schema_version": 1, "session": session["session_id"], "profiles": profiles})
         statuses = [worker["status"] for worker in report["workers"]]
         report["status"] = "complete" if statuses and all(s == "complete" for s in statuses) else ("failed" if "failed" in statuses else "not_run")
         report["resources_after"] = device_snapshot()
@@ -235,7 +272,7 @@ def feasibility(args):
         report["prerequisite_errors"].append({"type": type(exc).__name__, "message": str(exc)})
     report["ended_at"] = now()
     if workspace_ready:
-        write_evidence(args.workspace, "feasibility.json", report)
+        write_evidence(args.workspace, f"{stage}.json", report)
     print(json.dumps({"status": report["status"], "message": "not run" if report["status"] == "not_run" else report["status"], "errors": report["prerequisite_errors"]}))
     return {"complete": 0, "failed": 1, "not_run": 2}[report["status"]]
 
@@ -245,8 +282,8 @@ def main():
     stages = parser.add_subparsers(dest="stage", required=True)
     for name in ("feasibility", "repeatability", "replay"):
         stage = stages.add_parser(name)
-        stage.add_argument("--corpus", type=Path, required=True)
-        stage.add_argument("--checkpoint", type=Path, required=True)
+        stage.add_argument("--corpus", type=Path, default=ROOT / "corpus/frozen_v1_0")
+        stage.add_argument("--checkpoint", type=Path, default=ROOT / "checkpoints/GR00T-N1.7-3B-SO101")
         stage.add_argument("--workspace", type=Path, required=True)
         stage.add_argument("--record", default="record_0000.npz")
         stage.add_argument("--device", default="cuda:0", choices=("cuda:0", "cpu"))
@@ -257,9 +294,6 @@ def main():
         stage.add_argument("--native-cache", type=Path, default=Path.home() / ".cache/huggingface")
         stage.add_argument("--worker-timeout", type=int, default=900)
     args = parser.parse_args()
-    if args.stage != "feasibility":
-        print(json.dumps({"status": "not_run", "message": "not run: Task 1 tracer gate must pass before schedule expansion"}))
-        return 2
     return feasibility(args)
 
 

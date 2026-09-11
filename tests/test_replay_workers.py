@@ -387,3 +387,125 @@ def test_explicit_cpu_diagnostic_keeps_operational_cuda_and_arguments(tmp_path):
     stock = module.worker_argv(args, "native", "stock-capacity", "image", "worker.json", "test")
     assert stock[stock.index("--device") + 1] == "cpu"
     assert stock[stock.index("--gpus") + 1] == "all"
+
+
+def schedule_lock():
+    api = contract()
+    records = [{"file": f"record_{i:04d}.npz", "seeds": [42, 43, 44, 45, 46],
+                "instruction": ("banana", "apple", "orange")[i % 3], "sha256": "6" * 64}
+               for i in range(120)]
+    return {"records": records, "schedule": [{"record": r["file"], "seed": seed} for r in records for seed in r["seeds"]],
+            "joint_order": list(api.JOINT_ORDER), "camera_order": list(api.CAMERA_ORDER), "fingerprint": "1" * 64}
+
+
+@pytest.mark.parametrize("corruption", ["missing_record", "duplicate_record", "missing_seed", "duplicate_seed", "permuted_camera", "permuted_joint", "permuted_schedule"])
+def test_complete_schedule_rejects_missing_duplicate_or_permuted_membership(corruption):
+    api = contract()
+    assert callable(getattr(api, "validate_schedule", None)), "Complete schedule validation must exist"
+    lock = schedule_lock()
+    api.validate_schedule(lock, lock["schedule"], "replay")
+    if corruption == "missing_record":
+        lock["records"].pop()
+    elif corruption == "duplicate_record":
+        lock["records"][-1] = lock["records"][0]
+    elif corruption == "missing_seed":
+        lock["records"][0]["seeds"].pop()
+    elif corruption == "duplicate_seed":
+        lock["records"][0]["seeds"][-1] = 42
+    elif corruption == "permuted_camera":
+        lock["camera_order"].reverse()
+    elif corruption == "permuted_joint":
+        lock["joint_order"].reverse()
+    else:
+        lock["schedule"].reverse()
+    with pytest.raises(ValueError):
+        api.validate_schedule(lock, lock["schedule"], "replay")
+
+
+def test_repeatability_schedule_has_fixed_warm_changed_and_cold_processes():
+    api = contract()
+    assert callable(getattr(api, "repeatability_schedule", None)), "Repeatability scheduling must be executable"
+    lock = schedule_lock()
+    schedule = api.repeatability_schedule(lock)
+    assert len(schedule["groups"]) == 13
+    warm = schedule["groups"][0]
+    assert warm["id"] == "warm" and len(warm["cases"]) == 36
+    for record in (0, 60, 80, 90, 100, 119):
+        name = f"record_{record:04d}.npz"
+        cases = [c for c in warm["cases"] if c["record"] == name]
+        assert [c["seed"] for c in cases] == [42] * 5 + [43]
+        assert [c["mode"] for c in cases] == ["warm"] * 5 + ["changed"]
+        cold = [g for g in schedule["groups"][1:] if g["cases"][0]["record"] == name]
+        assert len(cold) == 2 and all(len(g["cases"]) == 1 for g in cold)
+        assert len({g["id"] for g in cold}) == 2
+        assert all(g["cases"][0]["seed"] == 42 for g in cold)
+
+
+def fixture_trace(key, lock):
+    arrays = {"raw": np.zeros((1, 40, 132), np.float32), "noise": np.ones((1, 40, 132), np.float32),
+              "decoded": np.zeros((16, 6), np.float32)}
+    entry = next(r for r in lock["records"] if r["file"] == key["record"])
+    return profile(), arrays, entry
+
+
+def test_streaming_retains_each_success_and_failure_without_completing_partial_result(tmp_path):
+    api = contract()
+    assert callable(getattr(api, "execute_cases", None)), "Case streaming must publish durable per-case evidence"
+    lock = schedule_lock()
+    cases = lock["schedule"][:3]
+    report = api.ReplayManifest("fixture", "diagnostic", lock["fingerprint"], cases, evidence_kind="hermetic_fixture")
+    seen = []
+    def trace(key):
+        seen.append(key)
+        if len(seen) == 2:
+            raise api.PrerequisiteError("measured fixture failure")
+        return fixture_trace(key, lock)
+    with pytest.raises(api.PrerequisiteError):
+        api.execute_cases(report, tmp_path, lock, cases, trace, "fixture")
+    assert seen == cases[:2]
+    assert report.status != "complete" and report.executed_cases == cases[:1]
+    saved = api.read_json(tmp_path / report.cases[0]["evidence"]["path"])
+    assert saved["key"] == cases[0] and saved["evidence_kind"] == "hermetic_fixture"
+    failures = list((tmp_path / "workers/failures").glob("*.json"))
+    assert len(failures) == 1 and api.read_json(failures[0])["key"] == cases[1]
+
+
+def test_streaming_reuses_order_and_rejects_mixed_effective_configuration(tmp_path):
+    api = contract()
+    assert callable(getattr(api, "execute_cases", None)), "Case streaming must bind effective configuration"
+    lock = schedule_lock()
+    cases = lock["schedule"][:2]
+    report = api.ReplayManifest("fixture", "diagnostic", lock["fingerprint"], cases, evidence_kind="hermetic_fixture")
+    seen = []
+    def trace(key):
+        seen.append(key)
+        observed, tensors, entry = fixture_trace(key, lock)
+        if len(seen) == 2:
+            observed["checkpoint_fingerprint"] = "0" * 64
+        return observed, tensors, entry
+    with pytest.raises(ValueError, match="configuration"):
+        api.execute_cases(report, tmp_path, lock, cases, trace, "fixture")
+    assert seen == cases and report.status != "complete"
+
+
+def test_native_operational_mapping_observes_real_policy_collaborator_changes():
+    module = native_worker()
+    adapter = module.NativeReplay.__new__(module.NativeReplay)
+    adapter.purpose = "operational"
+    class ServingPolicy:
+        offset = 0
+        def get_action(self, observation):
+            assert observation["state"]["single_arm"].shape == (1, 1, 5)
+            assert observation["language"]["annotation.human.task_description"] == [["banana"]]
+            value = observation["state"]["single_arm"][0, 0, 0] + self.offset
+            return {"single_arm": np.full((1, 16, 5), value, np.float32), "gripper": np.full((1, 16, 1), 7, np.float32)}, {}
+    adapter.policy = ServingPolicy()
+    arrays = {"state": np.arange(6, dtype=np.float32), "video_front": np.zeros((480, 640, 3), np.uint8), "video_wrist": np.zeros((480, 640, 3), np.uint8)}
+    try:
+        original = adapter.predict(arrays, {"instruction": "banana"})
+        adapter.policy.offset = 3
+        changed = adapter.predict(arrays, {"instruction": "banana"})
+    except ImportError as exc:
+        pytest.fail(f"Operational mapping must be testable through the serving collaborator without diagnostic imports: {exc}")
+    assert np.all(changed[:, :5] - original[:, :5] == 3)
+    assert np.all(changed[:, 5] == original[:, 5])

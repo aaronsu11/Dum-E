@@ -1,9 +1,11 @@
 # Shared native/LeRobot chunk observer
 
 The optional serving adapters use the same `policy_guard.chunk_observer.ChunkObserver`
-with two explicit modes: `off` and `lightweight`. Existing entrypoints and Phase 7
-attestation are unchanged. These adapters are opt-in and have not been deployed
-to a physical trial.
+with explicit `off`, `lightweight` and `exhaustive` modes. Lightweight is now the
+normal serving recipe/image default. The original entrypoint and Phase 7
+attestation remain available for source-bound exhaustive diagnostics. The
+off-mode physical trial is recorded in `docs/OBSERVER-OFF-PHYSICAL-TRIAL.md`;
+async physical verification remains pending.
 
 | Matched GPU pipeline | Observer off | Lightweight |
 |---|---:|---:|
@@ -97,3 +99,28 @@ with the shared observer. The new network serving adapters have behavioral
 fixture coverage; a real socket-level serving check remains separate from the
 local GPU pipeline measurements. No production source or historical evidence
 was changed, so the completed Phase 7 verification remains valid.
+
+
+## Default rollout — 2026-09-12
+
+`bash scripts/build_observed_policy_images.sh` repackages already-local pinned
+runtimes without model/dependency downloads. Built images are
+`dume-native-lightweight:20260912` and `dume-lerobot-lightweight:20260912`.
+Both default to lightweight telemetry; their in-image launchers passed startup
+argument/import checks. New full LeRobot builds also use the lightweight wrapper
+as their Docker CMD. Normal model settings remain unchanged.
+
+The native flag now accepts `--observer-mode exhaustive`. LeRobot accepts
+`DUME_CHUNK_OBSERVER=exhaustive`; with `DUME_PARITY_ATTESTATION_PATH` it delegates
+to the original attested serving path. Without that path, exhaustive mode records
+operation telemetry but does not grant a release attestation. Off/lightweight
+still refuse an exhaustive attestation path.
+
+The normal LeRobot wrapper serializes model loading and the complete
+preprocess/inference/decode region to protect the shared relative-action anchor.
+Client-side serialization separately preserves a complete observation/action
+exchange. The supported deployment has one controlling client session; these
+locks do not turn upstream's global queues into independent multi-client sessions.
+
+Existing stopped containers retain their original command. No robot process or
+new inference service was left running by the rollout.

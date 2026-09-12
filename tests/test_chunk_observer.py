@@ -134,3 +134,52 @@ def test_native_endpoint_uses_shared_observer(monkeypatch, tmp_path, mode):
     monkeypatch.setattr(sys, 'argv', ['serve', '--model-path', str(tmp_path), '--observer-mode', mode])
     script.main()
     assert calls==[{'test': 1}]
+
+
+def test_exhaustive_mode_is_explicit_and_preserves_rng():
+    m=model();x=torch.ones(1,2);rng=torch.get_rng_state().clone()
+    observer=ChunkObserver('exhaustive')
+    assert observer.run(m,predict,m,x) is x
+    assert torch.equal(rng,torch.get_rng_state())
+    assert observer.last['coverage']=='operations'
+    assert observer.last['flow_steps']==4
+    assert observer.last['exhaustive_attestation'] is False
+
+
+def test_exhaustive_attestation_delegates_to_original_entrypoint(monkeypatch):
+    import sys
+    from scripts import serve_observed_lerobot as script
+    calls=[]
+    monkeypatch.setenv('DUME_PARITY_ATTESTATION_PATH','/evidence/runtime.json')
+    monkeypatch.setenv('DUME_CHUNK_OBSERVER','exhaustive')
+    monkeypatch.setitem(sys.modules,'entrypoint',SimpleNamespace(main=lambda: calls.append('original') or 0))
+    assert script.main()==0 and calls==['original']
+
+
+def test_server_serializes_relative_anchor_through_decode(monkeypatch):
+    import sys,time
+    from concurrent.futures import ThreadPoolExecutor
+    from scripts import serve_observed_lerobot as script
+    m=model()
+    class Server:
+        def __init__(self):
+            self.policy=SimpleNamespace(_groot_model=m)
+            self.logger=SimpleNamespace(info=lambda *args: None)
+        def _predict_action_chunk_impl(self, observation):
+            self.anchor=observation
+            time.sleep(.01)
+            return self.anchor
+    entry=SimpleNamespace(DumEGrootPolicyServer=Server)
+    def serve():
+        instance=entry.DumEGrootPolicyServer()
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            a=executor.submit(instance._predict_action_chunk,1)
+            b=executor.submit(instance._predict_action_chunk,2)
+            assert (a.result(),b.result())==(1,2)
+        return 0
+    entry.main=serve
+    monkeypatch.setitem(sys.modules,'entrypoint',entry)
+    monkeypatch.setenv('DUME_CHUNK_OBSERVER','off')
+    monkeypatch.delenv('DUME_PARITY_ATTESTATION_PATH',raising=False)
+    monkeypatch.setattr(torch.cuda,'synchronize',lambda:None)
+    assert script.main()==0

@@ -175,6 +175,7 @@ COPY docker/lerobot-policy/*.py /app/docker/lerobot-policy/
 # repo-root `.dockerignore`, whose allowlist denies everything by default — that
 # friction is intended and the decision is recorded there.
 COPY policy_guard/ /app/policy_guard/
+COPY scripts/serve_observed_lerobot.py /app/scripts/serve_observed_lerobot.py
 
 WORKDIR /app
 # So both /app/docker/lerobot-policy/*.py and any process started with an
@@ -185,4 +186,4 @@ WORKDIR /app
 # policy_guard only by accident of being run from /app.
 ENV PYTHONPATH=/app
 
-CMD ["python3", "/app/docker/lerobot-policy/entrypoint.py", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python3", "/app/scripts/serve_observed_lerobot.py", "--host", "0.0.0.0", "--port", "8080"]

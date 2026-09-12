@@ -115,15 +115,17 @@ are mounted at runtime, never baked into the image.
     docker rm -f gr00t-server 2>/dev/null || true
     docker run -d \
         --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
-        -p 5555:5555 \
+        -p 127.0.0.1:5555:5555 \
         -v "$(pwd)/checkpoints/GR00T-N1.7-3B-SO101:/checkpoints/model:ro" \
         -v ~/.cache/huggingface:/root/.cache/huggingface:ro \
         -e HF_TOKEN="$HF_TOKEN" \
+        -v "$(pwd)/scripts:/app/scripts:ro" \
+        -v "$(pwd)/policy_guard:/app/policy_guard:ro" \
         --name gr00t-server \
         gr00t \
-        uv run python gr00t/eval/run_gr00t_server.py \
+        uv run python /app/scripts/serve_observed_native.py \
             --model-path /checkpoints/model \
-            --embodiment-tag new_embodiment --host 0.0.0.0 --port 5555
+            --host 0.0.0.0 --port 5555 --observer-mode lightweight
     ```
 
     The server is ready once port `5555` is listening and the model has finished
@@ -503,3 +505,21 @@ This project builds on top of the following open-source projects:
 *Built with ❤️ for the future of robotics*
 
 </div> 
+
+
+### Inference observation modes
+
+Normal native serving (the command above) and new LeRobot image builds default
+to the shared lightweight observer. It logs chunk time, backbone metadata and
+flow steps without per-operation interception. Existing images must be rebuilt
+or explicitly launched with the current read-only source mounts and wrapper.
+
+- Native: `--observer-mode lightweight|off|exhaustive`.
+- LeRobot: `DUME_CHUNK_OBSERVER=lightweight|off|exhaustive`.
+- Source-bound Phase 7 diagnostics: keep the original entrypoint with
+  `DUME_PARITY_ATTESTATION_PATH`, or select `exhaustive` explicitly with the new
+  wrapper. Lightweight/off modes refuse that attestation path.
+
+Exhaustive telemetry alone is not a release attestation. The original model
+configuration, controller safety controls and historical evidence remain separate
+from observation mode. See `docs/SHARED-CHUNK-OBSERVER.md`.

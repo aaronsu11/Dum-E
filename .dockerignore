@@ -28,3 +28,10 @@
 # stays denied by the `*` above, and `policy_guard/` holds no credential, no
 # checkpoint and no build artifact.
 !policy_guard/
+
+# Normal serving uses the shared lightweight observer; admit only its launcher.
+!scripts/
+scripts/*
+!scripts/serve_observed_lerobot.py
+!scripts/serve_observed_native.py
+!scripts/replay_groot_native.py

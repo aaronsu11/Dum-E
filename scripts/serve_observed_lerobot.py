@@ -1,4 +1,4 @@
-"""LeRobot serving with shared off/lightweight telemetry; no parity attestation.
+"""LeRobot serving with shared off/lightweight/exhaustive telemetry; no parity attestation.
 
 All ordinary entrypoint/SAFE-01 preflight checks remain. This explicitly separate
 mode cannot satisfy the exhaustive Phase 7 physical-run attestation contract.
@@ -7,20 +7,38 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 sys.path[:0] = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parents[1] / 'docker/lerobot-policy')]
 from policy_guard.chunk_observer import ChunkObserver
 
 
 def main():
-    if os.getenv('DUME_PARITY_ATTESTATION_PATH'):
-        raise RuntimeError('Lightweight telemetry cannot replace exhaustive parity attestation; use the standard entrypoint for that contract')
+    attestation = os.getenv('DUME_PARITY_ATTESTATION_PATH')
     mode = os.environ.get('DUME_CHUNK_OBSERVER', 'lightweight')
+    if attestation and mode != 'exhaustive':
+        raise RuntimeError('Lightweight telemetry cannot replace exhaustive parity attestation; use the standard entrypoint for that contract')
     # Validate before importing/starting the server.
     ChunkObserver(mode)
     import torch
     import entrypoint
+    if attestation:
+        return entrypoint.main()
     class ObservedServer(entrypoint.DumEGrootPolicyServer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._pipeline_lock = threading.RLock()
+
+        def SendPolicyInstructions(self, request, context):
+            with self._pipeline_lock:
+                return super().SendPolicyInstructions(request, context)
+
         def _predict_action_chunk(self, observation):
+            # The relative-action anchor lives on the processor instance.
+            # Hold through preprocessing, inference and decode, including failures.
+            with self._pipeline_lock:
+                return self._observed_chunk(observation)
+
+        def _observed_chunk(self, observation):
             if getattr(self, '_parity_attestor', None) is not None:
                 raise RuntimeError('Exhaustive attestation cannot be bypassed')
             observer = ChunkObserver(mode, synchronize=torch.cuda.synchronize)

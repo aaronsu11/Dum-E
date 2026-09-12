@@ -459,6 +459,7 @@ async def test_retarget_rejects_empty_missing_and_terminal_tasks(shm_env_and_ser
     for target,instruction in [(task_id,'  '),('missing','apple')]:
         response=await client.call_tool('retarget_robot_instruction',{'task_id':target,'instruction':instruction})
         assert response.data['status']=='rejected'
+        if target=='missing':assert 'tool-call ID' in response.data['error'] and 'list_tasks' in response.data['error']
     await tm.update_task(task_id,TaskStatus.COMPLETED)
     response=await client.call_tool('retarget_robot_instruction',{'task_id':task_id,'instruction':'apple'})
     assert response.data['status']=='rejected'

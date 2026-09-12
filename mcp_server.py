@@ -333,12 +333,15 @@ async def retarget_robot_instruction(task_id: str, instruction: str) -> Dict[str
 
     Use this when the user changes the object/instruction during a running pick.
     The worker reports whether it applied the instruction through task progress.
+    Get task_id from list_tasks(status="running"); a tool-call ID is not a task ID.
     """
     if not isinstance(instruction, str) or not instruction.strip():
         return {"status": "rejected", "error": "Nonempty instruction required"}
     task = await TASK_MANAGER.get_task(task_id)
-    if task is None or task.status != TaskStatus.RUNNING:
-        return {"status": "rejected", "error": "Task is not running"}
+    if task is None:
+        return {"status": "rejected", "error": "Unknown task_id. Call list_tasks(status='running') and use the returned task_id, not a tool-call ID."}
+    if task.status != TaskStatus.RUNNING:
+        return {"status": "rejected", "error": "Task is not running", "task_status": task.status.value}
     await MESSAGE_BROKER.publish(Message(
         message_type=MessageType.STATUS_UPDATE, task_id=task_id,
         timestamp=datetime.now(), data={"source": "mcp_server", "action": "retarget", "instruction": instruction}))

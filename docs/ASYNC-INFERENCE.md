@@ -1,6 +1,6 @@
 # Async inference checkpoint
 
-The Phase 8 implementation remains opt-in. Physical pick, server-loss hold, spoken retarget and audible failure checks have passed. The interrupted sustained-run check and GPU latency-outlier investigation were explicitly deferred by Aaron on 2026-09-12; independent closeout review is pending.
+The Phase 8 implementation remains opt-in. Physical pick, server-loss hold, spoken retarget and audible failure checks have passed. The interrupted sustained-run check and GPU latency-outlier investigation were explicitly deferred by Aaron on 2026-09-12; independent review is complete and Aaron accepted the existing descriptive continuity evidence for this milestone. Phase 8 is closed in that amended scope.
 
 ## Runtime behavior
 
@@ -86,4 +86,4 @@ The integrated closeout trial applied spoken banana→apple retarget with no old
 
 Physical voice tests use a fixed guarded runner with real voice/MCP/GPU/controller. Normal robot-agent planning and control integration were tested separately with simulated hardware. Real server-kill/hold and live audible deadline failure are composed evidence, not an identical combined failure trial. Joint velocity evidence is descriptive for one successful run, without a formal periodic-spike threshold.
 
-The authoritative closeout record is `.planning/phases/08-async-inference-staleness-watchdog/08-VERIFICATION.md` once independent review finishes. No new motion, expanded validation or deadline relaxation follows automatically from closeout.
+The authoritative closeout record is `.planning/phases/08-async-inference-staleness-watchdog/08-VERIFICATION.md` (independent review plus explicit operator closeout disposition). No new motion, expanded validation or deadline relaxation follows automatically from closeout.

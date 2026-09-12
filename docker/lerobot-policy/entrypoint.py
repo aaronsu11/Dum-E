@@ -427,6 +427,16 @@ def run_preflight(checkpoint_path: str, backbone_revision: str) -> int:
     return checks.report()
 
 
+def positive_cpu_threads(value: str) -> int:
+    try:
+        threads = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("CPU threads must be a positive integer") from exc
+    if threads < 1:
+        raise argparse.ArgumentTypeError("CPU threads must be a positive integer")
+    return threads
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     # argparse, NOT draccus: draccus owns upstream's CLI surface for
@@ -464,7 +474,21 @@ def main() -> int:
             "calls, so the refusal path can be tested without starting a server."
         ),
     )
+    parser.add_argument(
+        "--cpu-threads", type=positive_cpu_threads,
+        default=os.environ.get("DUME_POLICY_CPU_THREADS", "1"),
+        help="PyTorch CPU intra-op threads for image preparation (default: 1; "
+             "environment: DUME_POLICY_CPU_THREADS). Model inference remains on CUDA.",
+    )
     args = parser.parse_args()
+
+    # Apply before processor construction and before gRPC worker threads start.
+    # The RTX 3060 benchmark found substantial overhead with the 20-thread
+    # host default; one thread retained exact outputs for the measured input.
+    import torch
+    torch.set_num_threads(args.cpu_threads)
+    print(f"PyTorch CPU threads: intra_op={torch.get_num_threads()} "
+          f"inter_op={torch.get_num_interop_threads()}", flush=True)
 
     # ONE call site for both paths. --preflight-only must not grow a second copy
     # of the checks: a parallel copy could pass while the real startup failed.

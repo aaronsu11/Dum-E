@@ -76,3 +76,53 @@ Raw samples, pinned image commands, stdout logs, and reproducible worker/launche
 scripts are in `corpus/phase7-latency-benchmark-20260911/`: `native.json`,
 `lerobot.json`, `native-stages.json`, `lerobot-stages.json`,
 `lerobot-breakdown.json`, and `lerobot-threads.json`.
+
+
+## Serving CPU-thread limit applied — 2026-09-12
+
+The serving entrypoint now calls `torch.set_num_threads(1)` by default before
+processor preflight and gRPC workers start. `--cpu-threads N` overrides
+`DUME_POLICY_CPU_THREADS`; that environment variable overrides the default1.
+Non-positive/non-integer settings refuse startup. The effective intra-op and
+inter-op counts are logged. This controls CPU preparation; model inference
+continues on CUDA in BF16. Direct replay constructors do not use this entrypoint.
+
+Seven focused startup tests passed: default, environment and CLI precedence,
+application before preflight, and invalid-value refusal. No broad model
+re-evaluation or physical trial was run.
+
+A paired serving check used the same pinned image, updated read-only source
+mount, frozenrecord0005, ambient deployed RNG, one warmup and three measured
+requests per setting. It exercised the real `RuntimeSource`/`CheckedPolicy`
+client, including server observation/attestation and before/during/after client
+host/process checks. Each response passed identity, chronology, finite output
+and16×6shape validation. Ambient requests are not an output-equality experiment;
+the prior fixed-seed thread comparison established equality for this input.
+
+| Actual serving measurement | 20 CPU threads | 1 CPU thread |
+|---|---:|---:|
+| Median generation, with runtime observation | 262.49ms | 207.40ms |
+| Generation range, three warm calls | 205.76–296.95ms | 204.56–207.85ms |
+| Median server validation | 50.14ms | 44.79ms |
+| Median full guarded client call | 669.92ms | 603.31ms |
+
+The configured limit improved median generation by21% and complete guarded
+client latency by10% in this small check. This is not a p95 or throughput claim.
+The ~133ms result above was the local pipeline without runtime observation,
+RPC or client identity checks; it is not the measured physical-test serving
+latency. Server validation and repeated client host/process checks remain
+separate costs, and the existing runtime observer remains enabled.
+
+The one-thread local service is running as `dume-serving-cpu1-20260912` at
+`127.0.0.1:8080`, using the pinned image with read-only current serving source
+mounts (no image rebuild). Runtime attestation is in
+`corpus/phase7-serving-threads-20260912/cpu1/runtime/lerobot.json`.
+The previous20-thread comparison service is stopped. No controller was created
+and no arm motion occurred. This measurement does not grant another physical
+trial approval. Future fresh image builds include the updated entrypoint default.
+
+Raw samples, full per-request runtime proofs, exact Docker commands, server/client
+logs and the reproducible checker/launcher are in
+`corpus/phase7-serving-threads-20260912/`. CPU thread count and entrypoint hash
+are recorded in this benchmark's startup log/source proof; they are not new
+fields in the existing model-semantic attestation schema.

@@ -127,6 +127,14 @@ def _spawn_agent_worker(
         "DUME_POLICY_BACKEND": controller_cfg.get("policy_backend", "groot-native"),
     }
 
+    if "async_inference" in controller_cfg:
+        policy_env_defaults["DUME_ASYNC_INFERENCE"] = "1" if controller_cfg["async_inference"] is True else "0"
+    if controller_cfg.get("async_latency_path"):
+        policy_env_defaults["DUME_ASYNC_LATENCY_PATH"] = str(controller_cfg["async_latency_path"])
+
+    if controller_cfg.get("async_trace_directory"):
+        policy_env_defaults["DUME_ASYNC_TRACE_DIRECTORY"] = str(controller_cfg["async_trace_directory"])
+
     # The joint-value convention and the per-step motion clamp are forwarded
     # only when the config actually names them, so their
     # defaults live in exactly one place (embodiment/so_arm10x/controller.py) and

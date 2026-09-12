@@ -147,3 +147,10 @@ controller:
   # so this example deliberately pins the v1.0 baseline backend rather than
   # inheriting the default by accident.
   policy_backend: "groot-native"
+
+  # Opt-in until Phase 8 physical/voice verification. Requires backend lerobot.
+  async_inference: false
+  # A measured request-latency artifact; no guessed timeout default.
+  # async_latency_path: "corpus/phase8-latency-20260912/latency.json"
+  # Optional per-action measured state/command traces for physical verification.
+  # async_trace_directory: "corpus/phase8-physical-traces"

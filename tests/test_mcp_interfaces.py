@@ -324,3 +324,18 @@ async def test_fleet_list_robots_only_enabled_filter(shm_env_and_server):
     res_disabled = await client.call_tool("list_robots", {"only_enabled": False})
     disabled_ids = {r["robot_id"] for r in res_disabled.data.get("robots", [])}
     assert "r-B" in disabled_ids
+
+
+@pytest.mark.asyncio
+async def test_retarget_running_task_publishes_control_without_new_task(shm_env_and_server):
+    client=shm_env_and_server['client'];tm=shm_env_and_server['tm'];broker=shm_env_and_server['broker']
+    task_id=await tm.create_task('banana')
+    rejected=await client.call_tool('retarget_robot_instruction',{'task_id':task_id,'instruction':'apple'})
+    assert rejected.data['status']=='rejected'
+    await tm.update_task(task_id,TaskStatus.RUNNING)
+    result=await client.call_tool('retarget_robot_instruction',{'task_id':task_id,'instruction':'apple'})
+    assert result.data['status']=='requested' and result.data['task_id']==task_id
+    messages=await broker.get_message_history(task_id=task_id,limit=10)
+    assert any(m.message_type==MessageType.STATUS_UPDATE and m.data.get('action')=='retarget' and
+               m.data.get('instruction')=='apple' for m in messages)
+    assert len(await tm.list_tasks())==1

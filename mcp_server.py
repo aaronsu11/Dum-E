@@ -317,6 +317,24 @@ async def get_task_details(
 
 
 @mcp.tool()
+async def retarget_robot_instruction(task_id: str, instruction: str) -> Dict[str, Any]:
+    """Retarget an active async pick without starting a second task or reconnecting.
+
+    Use this when the user changes the object/instruction during a running pick.
+    The worker reports whether it applied the instruction through task progress.
+    """
+    if not isinstance(instruction, str) or not instruction.strip():
+        return {"status": "rejected", "error": "Nonempty instruction required"}
+    task = await TASK_MANAGER.get_task(task_id)
+    if task is None or task.status != TaskStatus.RUNNING:
+        return {"status": "rejected", "error": "Task is not running"}
+    await MESSAGE_BROKER.publish(Message(
+        message_type=MessageType.STATUS_UPDATE, task_id=task_id,
+        timestamp=datetime.now(), data={"source": "mcp_server", "action": "retarget", "instruction": instruction}))
+    return {"task_id": task_id, "status": "requested", "instruction": instruction}
+
+
+@mcp.tool()
 async def cancel_task(task_id: str) -> Dict[str, Any]:
     """Cancel a running or pending task by ID."""
     success = await TASK_MANAGER.cancel_task(task_id)

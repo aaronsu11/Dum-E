@@ -68,11 +68,16 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
         # groot-native process pay for a stack it never uses. Asserted by
         # tests/test_policy_backend.py::test_factory_module_import_pulls_no_torch_or_lerobot,
         # which runs in a subprocess so the rest of the suite cannot mask it.
+        if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
+            from policy.lerobot.serialized_backend import SerializedLeRobotPolicyBackend
+            return SerializedLeRobotPolicyBackend(**kwargs)
         from policy.lerobot.backend import LeRobotPolicyBackend
 
         return LeRobotPolicyBackend(**kwargs)
 
     if backend == "groot-native":
+        if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
+            raise ValueError("Async picking currently requires the LeRobot backend")
         # Lazy-import inside the branch, for the same reason as above: the GR00T
         # transport (policy/gr00t/service.py) depends only on msgpack/numpy/zmq and
         # must not be dragged in by a lerobot selection either.

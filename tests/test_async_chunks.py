@@ -93,3 +93,20 @@ def test_changed_target_latches_before_next_dispatch():
     command=q.next_action(0)
     with pytest.raises(InferenceStopped,match='clamped'):q.dispatch(command,lambda target:{'joint':.5})
     with pytest.raises(InferenceStopped):q.next_action(1)
+
+
+def test_unclipped_upstream_roundtrip_is_not_a_clamp():
+    from lerobot.robots.utils import ensure_safe_goal_position
+    q,e,c=fixture();q.request({},0);e.calls[0][0].set_result(actions(.1))
+    def send(target):
+        result=ensure_safe_goal_position({'joint':(target['joint'],10.)},160.)
+        assert result['joint'] != target['joint']  # IEEE rounding, no clipping
+        return result
+    q.dispatch(q.next_action(0),send)
+    q.next_action(1)
+
+
+@pytest.mark.parametrize('returned',[float('nan'),float('inf'),True,None,'1',1.0002])
+def test_invalid_or_materially_changed_return_stops(returned):
+    q,e,c=fixture();q.request({},0);e.calls[0][0].set_result(actions())
+    with pytest.raises(InferenceStopped):q.dispatch(q.next_action(0),lambda target:{'joint':returned})

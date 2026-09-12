@@ -152,7 +152,13 @@ class AsyncChunks:
             self.poll(command.step);self._validate_command(command)
             target=self._effective_target(command)
             result=send(target)
-            if not isinstance(result,dict) or any(result.get(k)!=v for k,v in target.items()):
+            # Match the controller/upstream clamp threshold. Subtracting and
+            # re-adding present position can change a float without clipping it.
+            if not isinstance(result,dict) or set(result)!=set(target) or any(
+                isinstance(result[k],bool) or not isinstance(result[k],(int,float)) or
+                not math.isfinite(result[k]) or not math.isclose(result[k],v,rel_tol=0.,abs_tol=1e-4)
+                for k,v in target.items()
+            ):
                 self._fail('Controller clamped or changed an async target')
             self.events.append({'event':'action','step':command.step,'epoch':command.epoch,'at':self.clock(),'target':dict(target)})
             return result

@@ -157,8 +157,8 @@ def run(workspace):
             check_current()
             checked=AsyncPickSkill(controller,policy,async_settings,trace_directory=workspace/'traces')
             result['motion_started_at']=now()
-            print('ONE ASYNC PHYSICAL TRIAL: initial/ready reset then at most 320 actions at 20 Hz. STOP ARMED.',flush=True)
-            checked.run(pose='initial',actions_to_execute=20,action_horizon=16,
+            print(f"ONE ASYNC PHYSICAL TRIAL: initial/ready reset then at most {PROTOCOL['chunks']*16} actions at 20 Hz. STOP ARMED.",flush=True)
+            checked.run(pose='initial',actions_to_execute=PROTOCOL['chunks'],action_horizon=16,
                                                     language_instruction=safety.INSTRUCTION)
             stop.check()
             check_current()

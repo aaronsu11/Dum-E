@@ -74,3 +74,24 @@ def test_opt_in_trace_records_actual_readback(tmp_path):
     assert trace['status']=='complete' and len(trace['state_samples'])==16
     assert trace['state_samples'][0]['state']==[7.]*6
     assert trace['events'][1]['event'] in ('action','chunk')
+
+
+def test_successive_tasks_reuse_handshake_but_get_fresh_actions():
+    class PersistentPolicy(Policy):
+        def __init__(self):
+            super().__init__();self._handshaken=False;self.handshakes=0
+        def _handshake(self):
+            self.handshakes+=1;self._handshaken=True
+        def get_action(self,obs,task):
+            self.calls.append((threading.current_thread().name,obs,task))
+            return [dict.fromkeys(JOINT_ORDER,2. if task=='apple' else 1.) for _ in range(16)]
+    controller=Controller();policy=PersistentPolicy();skill=AsyncPickSkill(controller,policy,AsyncSettings(.15))
+    original_session=policy._session
+    skill.run(actions_to_execute=1,language_instruction='banana')
+    skill.run(actions_to_execute=1,language_instruction='apple')
+    assert policy.handshakes==1 and policy._session is original_session and not policy.closed
+    assert len(controller.sent)==32
+    assert all(target[JOINT_ORDER[0]]==1. for _,target in controller.sent[:16])
+    assert all(target[JOINT_ORDER[0]]==2. for _,target in controller.sent[16:])
+    assert controller.resets==['initial','ready','initial','ready']
+    assert not skill.active

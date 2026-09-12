@@ -279,3 +279,22 @@ def test_trial1_only_approval_cannot_release_later_trials(workspace):
         with pytest.raises(ValueError, match="trial-1-only approval"):
             gate.assert_live_release(ev(workspace), {}, expected_stage=stage, runtime={},
                                      current_calibration_sha256="unused")
+
+
+@pytest.mark.parametrize("index", [2, 3])
+def test_single_later_trial_release_requires_exact_stage(workspace, index):
+    review = prepare(workspace)
+    answers = iter(["Aaron", "Continue one trial at a time", "approve"])
+    fixtures.cli().record_decision(workspace, "live", prompt=lambda _: next(answers),
+                                   clock=lambda: fixtures.ts(25), test_only=True, single_trial=index)
+    approval = gate.validate_live_approval(ev(workspace))
+    assert gate.approved_trial_indices(approval) == (index,)
+    live, _ = fixtures.preflight(workspace, "live", 30, previous=review, reason="live")
+    run, _ = fixtures.preflight(workspace, "run", 40, previous=live, reason="fresh construction")
+    trial, runtime = fixtures.preflight(workspace, f"trial-{index:02d}", 50, previous=run, reason="one approved trial")
+    gate.assert_live_release(ev(workspace), trial, expected_stage=f"trial-{index:02d}", runtime=runtime,
+                             current_calibration_sha256=fixtures.digest("calibration"), now=fixtures.ts(53))
+    for other in ({1, 2, 3} - {index}):
+        with pytest.raises(ValueError, match=f"trial-{index}-only approval"):
+            gate.assert_live_release(ev(workspace), {}, expected_stage=f"trial-{other:02d}", runtime={},
+                                     current_calibration_sha256="unused")

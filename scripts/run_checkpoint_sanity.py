@@ -467,9 +467,10 @@ def run(workspace, *, preflight, preflight_attempt, runtime_source,
             stop.check()
             policy = policy_factory()
             approval = gate.validate_live_approval(ev)
-            trial_count = 1 if approval.get("approval_scope") == list(gate.MILESTONE_TRIAL1_SCOPE) else TRIALS
-            result["authorized_trials"] = trial_count
-            for index in range(1, trial_count + 1):
+            indices = gate.approved_trial_indices(approval)
+            result["authorized_trials"] = len(indices)
+            result["authorized_trial_indices"] = list(indices)
+            for index in indices:
                 stop.check()
                 stage = f"trial-{index:02d}"
                 reference, rv = collect_preflight(ev, stage=stage, attempt=1,

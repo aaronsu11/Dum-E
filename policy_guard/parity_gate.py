@@ -80,6 +80,21 @@ STAGES = ("review", "live", "run", "trial-01", "trial-02", "trial-03")
 MILESTONE_MODE = "milestone_12"
 MILESTONE_LIVE_SCOPE = ("scoped-native-reference", "three-trial-physical-test")
 MILESTONE_TRIAL1_SCOPE = ("scoped-native-reference", "physical-trial-1-only")
+
+
+def single_trial_scope(index):
+    require(type(index) is int and index in (1, 2, 3), "single trial must be 1, 2, or 3")
+    return ["scoped-native-reference", f"physical-trial-{index}-only"]
+
+
+def approved_trial_indices(record):
+    scope = record.get("approval_scope")
+    for index in (1, 2, 3):
+        if scope == single_trial_scope(index):
+            return (index,)
+    require(scope in (None, list(MILESTONE_LIVE_SCOPE)), "invalid physical-trial scope")
+    return (1, 2, 3)
+
 PREPROCESSING_KEYS = {"image_front", "image_wrist", "state", "tokens", "mask"}
 SEMANTIC_KEYS = {
     "backend", "purpose", "checkpoint_fingerprint", "backbone_fingerprint",
@@ -361,6 +376,8 @@ def decision_evidence(workspace, kind):
             "live": ["offline-report.json", "tolerance-agreement.json", "golden-candidate.json",
                      "golden-approval.json", "golden-replay.json"],
         }[kind]
+    if kind == "live" and (ev.workspace / "trial-continuation.json").exists():
+        names.append("trial-continuation.json")
     refs = [ev.reference(name) for name in names]
     if kind == "live":
         refs.append(ev.json("release-review.json")["review_preflight"])
@@ -894,7 +911,12 @@ def _preflight_record(ev, record, *, path, success=True, seen=None):
         if attempt > 1:
             require(prior["stage"] == stage and prior["attempt"] == attempt - 1, "renewal must link previous attempt of same stage")
         else:
-            require(prior["stage"] == STAGES[STAGES.index(stage) - 1] and prior["status"] == "complete",
+            expected_prior = STAGES[STAGES.index(stage) - 1]
+            if stage.startswith("trial-") and prior["stage"] == "run":
+                indices = approved_trial_indices(validate_live_approval(ev))
+                if len(indices) == 1 and stage == f"trial-{indices[0]:02d}":
+                    expected_prior = "run"
+            require(prior["stage"] == expected_prior and prior["status"] == "complete",
                     "initial stage must follow successful preceding stage")
         require(timestamp(prior["ended_at"]) < timestamp(record["started_at"]), "predecessor chronology")
     if not success and record["status"] != "complete":
@@ -962,7 +984,7 @@ def validate_live_approval(workspace, *, decision=None):
     review = validate_release_review(ev)
     record = _decision(ev, "live", subject=decision)
     if review["release_evidence"].get("acceptance_mode") == MILESTONE_MODE:
-        require(record.get("approval_scope") in (list(MILESTONE_LIVE_SCOPE), list(MILESTONE_TRIAL1_SCOPE)),
+        require(record.get("approval_scope") in (list(MILESTONE_LIVE_SCOPE), *(single_trial_scope(i) for i in (1, 2, 3))),
                 "explicit combined scoped-reference and physical-test approval required")
     require(timestamp(review["ended_at"]) < timestamp(record["decided_at"]), "live approval must follow archive/review")
     return record
@@ -976,9 +998,10 @@ def assert_live_release(workspace, preflight, *, expected_stage, runtime,
     ev = Evidence(supplied.workspace, test_only=supplied.test_only)
     require(expected_stage in STAGES[1:], "review-stage readiness cannot release hardware")
     approval = validate_live_approval(ev)
-    if approval.get("approval_scope") == list(MILESTONE_TRIAL1_SCOPE):
-        require(expected_stage in ("live", "run", "trial-01"),
-                "trial-1-only approval cannot release another trial")
+    indices = approved_trial_indices(approval)
+    if len(indices) == 1:
+        require(expected_stage in ("live", "run", f"trial-{indices[0]:02d}"),
+                f"trial-{indices[0]}-only approval cannot release another trial")
     record = validate_preflight_record(ev, preflight, expected_stage=expected_stage)
     require(current_calibration_sha256 == record["calibration_sha256"], "current calibration changed")
     validate_runtime_attestation(

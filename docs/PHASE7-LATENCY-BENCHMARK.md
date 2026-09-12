@@ -126,3 +126,33 @@ logs and the reproducible checker/launcher are in
 `corpus/phase7-serving-threads-20260912/`. CPU thread count and entrypoint hash
 are recorded in this benchmark's startup log/source proof; they are not new
 fields in the existing model-semantic attestation schema.
+
+
+## Three physical trials completed — 2026-09-12
+
+Aaron confirmed all three completed trials successful, including banana grasp,
+with no erratic movement or table strikes. Each completed20chunks×16actions.
+No clamp warnings or safety stops were recorded in these three completed trials.
+The runner disconnected after trial3's observation was recorded.
+
+| Trial | Control loop | Mean generation | Mean validation |
+|---|---:|---:|---:|
+| 1 | 30s | 242.30ms | 52.96ms |
+| 2 | 29s | 209.21ms | 45.52ms |
+| 3 | 29s | 208.32ms | 45.69ms |
+
+Trial1 preceded the CPU-thread limit; trials2and3 used the one-thread serving
+entrypoint. Trials ran separately with explicit per-trial authorization and
+fresh review/live/construction/trial preflights. The successful first trial is
+in `corpus/phase7-trial1-retry2-20260911`, second in
+`corpus/phase7-trial2-20260912`, and third in `corpus/phase7-trial3-20260912`.
+All prior interrupted attempts remain archived: one operator-requested latency
+restart and two wrist-camera USB failures. They are not relabelled successful.
+
+`corpus/phase7-physical-trials-20260912/summary.json` binds each original run and
+approval and records3directional successes and3grasps. The summary was assembled
+after validating each original safety journal, approval and preflight sequence.
+Individual run records remain `partial` because each contains one authorized
+trial; the summary does not overwrite them into a fictional contiguous run.
+This completes the physical check. Post-live native regression and formal phase
+closeout are separate outstanding requirements; no phase-complete claim is made.

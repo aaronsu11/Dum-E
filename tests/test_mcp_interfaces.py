@@ -383,6 +383,7 @@ async def test_async_agent_mcp_integration(shm_env_and_server,monkeypatch,scenar
             return [dict.fromkeys(JOINT_ORDER,.2 if instruction=='apple' else .1) for _ in range(16)]
         def close(self):self.closed=True
     controller=Controller();policy=Policy()
+    await client.call_tool('register_robot',{'robot_id':controller.id,'name':'Integration test arm'})
     agent=SO10xRobotAgent(controller,policy,task_manager=tm,message_broker=broker)
     original_run=agent.async_pick.run
     # Bound the real start_pick tool to two chunks for this test only.
@@ -462,3 +463,15 @@ async def test_retarget_rejects_empty_missing_and_terminal_tasks(shm_env_and_ser
     response=await client.call_tool('retarget_robot_instruction',{'task_id':task_id,'instruction':'apple'})
     assert response.data['status']=='rejected'
     assert not await broker.get_message_history(task_id=task_id,limit=10)
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_unknown_or_disabled_robot_before_creating_task(shm_env_and_server):
+    client=shm_env_and_server['client'];tm=shm_env_and_server['tm']
+    unknown=await client.call_tool('execute_robot_instruction',{'robot_id':'invented-id','instruction':'test'})
+    assert unknown.data['status']=='rejected' and 'list_robots' in unknown.data['error']
+    await client.call_tool('register_robot',{'robot_id':'disabled-test'})
+    await client.call_tool('set_robot_enabled',{'robot_id':'disabled-test','enabled':False})
+    disabled=await client.call_tool('execute_robot_instruction',{'robot_id':'disabled-test','instruction':'test'})
+    assert disabled.data['status']=='rejected'
+    assert await tm.list_tasks()==[]

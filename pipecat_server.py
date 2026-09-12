@@ -249,6 +249,9 @@ class AsyncMCPClient(MCPClient):
     # function_call_timeout_secs flipped to None, so without an explicit bound a
     # stalled normal tool would hang the voice loop forever.
     NORMAL_TOOL_TIMEOUT_SECS: float = 30.0
+    # None inherits the global 30s timeout in the pinned runtime. Allow the
+    # MCP execution handler its default 900s deadline plus transport cleanup.
+    LONG_TOOL_TIMEOUT_SECS: float = 960.0
 
     async def register_tools_schema(self, tools_schema, llm):
         """Register MCP tools, deriving cancel_on_interruption + timeout_secs from long_running metadata.
@@ -259,8 +262,8 @@ class AsyncMCPClient(MCPClient):
         flag, so we re-list tools from the live session to recover the `long_running`
         flag, then register each tool with the parent's `self._tool_wrapper`.
 
-        - long_running tools: cancel_on_interruption=False, timeout_secs=None (exempt —
-          legitimate multi-minute robot tasks must not be killed).
+        - long_running tools: cancel_on_interruption=False, timeout_secs=960
+          (covers the MCP handler's default 900-second task deadline).
         - normal tools: cancel_on_interruption=True, timeout_secs=NORMAL_TOOL_TIMEOUT_SECS
           (true hangs are bounded).
         """
@@ -280,7 +283,7 @@ class AsyncMCPClient(MCPClient):
             is_long_running = long_running_by_name.get(tool_name, False)
             # If the tool is long running, we don't want to interrupt it on new voice input.
             cancel_on_interruption = not is_long_running
-            timeout_secs = None if is_long_running else self.NORMAL_TOOL_TIMEOUT_SECS
+            timeout_secs = self.LONG_TOOL_TIMEOUT_SECS if is_long_running else self.NORMAL_TOOL_TIMEOUT_SECS
             logger.debug(
                 f"Registering function handler for '{tool_name}' with "
                 f"cancel_on_interruption={cancel_on_interruption}, timeout_secs={timeout_secs}"

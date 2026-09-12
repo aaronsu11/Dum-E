@@ -190,6 +190,14 @@ async def execute_robot_instruction(
     All updates are forwarded to the MCP client through ctx.report_progress,
     making this tool compatible with streamable HTTP clients.
     """
+    # Reject unroutable requests before they become silently pending tasks.
+    if robot_id is not None and FLEET_MANAGER is not None:
+        robot = await FLEET_MANAGER.get_robot(robot_id)
+        if robot is None:
+            return {"status": "rejected", "error": "Unknown robot_id. Call list_robots and use its exact robot_id."}
+        if not robot.enabled:
+            return {"status": "rejected", "error": "Robot is disabled."}
+
     # Create task record
     task_id = await TASK_MANAGER.create_task(
         instruction,

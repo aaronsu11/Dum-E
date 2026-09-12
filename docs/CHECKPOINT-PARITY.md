@@ -732,3 +732,57 @@ The transition checks the exact reviewed server AST changes and binds the new
 GPU witness; it does not relabel historical inference as a fresh run. The prior
 physical result remains in `corpus/phase7-small-gpu-20260911/live-run.json` as an
 operator-requested restart, with no claimed physical success or failure score.
+
+
+## Phase 7 closeout — 2026-09-12
+
+The amended milestone passed: the preserved stock producer/consumer case,
+12-observation GPU BF16 comparison accepted under the operator's physical-unit
+bounds, three successful individually authorized physical trials, and a fresh
+12-observation native GPU regression after the last trial. The original strict
+numerical comparison remains failed; this result does not claim exhaustive
+parity. Physical acceptance permits 2°/0.5°/0.5° max/mean/absolute mean bias per
+arm joint and 1/0.25/0.25 normalized gripper points.
+
+All three successful trials completed 20 chunks × 16 actions, with coherent
+banana-directed movement and grasp, zero recorded clamps and no safety stops.
+Aaron supplied the success observations. Earlier interrupted attempts remain
+archived separately. The immutable summary is
+`corpus/phase7-physical-trials-20260912/summary.json`; the final workspace is
+`corpus/phase7-closeout-20260912`. Each successful trial retains its own named
+approval, current preflights and original single-trial `partial` record. The
+closeout validator checks their combined evidence without rewriting them as one
+continuous run.
+
+The final native replay ran on GPU BF16 for about 28 seconds after trial 3.
+All 12 raw, noise and decoded outputs matched the reviewed native reference
+exactly (maximum absolute differences 0). Its 12 observer-control calls also
+passed. Final regression SHA256:
+`71878173661c9f620404a4eb8ce9e7a3f546bc7e61fc6818ffafd135816a7ecb`.
+31 focused replay/closeout validator tests passed. Independent review covered
+release/approval/control boundaries and found no unresolved high/critical issue.
+
+Read-only local verification of the archived closeout:
+
+```sh
+UV_NO_SYNC=1 uv run python scripts/replay_milestone_final.py check \
+  --workspace corpus/phase7-closeout-20260912
+UV_NO_SYNC=1 uv run python -m policy_guard.milestone_closeout check \
+  --workspace corpus/phase7-closeout-20260912
+```
+
+To create a later fresh regression, prepare a new evidence workspace retaining
+the explicitly reviewed scope, reference, source transition and physical links,
+then run `scripts/replay_milestone_final.py replay --workspace <new-workspace>`.
+The command refuses CPU inference and checks current input/source identity;
+changed inference or drift requires investigation and explicit reference review.
+Never overwrite archived attempts or use the historical 600-case command for
+this amended milestone.
+
+Latency diagnosis and measurements are in `docs/PHASE7-LATENCY-BENCHMARK.md`.
+The model-only timings were about 119 ms native and 121 ms LeRobot; CPU image
+preparation and guard checks accounted for the remaining difference. Serving
+now defaults to one CPU intra-op thread. Successful trials 2 and 3 averaged
+about 209 and 208 ms per generated chunk; complete guarded RPC timing remains
+higher. All physical runners are closed; the serving container was stopped to
+free GPU memory for final regression.

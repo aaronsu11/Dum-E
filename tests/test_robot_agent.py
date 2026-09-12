@@ -104,9 +104,9 @@ async def test_start_pick_offloads_to_thread(mocker):
     # Invoke the underlying async tool function directly.
     result = await start_pick._tool_func(item="a banana")
 
-    assert spy.await_count == 1 or spy.call_count == 1
+    assert spy.await_count == 2  # skill and JPEG encoding both leave the event loop
     # The Skill bound in the offloaded call is the PickSkill.
-    offloaded_callable = spy.call_args.args[0]
+    offloaded_callable = spy.call_args_list[0].args[0]
     assert offloaded_callable.__self__.__class__ is PickSkill
     # The adapter still builds the preserved response shape from the raw images.
     assert result["status"] == "success"
@@ -171,3 +171,39 @@ async def test_get_status_does_not_await_is_connected():
     # The genuinely-async deps were awaited.
     task_manager.list_tasks.assert_awaited_once()
     message_broker.get_message_history.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_async_fault_reaches_broker_even_if_task_storage_fails(monkeypatch):
+    from unittest.mock import AsyncMock
+    from shared import MessageType
+    monkeypatch.delenv('DUME_ASYNC_INFERENCE',raising=False)
+    controller=_make_controller_mock();broker=Mock();broker.publish=AsyncMock()
+    tasks=Mock();tasks.get_task=AsyncMock(return_value=None);tasks.update_task=AsyncMock(side_effect=RuntimeError('storage failed'))
+    agent=SO10xRobotAgent(controller,Mock(),task_manager=tasks,message_broker=broker)
+    agent._active_task_id='active'
+    await agent._publish_async_failure('Policy server disconnected')
+    message=broker.publish.call_args.args[0]
+    assert message.message_type==MessageType.TASK_FAILED
+    assert message.task_id=='active' and 'disconnected' in message.data['error']
+
+
+@pytest.mark.asyncio
+async def test_control_listener_retargets_and_cancels_active_pick():
+    from unittest.mock import AsyncMock
+    from shared import Message,MessageType
+    from datetime import datetime
+    from embodiment.so_arm10x.agent import _control_updates
+    class Broker:
+        def __init__(self):self.messages=[]
+        async def subscribe(self,**kwargs):
+            assert kwargs['task_id']=='active'
+            for data in ({'source':'mcp_server','action':'retarget','instruction':'apple'},
+                         {'source':'mcp_server','status':'cancelled'}):
+                yield Message(message_type=MessageType.STATUS_UPDATE,task_id='active',timestamp=datetime.now(),data=data)
+        async def publish(self,message):self.messages.append(message)
+    pick=Mock();broker=Broker();agent=Mock();agent.async_pick=pick
+    await _control_updates(agent,broker,'active')
+    pick.set_task.assert_called_once_with('apple')
+    pick.stop.assert_called_once()
+    assert len(broker.messages)==2

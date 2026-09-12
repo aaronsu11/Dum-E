@@ -270,7 +270,7 @@ class TestRegisterToolsSchemaTimeoutPolicy:
 
         # long_running tool: exempt from interruption + unbounded (D-02).
         assert by_name["pick_object"]["cancel_on_interruption"] is False
-        assert by_name["pick_object"]["timeout_secs"] is None
+        assert by_name["pick_object"]["timeout_secs"] == 960.0
 
         # normal tool: interruptible + bounded at the normal-tool timeout (PIPE-04).
         assert by_name["get_status"]["cancel_on_interruption"] is True

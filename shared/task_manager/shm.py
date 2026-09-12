@@ -151,6 +151,27 @@ class SharedMemoryTaskManager(ITaskManager):
         await self.update_task(task_id, TaskStatus.CANCELLED)
         return True
 
+    async def expire_pending_task(self, task_id: str, reason: str) -> bool:
+        """Fail only an unclaimed task, under the same lock used by claim_task."""
+        fd = _acquire_file_lock(self.lock_file)
+        try:
+            for i in range(self.capacity):
+                if not self.tasks[i].strip():
+                    continue
+                try:
+                    task = self._decode_task(self.tasks[i].rstrip())
+                except Exception:
+                    continue
+                if task.task_id == task_id and task.status == TaskStatus.PENDING:
+                    task.status = TaskStatus.FAILED
+                    task.status_message = reason
+                    task.completed_at = datetime.now()
+                    self.tasks[i] = self._encode_task(task)
+                    return True
+        finally:
+            _release_file_lock(fd)
+        return False
+
     async def claim_task(self, task_id: str, worker_id: str) -> bool:
         fd = _acquire_file_lock(self.lock_file)
         try:

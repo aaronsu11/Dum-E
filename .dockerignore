@@ -1,0 +1,37 @@
+# Build context allowlist for `docker build .` at this repo root.
+#
+# DENY EVERYTHING, then re-admit only what a Dockerfile in this repo actually
+# needs. This is an allowlist on purpose, for two reasons that are not stylistic:
+#
+# 1. SIZE. The repo root holds ~12 GB of checkpoint shards and a ~6 GB .venv. A
+#    default (empty) context would ship all of it to the Docker daemon on every
+#    build, for a Dockerfile whose only COPY is three Python files.
+#
+# 2. SECRETS. `.env` lives at this repo root. With a permissive context it sits
+#    inside every build, one careless `COPY . .` away from being baked into a
+#    layer — while docker/lerobot-policy/Dockerfile goes to real trouble to pass
+#    HF_TOKEN as a BuildKit `--secret` precisely so it never persists. An
+#    allowlist makes that leak structurally impossible rather than merely
+#    unlikely.
+#
+# Adding a new COPY to a Dockerfile therefore requires adding its path here. That
+# is the intended friction: it forces the decision to be explicit.
+*
+
+!docker/lerobot-policy/
+
+# Admitted by plan 06-03, which added `COPY policy_guard/ /app/policy_guard/` to
+# docker/lerobot-policy/Dockerfile so the SAFE-01 guard has ONE implementation
+# across the process boundary instead of a second copy inside the image. This
+# entry is the explicit decision the header above demands: it admits ~20 KB of
+# first-party Python (two files, one of them 0 bytes) and no secret — `.env`
+# stays denied by the `*` above, and `policy_guard/` holds no credential, no
+# checkpoint and no build artifact.
+!policy_guard/
+
+# Normal serving uses the shared lightweight observer; admit only its launcher.
+!scripts/
+scripts/*
+!scripts/serve_observed_lerobot.py
+!scripts/serve_observed_native.py
+!scripts/replay_groot_native.py

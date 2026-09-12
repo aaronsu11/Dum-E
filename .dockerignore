@@ -35,3 +35,9 @@ scripts/*
 !scripts/serve_observed_lerobot.py
 !scripts/serve_observed_native.py
 !scripts/replay_groot_native.py
+
+# Evaluation-only model server: no credentials, checkpoints or user outputs.
+!docker/model-swap/
+!policy_lab/
+policy_lab/**/__pycache__/
+policy_lab/**/*.pyc

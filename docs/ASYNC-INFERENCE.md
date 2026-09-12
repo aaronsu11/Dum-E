@@ -1,7 +1,6 @@
 # Async inference checkpoint
 
-The Phase 8 implementation is opt-in. Software and GPU simulation checks pass;
-physical stop/hold, joint continuity, and integrated voice verification remain pending.
+The Phase 8 implementation remains opt-in. Physical pick, server-loss hold, spoken retarget and audible failure checks have passed. The interrupted sustained-run check and GPU latency-outlier investigation were explicitly deferred by Aaron on 2026-09-12; independent closeout review is pending.
 
 ## Runtime behavior
 
@@ -15,7 +14,7 @@ preprocessing through decoding so relative actions retain the correct state anch
 A missed request deadline, stale action, inference error, or controller clamp latches
 a fault, closes the policy connection, and reports failure to the task and voice
 pipelines. Further movement and automatic reset are refused. This stops issuing
-commands; actual mechanical stopping/holding must still be measured on the arm.
+commands; mechanical stopping/holding was observed in one supervised server-loss trial, not guaranteed for every pose or fault.
 The controller owns the serial bus. Robot and inference calls run off the event loop.
 
 ## Measured evidence
@@ -79,13 +78,12 @@ Built images:
 - `dume-native-lightweight:20260912`: `sha256:78cab5833cb5d41ec08f689e5de2a0143244416fda2d28630ffe334be27bbd59`
 - `dume-lerobot-lightweight:20260912`: `sha256:b7074a5c29c12d90696d51c26ee3d9a3c699aeedde8f65176edb503f4fa126aa`
 
-## Remaining operator checks
+## Physical and voice results
 
-Run one test at a time with Aaron beside the arm and able to stop it. Begin with
-one bounded async pick using command/state traces; check motion and chunk-boundary
-velocity before introducing failure. Then prepare a separate server-loss trial
-in a collision-free pose and measure last-command time, physical hold, task failure,
-and audible notification. Finally verify spoken retargeting and measure voice
-round trips during the required longer integrated run against a normal baseline.
-Each trial needs a concrete runner/protocol and current operator readiness before
-motion. Do not infer a physical pass from the simulated controller or prior sync trials.
+Successful async physical trial 2 completed 320 actions with smooth grasp/lift/delivery confirmed by Aaron. Physical server loss stopped commands 233.512 ms after kill, detected failure 285.784 ms after kill, refused reset and held safely per Aaron. A later voice-triggered physical pick succeeded; startup optimization is deferred.
+
+The integrated closeout trial applied spoken banana→apple retarget with no old-epoch commands afterward. It stopped at 1,568 actions / 78.617 s on a 322.126 ms inference outlier. Aaron confirmed redirection, safe stop and audible failure. Two conversational turns during motion measured1.633 / 1.639 s; baseline1.684 / 1.651 / 4.484 s. The original multi-minute requirement is unfulfilled and now explicitly backlogged. See [latency investigation](PHASE8-LATENCY-SPIKE.md).
+
+Physical voice tests use a fixed guarded runner with real voice/MCP/GPU/controller. Normal robot-agent planning and control integration were tested separately with simulated hardware. Real server-kill/hold and live audible deadline failure are composed evidence, not an identical combined failure trial. Joint velocity evidence is descriptive for one successful run, without a formal periodic-spike threshold.
+
+The authoritative closeout record is `.planning/phases/08-async-inference-staleness-watchdog/08-VERIFICATION.md` once independent review finishes. No new motion, expanded validation or deadline relaxation follows automatically from closeout.

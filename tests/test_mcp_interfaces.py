@@ -476,3 +476,32 @@ async def test_execute_rejects_unknown_or_disabled_robot_before_creating_task(sh
     disabled=await client.call_tool('execute_robot_instruction',{'robot_id':'disabled-test','instruction':'test'})
     assert disabled.data['status']=='rejected'
     assert await tm.list_tasks()==[]
+
+
+@pytest.mark.asyncio
+async def test_managed_trial_cannot_be_reenabled_or_dispatched_when_spent(shm_env_and_server):
+    client=shm_env_and_server['client'];tm=shm_env_and_server['tm']
+    await client.call_tool('register_robot',{'robot_id':'trial','metadata':{'managed_trial':True,'ready_for_task':False}})
+    enabled=await client.call_tool('set_robot_enabled',{'robot_id':'trial','enabled':True})
+    assert enabled.data['updated'] is False
+    result=await client.call_tool('execute_robot_instruction',{'robot_id':'trial','instruction':'pick banana'})
+    assert result.data['status']=='rejected'
+    assert await tm.list_tasks()==[]
+
+
+@pytest.mark.asyncio
+async def test_unclaimed_dispatch_fails_without_waiting_for_execution_timeout(shm_env_and_server):
+    client=shm_env_and_server['client'];tm=shm_env_and_server['tm']
+    await client.call_tool('register_robot',{'robot_id':'no-worker'})
+    result=await client.call_tool('execute_robot_instruction',{'robot_id':'no-worker','instruction':'test','timeout_s':1})
+    assert result.data['status']=='failed' and 'No worker claimed' in result.data['error']
+    assert (await tm.get_task(result.data['task_id'])).status==TaskStatus.FAILED
+    assert not await tm.claim_task(result.data['task_id'],'late-worker')
+
+
+@pytest.mark.asyncio
+async def test_pending_expiry_cannot_overwrite_worker_claim(shm_env_and_server):
+    tm=shm_env_and_server['tm'];tid=await tm.create_task('test')
+    assert await tm.claim_task(tid,'worker')
+    assert not await tm.expire_pending_task(tid,'late timeout')
+    assert (await tm.get_task(tid)).status==TaskStatus.RUNNING

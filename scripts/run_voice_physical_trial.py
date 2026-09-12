@@ -39,7 +39,7 @@ async def serve(workspace):
     physical.validate_approval(approval,await asyncio.to_thread(physical.snapshot))
     physical.gate.require(sys.stdin.isatty(),'Interactive stop terminal required')
     physical.gate.require(not (workspace/'voice-dispatch.json').exists(),'Existing voice attempt must be preserved')
-    await fleet.register_robot(ROBOT_ID,'Physical Test Arm',{'physical':True,'scope':'one approved banana pick; 320 actions; no retarget'})
+    await fleet.register_robot(ROBOT_ID,'Physical Test Arm',{'physical':True,'managed_trial':True,'ready_for_task':True,'scope':'one approved banana pick; 320 actions; no retarget'})
     await fleet.set_enabled(ROBOT_ID,True)
     proc=None;controls=None;task_id=None;cancelled=False;control_events=[]
     async def publish(kind,data):
@@ -69,6 +69,8 @@ async def serve(workspace):
                 if not await tm.claim_task(task_id,'voice-physical-trial'):continue
                 task=await tm.get_task(task_id)
                 if task.status==TaskStatus.CANCELLED:continue
+                await fleet.register_robot(ROBOT_ID,metadata={'physical':True,'managed_trial':True,'ready_for_task':False})
+                await fleet.set_enabled(ROBOT_ID,False)
                 write_evidence(workspace,'voice-dispatch.json',{'at':now(),'task_id':task_id,'instruction':data['instruction'],'robot_id':ROBOT_ID,'protocol':physical.PROTOCOL})
                 controls=asyncio.create_task(control_loop())
                 await asyncio.sleep(0)
@@ -100,6 +102,7 @@ async def serve(workspace):
         if controls is not None:
             controls.cancel()
             with suppress(asyncio.CancelledError):await controls
+        await fleet.register_robot(ROBOT_ID,metadata={'physical':True,'managed_trial':True,'ready_for_task':False})
         await fleet.set_enabled(ROBOT_ID,False)
 
 

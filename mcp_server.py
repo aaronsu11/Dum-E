@@ -170,6 +170,9 @@ async def set_robot_enabled(robot_id: str, enabled: bool) -> Dict[str, Any]:
     """Enable or disable a robot by ID."""
     if not FLEET_MANAGER:
         return {"error": "Fleet manager not available in this deployment"}
+    robot = await FLEET_MANAGER.get_robot(robot_id)
+    if enabled and robot is not None and robot.metadata.get("managed_trial"):
+        return {"robot_id": robot_id, "updated": False, "error": "This one-shot trial must be rearmed by its runner; enabling the registry does not start a worker."}
     ok = await FLEET_MANAGER.set_enabled(robot_id, enabled)
     return {"robot_id": robot_id, "enabled": enabled, "updated": bool(ok)}
 
@@ -195,6 +198,8 @@ async def execute_robot_instruction(
         robot = await FLEET_MANAGER.get_robot(robot_id)
         if robot is None:
             return {"status": "rejected", "error": "Unknown robot_id. Call list_robots and use its exact robot_id."}
+        if robot.metadata.get("managed_trial") and not robot.metadata.get("ready_for_task", False):
+            return {"status": "rejected", "error": "No trial is armed. Prepare a new trial with its runner."}
         if not robot.enabled:
             return {"status": "rejected", "error": "Robot is disabled."}
 
@@ -211,6 +216,7 @@ async def execute_robot_instruction(
 
     # Stream events for this task back to the MCP client
     done = asyncio.Event()
+    acknowledged = asyncio.Event()
     final_status: str = "unknown"
     final_error: Optional[str] = None
 
@@ -227,6 +233,7 @@ async def execute_robot_instruction(
             task_id=task_id,
         ):
             message: Message = message
+            acknowledged.set()
             if message.message_type == MessageType.TASK_STARTED:
                 await ctx.report_progress(progress=0, total=100, message="Task started")
                 continue
@@ -281,8 +288,22 @@ async def execute_robot_instruction(
 
     await ctx.report_progress(progress=0, total=100, message="Task dispatched to agent")
 
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    start_timeout = min(10.0, timeout_s)
     try:
-        await asyncio.wait_for(done.wait(), timeout=timeout_s)
+        try:
+            await asyncio.wait_for(acknowledged.wait(), timeout=start_timeout)
+        except asyncio.TimeoutError:
+            reason = f"No worker claimed the task within {start_timeout:g} seconds. The request did not run; start the worker before retrying."
+            if await _SHM_TM.expire_pending_task(task_id, reason):
+                final_status, final_error = "failed", reason
+                await MESSAGE_BROKER.publish(Message(
+                    message_type=MessageType.TASK_FAILED, task_id=task_id,
+                    timestamp=datetime.now(), data={"error": reason}))
+                await ctx.report_progress(progress=100, total=100, message=reason)
+                done.set()
+        if not done.is_set():
+            await asyncio.wait_for(done.wait(), timeout=max(0, deadline - asyncio.get_running_loop().time()))
     except asyncio.TimeoutError:
         await ctx.report_progress(
             progress=100,

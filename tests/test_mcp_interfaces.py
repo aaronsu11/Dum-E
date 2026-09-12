@@ -339,3 +339,126 @@ async def test_retarget_running_task_publishes_control_without_new_task(shm_env_
     assert any(m.message_type==MessageType.STATUS_UPDATE and m.data.get('action')=='retarget' and
                m.data.get('instruction')=='apple' for m in messages)
     assert len(await tm.list_tasks())==1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('scenario',['failure','retarget','cancel'])
+async def test_async_agent_mcp_integration(shm_env_and_server,monkeypatch,scenario):
+    """Real HTTP/SHM/worker/agent/tools/scheduler; simulated model and hardware."""
+    import time
+    import threading
+    from contextlib import suppress
+    from unittest.mock import AsyncMock
+    import numpy as np
+    from embodiment.so_arm10x.agent import SO10xRobotAgent, _agent_worker_loop
+    from embodiment.so_arm10x.async_pick import AsyncPickSkill
+    from policy.lerobot.async_chunks import AsyncSettings
+    from policy_guard.replay_contract import JOINT_ORDER
+    import embodiment.so_arm10x.async_pick as driver
+    client=shm_env_and_server['client'];tm=shm_env_and_server['tm'];broker=shm_env_and_server['broker']
+    monkeypatch.setenv('DUME_ASYNC_INFERENCE','1')
+    monkeypatch.setenv('DUME_ASYNC_LATENCY_PATH','test-measured-settings')
+    monkeypatch.delenv('DUME_ASYNC_TRACE_DIRECTORY',raising=False)
+    monkeypatch.setattr(driver,'load_settings',lambda path:AsyncSettings(.15))
+    class Controller:
+        id='integration-arm'
+        def __init__(self):self.connected=False;self.actions=[];self.resets=[];self.threads=[]
+        def touch(self):self.threads.append(threading.current_thread().name)
+        def connect(self):self.touch();self.connected=True
+        def disconnect(self):self.touch();self.connected=False
+        def is_connected(self):return self.connected
+        def get_current_images(self):self.touch();return {'front':np.zeros((4,4,3),dtype=np.uint8)}
+        def get_observation(self):self.touch();return {'step':len(self.actions)}
+        def move_to_initial_pose(self):self.touch();self.resets.append('initial')
+        def move_to_ready_pose(self):self.touch();self.resets.append('ready')
+        def set_target_state(self,target):self.touch();self.actions.append(dict(target));return dict(target)
+    class Policy:
+        language_instruction='banana';_handshaken=True
+        def __init__(self):self._session=SimpleNamespace();self.calls=[];self.fail=False;self.closed=False
+        def set_lang_instruction(self,text):self.language_instruction=text
+        def set_task(self,text):self.language_instruction=text
+        def get_action(self,obs,instruction):
+            self.calls.append((instruction,threading.current_thread().name));time.sleep(.04)
+            if self.fail:raise RuntimeError('injected inference failure')
+            return [dict.fromkeys(JOINT_ORDER,.2 if instruction=='apple' else .1) for _ in range(16)]
+        def close(self):self.closed=True
+    controller=Controller();policy=Policy()
+    agent=SO10xRobotAgent(controller,policy,task_manager=tm,message_broker=broker)
+    original_run=agent.async_pick.run
+    # Bound the real start_pick tool to two chunks for this test only.
+    def bounded_run(*args,**kwargs):return original_run(*args,**dict(kwargs,actions_to_execute=2))
+    agent.async_pick.run=bounded_run
+    tools={t.tool_name:t for t in agent._robot_tools}
+    class ScriptedModel:
+        async def stream_async(self,instruction):
+            await tools['start_pick']._tool_func(item='a banana')
+            yield {'result':SimpleNamespace(message={'role':'assistant','content':[{'text':'done'}]})}
+    agent._get_strands_agent=AsyncMock(return_value=ScriptedModel())
+    worker=asyncio.create_task(_agent_worker_loop(agent,tm,broker,controller.id,'integration-worker'))
+    execution=None
+    async def until(predicate,timeout=4):
+        async with asyncio.timeout(timeout):
+            while not predicate():await asyncio.sleep(.005)
+    try:
+        await asyncio.sleep(.03)  # subscribe before MCP publishes TASK_CREATED
+        execution=asyncio.create_task(client.call_tool('execute_robot_instruction',
+            {'instruction':'pick banana','robot_id':controller.id,'timeout_s':8}))
+        await until(lambda:len(controller.actions)>=4)
+        task_id=agent._active_task_id
+        assert task_id and (await tm.get_task(task_id)).status==TaskStatus.RUNNING
+        # This HTTP request must complete while inference and dispatch are active.
+        count=len(controller.actions);started=time.monotonic()
+        details=await client.call_tool('get_task_details',{'task_id':task_id})
+        assert time.monotonic()-started<1 and details.data['task']['status']=='running'
+        assert any(name.startswith('policy-inference') for _,name in policy.calls)
+        if scenario=='failure':policy.fail=True
+        elif scenario=='retarget':
+            response=await client.call_tool('retarget_robot_instruction',{'task_id':task_id,'instruction':'apple'})
+            assert response.data['status']=='requested'
+            await until(lambda:any(text=='apple' for text,_ in policy.calls))
+        else:
+            response=await client.call_tool('cancel_task',{'task_id':task_id})
+            assert response.data['cancelled'] is True
+        result=await execution
+        messages=await broker.get_message_history(task_id=task_id,limit=32)
+        task=await tm.get_task(task_id)
+        assert len(await tm.list_tasks())==1
+        if scenario=='retarget':
+            assert task.status==TaskStatus.COMPLETED and len(controller.actions)==32
+            assert not any(m.message_type==MessageType.TASK_FAILED for m in messages)
+            assert any('Retargeted' in str(m.data) for m in messages)
+            assert any(a[JOINT_ORDER[0]]==.2 for a in controller.actions)
+            assert not policy.closed
+        else:
+            assert task.status==(TaskStatus.CANCELLED if scenario=='cancel' else TaskStatus.FAILED)
+            assert result.data['status']==('cancelled' if scenario=='cancel' else 'failed')
+            assert any(m.message_type==MessageType.TASK_FAILED for m in messages)
+            assert not any(m.message_type==MessageType.TASK_COMPLETED for m in messages)
+            assert controller.resets==['initial','ready'] and policy.closed
+            stopped_count=len(controller.actions)
+            with pytest.raises(Exception):await tools['reset_pose']._tool_func()
+            await asyncio.sleep(.1)
+            assert len(controller.actions)==stopped_count
+        assert all(name!='MainThread' for name in controller.threads)
+        await until(lambda:not controller.connected)
+    finally:
+        if agent.async_pick.active:agent.async_pick.stop('test cleanup')
+        if execution is not None and not execution.done():execution.cancel()
+        worker.cancel()
+        with suppress(asyncio.CancelledError):await worker
+        if execution is not None:
+            with suppress(asyncio.CancelledError):await execution
+
+
+@pytest.mark.asyncio
+async def test_retarget_rejects_empty_missing_and_terminal_tasks(shm_env_and_server):
+    client=shm_env_and_server['client'];tm=shm_env_and_server['tm'];broker=shm_env_and_server['broker']
+    task_id=await tm.create_task('banana')
+    await tm.update_task(task_id,TaskStatus.RUNNING)
+    for target,instruction in [(task_id,'  '),('missing','apple')]:
+        response=await client.call_tool('retarget_robot_instruction',{'task_id':target,'instruction':instruction})
+        assert response.data['status']=='rejected'
+    await tm.update_task(task_id,TaskStatus.COMPLETED)
+    response=await client.call_tool('retarget_robot_instruction',{'task_id':task_id,'instruction':'apple'})
+    assert response.data['status']=='rejected'
+    assert not await broker.get_message_history(task_id=task_id,limit=10)

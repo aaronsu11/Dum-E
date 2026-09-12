@@ -243,10 +243,13 @@ async def execute_robot_instruction(
                     if isinstance(message.data, dict)
                     else None
                 )
+                task = await TASK_MANAGER.get_task(task_id)
+                cancelled = task is not None and task.status == TaskStatus.CANCELLED
                 await ctx.report_progress(
-                    progress=100, total=100, message=f"Task failed: {err_text}"
+                    progress=100, total=100,
+                    message="Task cancelled" if cancelled else f"Task failed: {err_text}"
                 )
-                final_status = "failed"
+                final_status = "cancelled" if cancelled else "failed"
                 final_error = err_text
                 done.set()
                 break

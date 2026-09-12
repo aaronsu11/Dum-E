@@ -174,12 +174,12 @@ async def test_get_status_does_not_await_is_connected():
 
 
 @pytest.mark.asyncio
-async def test_async_fault_reaches_voice_even_if_task_storage_fails(monkeypatch):
+async def test_async_fault_reaches_broker_even_if_task_storage_fails(monkeypatch):
     from unittest.mock import AsyncMock
     from shared import MessageType
     monkeypatch.delenv('DUME_ASYNC_INFERENCE',raising=False)
     controller=_make_controller_mock();broker=Mock();broker.publish=AsyncMock()
-    tasks=Mock();tasks.update_task=AsyncMock(side_effect=RuntimeError('storage failed'))
+    tasks=Mock();tasks.get_task=AsyncMock(return_value=None);tasks.update_task=AsyncMock(side_effect=RuntimeError('storage failed'))
     agent=SO10xRobotAgent(controller,Mock(),task_manager=tasks,message_broker=broker)
     agent._active_task_id='active'
     await agent._publish_async_failure('Policy server disconnected')

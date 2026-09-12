@@ -305,10 +305,17 @@ class SO10xRobotAgent(IRobotAgent):
         if self._event_loop is not None:
             asyncio.run_coroutine_threadsafe(self._publish_async_failure(reason), self._event_loop)
 
+    async def _record_failed_task(self, task_id, reason):
+        task = await self.task_manager.get_task(task_id)
+        if task is not None and task.status == TaskStatus.CANCELLED:
+            return TaskStatus.CANCELLED
+        await self.task_manager.update_task(task_id, TaskStatus.FAILED, reason)
+        return TaskStatus.FAILED
+
     async def _publish_async_failure(self, reason):
         notifications = []
         if self.task_manager is not None and self._active_task_id is not None:
-            notifications.append(self.task_manager.update_task(self._active_task_id, TaskStatus.FAILED, reason))
+            notifications.append(self._record_failed_task(self._active_task_id, reason))
         if self.message_broker is not None:
             notifications.append(self.message_broker.publish(Message(
                 message_type=MessageType.TASK_FAILED, task_id=self._active_task_id,
@@ -460,12 +467,13 @@ Note: Colors in images may appear different due to reflections.""",
                     f"❌ Failed to disconnect robot after error: {disconnect_error}"
                 )
 
+            terminal_status = TaskStatus.FAILED
             if self.task_manager is not None and task_id is not None:
-                await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
+                terminal_status = await self._record_failed_task(task_id, str(e))
 
             return {
                 "task_id": task_id,
-                "status": "failed",
+                "status": terminal_status.value,
                 "error": str(e),
                 "timestamp": datetime.now().isoformat(),
             }
@@ -608,7 +616,7 @@ Note: Colors in images may appear different due to reflections.""",
                 )
 
             if self.task_manager is not None and task_id is not None:
-                await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
+                await self._record_failed_task(task_id, str(e))
 
                 if self.message_broker:
                     # Publish failure message

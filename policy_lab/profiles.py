@@ -18,6 +18,13 @@ class Profile:
 
 
 PROFILES = {
+    "groot-so101": Profile(
+        "groot-so101", "Dum-E/GR00T-N1.7-3B-SO101",
+        "9bd09a2a40c04637b5d6e010790ac2e3b6cbd75f81c1d59443856e4e37f27c09",
+        "groot", 16, 6,
+        "Validated Dum-E checkpoint and BF16 LeRobot loader with serving guard; "
+        "evaluation HTTP transport, observer off, no physical execution.",
+    ),
     "pi05-base": Profile(
         "pi05-base", "lerobot/pi05_base",
         "b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba",

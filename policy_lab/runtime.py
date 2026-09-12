@@ -18,16 +18,22 @@ class ModelRuntime:
         self.fault = None
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA required; CPU model inference is disabled")
-        self.snapshot = snapshot_download(
-            self.profile.repo, revision=self.profile.revision,
-            allow_patterns=["*.json", "*.safetensors", "*.jinja", "*.model"],
-        )
+        if self.profile.policy_type == "groot":
+            self.snapshot = os.environ.get("MODEL_SWAP_GROOT_CHECKPOINT", "/checkpoints/model")
+            self._verify_groot_checkpoint()
+        else:
+            self.snapshot = snapshot_download(
+                self.profile.repo, revision=self.profile.revision,
+                allow_patterns=["*.json", "*.safetensors", "*.jinja", "*.model"],
+            )
         started = time.monotonic()
         torch.cuda.reset_peak_memory_stats()
         if self.profile.policy_type == "pi05":
             self._load_pi05()
-        else:
+        elif self.profile.policy_type == "molmoact2":
             self._load_molmoact2()
+        else:
+            self._load_groot()
         self.policy.eval().to("cuda")
         torch.cuda.synchronize()
         self.load_s = time.monotonic() - started
@@ -36,6 +42,41 @@ class ModelRuntime:
         ))
         if any(p.device.type != "cuda" for p in self.policy.parameters()):
             raise RuntimeError("Every model parameter must reside on CUDA")
+
+    def _verify_groot_checkpoint(self):
+        from policy_guard.replay_contract import checkpoint_inventory, fingerprint_configuration
+        refs, _ = checkpoint_inventory(Path(self.snapshot))
+        if fingerprint_configuration(refs) != self.profile.revision:
+            raise ValueError("GR00T checkpoint differs from the validated Phase 7 input lock")
+
+    def _load_groot(self):
+        import importlib.util
+        from lerobot.policies.groot.configuration_groot import GrootConfig
+        from lerobot.policies.factory import make_pre_post_processors
+        from policy_guard.groot_guard import (
+            EXPECTED_TAG, serving_preprocessor_overrides,
+            snapshot_from_loaded, assert_groot_serving_contract,
+        )
+        source = Path("/app/docker/lerobot-policy/server.py")
+        spec = importlib.util.spec_from_file_location("dume_validated_groot_server", source)
+        server = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(server)
+        config = GrootConfig(base_model_path=self.snapshot, embodiment_tag=EXPECTED_TAG,
+                             model_params_fp32=False)
+        server.fixup_policy_features(config, ["front", "wrist"], 480, 640, 6, 6)
+        self.policy = server.DumEGrootPolicy.from_pretrained(self.snapshot, config=config)
+        self.pre, self.post = make_pre_post_processors(
+            self.policy.config, pretrained_path=self.snapshot,
+            preprocessor_overrides={
+                "device_processor": {"device": "cuda"},
+                "rename_observations_processor": {"rename_map": {}},
+                **serving_preprocessor_overrides(),
+            },
+            postprocessor_overrides={"device_processor": {"device": "cuda"}},
+        )
+        assert_groot_serving_contract(
+            snapshot_from_loaded(self.policy.config, self.pre, self.post, self.profile.horizon)
+        )
 
     def _load_pi05(self):
         from lerobot.configs import PreTrainedConfig
@@ -141,6 +182,8 @@ class ModelRuntime:
             torch.cuda.synchronize()
             predicted_at = time.perf_counter()
             actions = self.policy.predict_action_chunk(batch)
+            if self.profile.policy_type == "groot":
+                actions = actions[:, :self.profile.horizon]
             torch.cuda.synchronize()
             decoded_at = time.perf_counter()
             actions = self.post(actions).detach().float().cpu()

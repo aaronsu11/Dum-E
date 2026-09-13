@@ -11,10 +11,18 @@ camera index 2. The controller captures RGB 640×480 images. Five body joints us
 centered LeRobot degrees; the gripper uses RANGE_0_100, even when
 `use_degrees=True`. Do not convert the gripper as degrees.
 
-Calibration file:
-`~/.cache/huggingface/lerobot/calibration/robots/so101_follower/my_awesome_follower_arm.json`
+Calibration file actually loaded by the current controller:
+`~/.cache/huggingface/lerobot/calibration/robots/so_follower/my_awesome_follower_arm.json`
 
-SHA256: `5bd471fbbb4e1be0c6ede80472d365b527bc0808befdd67f123148ed49e3dc50`
+SHA256: `ef68ae670b75d88f57260866653a484f224b1c31fdd8ff1d8e3cf2a1270b6f5b`
+
+**Phase10 correction:** Phase9 inspected the older `so101_follower` directory
+(SHA256 `5bd471fbbb4e1be0c6ede80472d365b527bc0808befdd67f123148ed49e3dc50`).
+Constructing the current controller without connecting hardware demonstrated
+that LeRobot resolves `so_follower` instead. These files contain different
+calibrations. The trial now binds to `robot.calibration_fpath` and validates
+the follower and bus mappings against it. Neither file was modified.
+Phase9's GPU timing measurements remain valid; they did not use this calibration.
 
 At audit time no `/dev/video*` or `/dev/ttyACM*` devices were visible. Saved camera
 indices are configuration, not proof of current identity, orientation or exposure.
@@ -63,11 +71,11 @@ calibration, degrees per normalized point are:
 
 | Joint | Degrees per point |
 |---|---:|
-| shoulder_pan | 1.165275 |
-| shoulder_lift | 1.037363 |
-| elbow_flex | 0.963516 |
-| wrist_flex | 1.007912 |
-| wrist_roll | 1.677802 |
+| shoulder_pan | 1.139341 |
+| shoulder_lift | 1.032088 |
+| elbow_flex | 0.965714 |
+| wrist_flex | 1.003956 |
+| wrist_roll | 1.800000 |
 
 The conversion is `degrees / scale` toward the normalized model frame and
 `normalized * scale` back. It leaves gripper values unchanged. This follows

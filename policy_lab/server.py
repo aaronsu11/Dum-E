@@ -7,7 +7,7 @@ import threading
 import traceback
 
 from .profiles import PROFILES
-from .protocol import MAX_BODY_BYTES, decode_request
+from .protocol import MAX_BODY_BYTES, decode_request, decode_rtc_request
 from .runtime import ModelRuntime
 
 
@@ -33,7 +33,7 @@ def handler(runtime):
             return self.respond(200, runtime.health())
 
         def do_POST(self):
-            if self.path != "/infer":
+            if self.path not in ("/infer", "/infer/rtc"):
                 return self.respond(404, {"error": "Not found"})
             if not gate.acquire(blocking=False):
                 return self.respond(409, {"error": "One inference request at a time"})
@@ -42,8 +42,12 @@ def handler(runtime):
                 if not 0 < length <= MAX_BODY_BYTES:
                     return self.respond(413, {"error": "Invalid request size"})
                 data = json.loads(self.rfile.read(length))
-                request = decode_request(data)
-                result = runtime.infer(*request)
+                if self.path == "/infer/rtc":
+                    request, rtc = decode_rtc_request(data)
+                    result = runtime.infer_rtc(request, rtc)
+                else:
+                    request = decode_request(data)
+                    result = runtime.infer(*request)
                 self.respond(200, result)
             except (ValueError, KeyError, TypeError) as exc:
                 self.respond(400, {"error": str(exc)})

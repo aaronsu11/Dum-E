@@ -32,6 +32,13 @@ PROFILES = {
         "Base-model smoke only: padded raw SO101 state, two mapped images and "
         "one missing-camera placeholder; no SO101 normalization or physical action mapping.",
     ),
+    "pi05-so101": Profile(
+        "pi05-so101", "Project-IRA/TPSoSe2026_Pi05_LeRobot_SO101_Finetuning_V7_Full_V2",
+        "4b48932cc74a61f685841a4fff467ef31caa9ce1", "pi05", 50, 6,
+        "Author-recommended checkpoint 008000; six named absolute SO101 joints in "
+        "degrees with 0-100 gripper; saved MEAN_STD processors; wrist_left/desk_view "
+        "live cameras. Dum-E calibration and task behavior require bounded physical validation.",
+    ),
     "molmoact2-so101": Profile(
         "molmoact2-so101", "allenai/MolmoAct2-SO100_101",
         "152569fe57914d97be91055800035f54e250d009",

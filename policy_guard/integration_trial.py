@@ -3,9 +3,9 @@ import numpy as np
 from policy.galaxea.modalities import JOINTS, vector
 
 PROTOCOL = {
-    "profile": "g05-so101", "scheduler": "sync", "chunks": 1,
+    "profile": "g05-so101", "scheduler": "sync", "chunks": 3,
     "actions": 32, "period_s": 0.05, "max_step": 0.25,
-    "max_excursion": 5.0, "reset_pose": None,
+    "max_tracking_error": 3.75, "max_excursion": 5.0, "reset_pose": None,
     "instruction": "Grab a banana and put it on the plate",
     "accuracy_scored": False,
 }
@@ -32,12 +32,21 @@ def joint_limits(calibration):
     return np.array([-v for v in spans] + [0.]), np.array(spans + [100.])
 
 
-def bounded_command(raw, observed, previous, origin, limits):
+def probe_target(origin, offset_degrees=3.0):
+    """Explicit diagnostic target, never presented as a model prediction."""
+    if not np.isfinite(offset_degrees) or not 0 < offset_degrees <= 6:
+        raise ValueError("Diagnostic pan offset must be within (0, 6] degrees")
+    target = vector(origin).copy()
+    target[0] += offset_degrees
+    return target
+
+
+def bounded_command(raw, observed, previous, origin, limits, *, max_tracking_error=0.25):
     """Project deliberately; preserve raw predictions separately in evidence.
 
     All arm limits are degrees; gripper limits are normalized 0–100 points.
-    Intersect limits around both the measured pose and the previous command,
-    so lag cannot accumulate into a later jump.
+    Separate measured-pose tracking allowance from command slew. The default
+    remains the original trial bound; diagnostic callers must opt in explicitly.
     """
     raw, observed, previous, origin = map(vector, (raw, observed, previous, origin))
     lower, upper = limits
@@ -46,8 +55,10 @@ def bounded_command(raw, observed, previous, origin, limits):
     if np.any(abs(observed - origin) > PROTOCOL["max_excursion"] + 0.5):
         raise ValueError("Observed excursion exceeded trial envelope")
     step, span = PROTOCOL["max_step"], PROTOCOL["max_excursion"]
-    low = np.maximum.reduce([lower, origin - span, observed - step, previous - step])
-    high = np.minimum.reduce([upper, origin + span, observed + step, previous + step])
+    if not np.isfinite(max_tracking_error) or not 0 < max_tracking_error <= 3.75:
+        raise ValueError("Invalid tracking allowance")
+    low = np.maximum.reduce([lower, origin - span, observed - max_tracking_error, previous - step])
+    high = np.minimum.reduce([upper, origin + span, observed + max_tracking_error, previous + step])
     if np.any(low > high):
         raise ValueError("Measured and commanded pose diverged; stop trial")
     return np.clip(raw, low, high)

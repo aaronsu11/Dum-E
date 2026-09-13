@@ -28,6 +28,10 @@ def calibration_scale(path):
 
 def to_model_frame(values, profile, *, calibration_path=None):
     values = vector(values)
+    if profile == "pi05-so101":
+        # Project-IRA records with LeRobot 0.5.1's use_degrees=True default.
+        # Mean/std normalization belongs to the saved checkpoint processor.
+        return values.copy()
     if profile in ("g05-so101", "molmoact2-so101"):
         return arm_to_model(values)
     if profile == "groot-so101":
@@ -41,6 +45,8 @@ def to_model_frame(values, profile, *, calibration_path=None):
 
 def to_arm_frame(values, profile, *, calibration_path=None):
     values = vector(values)
+    if profile == "pi05-so101":
+        return values.copy()
     if profile in ("g05-so101", "molmoact2-so101"):
         return model_to_arm(values)
     if profile == "groot-so101":

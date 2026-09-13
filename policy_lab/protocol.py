@@ -1,6 +1,7 @@
 """Bounded JSON wire format: no pickle, checkpoint paths, or executable payloads."""
 import base64
 import binascii
+import hashlib
 import numpy as np
 
 MAX_BODY_BYTES = 8 * 1024 * 1024
@@ -43,3 +44,34 @@ def decode_request(data):
     if type(seed) is not int or not 0 <= seed < 2**32:
         raise ValueError("Seed must be an unsigned 32-bit integer")
     return state.astype(np.float32), decode_image(data["front"]), decode_image(data["wrist"]), task, seed
+
+
+def prefix_digest(prefix):
+    if prefix is None:
+        return hashlib.sha256(b"initial").hexdigest()
+    return hashlib.sha256(np.asarray(prefix, dtype="<f8").tobytes()).hexdigest()
+
+
+def decode_rtc_request(data):
+    if not isinstance(data, dict) or set(data) != {
+            "state", "front", "wrist", "task", "seed", "rtc"}:
+        raise ValueError("Invalid RTC request fields")
+    rtc = data["rtc"]
+    if not isinstance(rtc, dict) or set(rtc) != {
+            "epoch", "request_id", "prefix_arm", "delay_steps"}:
+        raise ValueError("Invalid RTC metadata")
+    for key in ("epoch", "request_id"):
+        if type(rtc[key]) is not int or not 0 <= rtc[key] < 2**53:
+            raise ValueError("Invalid RTC identity")
+    prefix = rtc["prefix_arm"]
+    if prefix is None:
+        if type(rtc["delay_steps"]) is not int or rtc["delay_steps"] != 0:
+            raise ValueError("Initial RTC request requires zero delay")
+    else:
+        prefix = np.asarray(prefix)
+        if (prefix.shape != (25, 6) or prefix.dtype.kind not in "fiu"
+                or not np.isfinite(prefix).all()):
+            raise ValueError("RTC requires 25 finite bounded six-joint targets")
+        if type(rtc["delay_steps"]) is not int or not 1 <= rtc["delay_steps"] < 25:
+            raise ValueError("Invalid RTC delay")
+    return decode_request({k: v for k, v in data.items() if k != "rtc"}), rtc

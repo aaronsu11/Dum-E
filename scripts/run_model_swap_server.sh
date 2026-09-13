@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
-profile="${1:?Usage: run_model_swap_server.sh pi05-base|molmoact2-so101|groot-so101 [image]}"
-case "$profile" in pi05-base|molmoact2-so101|groot-so101) ;; *) echo "Unknown profile" >&2; exit 1;; esac
-image="${2:-dume-model-swap:phase8.1}"
+profile="${1:?Usage: run_model_swap_server.sh pi05-base|pi05-so101|molmoact2-so101|groot-so101 [image]}"
+case "$profile" in pi05-base|pi05-so101|molmoact2-so101|groot-so101) ;; *) echo "Unknown profile" >&2; exit 1;; esac
+if [[ "$profile" == pi05-so101 ]]; then
+  image="${2:-dume-model-swap:pi05-so101-phase10}"
+else
+  image="${2:-dume-model-swap:phase8.1}"
+fi
 cache="${MODEL_SWAP_CACHE:-$HOME/.cache/huggingface}"
 evidence="${MODEL_SWAP_EVIDENCE:-$PWD/corpus/model-swap-$profile}"
 mkdir -p "$cache" "$evidence"
@@ -15,6 +19,11 @@ if [[ "$profile" == groot-so101 ]]; then
   # Reuse the image's pinned, pre-existing Cosmos cache entirely offline.
   extra=(-e HF_HOME=/root/.cache/huggingface -e HF_HUB_OFFLINE=1
          -v "$checkpoint:/checkpoints/model:ro")
+fi
+if [[ "$profile" == pi05-so101 ]]; then
+  checkpoint="${MODEL_SWAP_PI05_SO101_CHECKPOINT:?Set the pinned checkpoint pretrained_model directory}"
+  [[ -f "$checkpoint/model.safetensors" ]] || { echo "SO101 checkpoint required" >&2; exit 1; }
+  extra=(-e HF_HUB_OFFLINE=1 -v "$checkpoint:/checkpoints/model:ro")
 fi
 # host networking keeps the server itself loopback-only on Linux; no -p 0.0.0.0
 # publication. On EC2 reach it only with ssh -L 8081:127.0.0.1:8081.

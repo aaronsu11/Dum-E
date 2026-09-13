@@ -5,7 +5,7 @@ environment variable into a concrete :class:`shared.IPolicyBackend`. This is the
 ONLY way production code reaches inference; there is no remaining hardcoded path
 to a specific policy stack.
 
-Selection is an explicit three-member allowlist plus explicit branches. A backend
+Selection is an explicit allowlist plus explicit branches. A backend
 name is never used to build an import path, a module attribute lookup or a class
 name, and is never ``eval``'d — the allowlist IS the whole validation surface
 (ASVS V5).
@@ -23,7 +23,7 @@ from shared import IPolicyBackend
 POLICY_BACKEND_ENV_VAR = "DUME_POLICY_BACKEND"
 
 #: The allowlist. Anything not in here is rejected — never defaulted.
-POLICY_BACKENDS = ("lerobot", "groot-native", "galaxea")
+POLICY_BACKENDS = ("lerobot", "groot-native", "galaxea", "pi05-so101")
 
 #: Code-level default when the environment variable is unset. Deliberately the
 #: target backend rather than the one that works today, so an unset variable
@@ -74,6 +74,10 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
         from policy.lerobot.backend import LeRobotPolicyBackend
 
         return LeRobotPolicyBackend(**kwargs)
+
+    if backend == "pi05-so101":
+        from policy.pi05_backend import Pi05SO101PolicyBackend
+        return Pi05SO101PolicyBackend(**kwargs)
 
     if backend == "galaxea":
         if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":

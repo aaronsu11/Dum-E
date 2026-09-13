@@ -219,6 +219,11 @@ if __name__ == "__main__":
 
     async def _main():
         if args.worker:
+            from shared.fleet_manager import get_shared_memory_fleet_manager_from_env
+            fleet = get_shared_memory_fleet_manager_from_env()
+            if fleet is not None:
+                await fleet.register_robot(args.id, "Mock Robot", {"simulated": True})
+                await fleet.set_enabled(args.id, True)
             worker_id = f"mock-worker-{uuid.uuid4()}"
             await mock_agent_worker_loop(
                 agent=agent,

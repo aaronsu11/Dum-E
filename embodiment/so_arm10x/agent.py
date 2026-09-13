@@ -1,25 +1,4 @@
-"""
-Refactored robot agent implementing the IRobotAgent interface.
-
-This module provides an SO10x robot agent that implements the abstract
-interfaces while maintaining compatibility with the existing voice assistant
-streaming pattern. Key improvements include:
-- Implements IRobotAgent interface for modularity
-- Message publishing for real-time progress updates
-- Enhanced error handling and recovery
-- Task lifecycle management
-- Tool registry integration
-
-Example usage (from the root directory):
-python -m embodiment.so_arm10x.agent \
-    --port /dev/ttyACM0 \
-    --id so101_follower_arm \
-    --wrist_cam_idx 0 \
-    --front_cam_idx 1 \
-    --policy_host localhost \
-    --profile aws \
-    --instruction "I want one banana and one apple on the plate"
-"""
+'Refactored robot agent implementing the IRobotAgent interface.'
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
@@ -105,19 +84,7 @@ def create_robot_tools(
     gr00t_client_instance: Gr00tRobotInferenceClient,
     async_pick=None,
 ):
-    """Create robot tools that use the specific robot instance.
-
-    Each blocking robot operation lives in a synchronous ``Skill`` (skills.py).
-    The robot ``@tool`` functions below are thin ASYNC adapters that offload the
-    Skill's ``run()`` onto a worker thread via ``asyncio.to_thread``, so
-    the event loop stays responsive during multi-minute N1.7 inference. The
-    adapters preserve the exact ``{"status", "content": [...]}`` response shape
-    and the ``image_to_jpeg_bytes`` post-processing; the Skill returns raw images.
-
-    Strands 1.12.0 accepts ``async def`` functions decorated with ``@tool``
-    (confirmed via ``Agent(tools=[async_tool]).tool_names``), so the adapters are
-    registered directly without a sync bridge.
-    """
+    'Create robot tools that use the specific robot instance.'
 
     # Construct the synchronous Skills bound to this controller + policy client.
     pick_skill = async_pick or PickSkill(robot_controller, gr00t_client_instance)
@@ -172,14 +139,7 @@ def create_robot_tools(
 
     @tool
     async def start_pick(item: str) -> dict:
-        """Start picking up an item and put it on the plate
-
-        Args:
-            item: The item to pick up, e.g. "a banana", "an apple", "an orange"
-
-        Returns:
-            A dictionary containing the status of the pick operation
-        """
+        'Start picking up an item and put it on the plate'
         language_instruction = f"Grab {item} and put it on the plate"
         gr00t_client_instance.set_lang_instruction(language_instruction)
         latest_images = await run_pick(
@@ -239,13 +199,7 @@ def create_robot_tools(
 
 
 class SO10xRobotAgent(IRobotAgent):
-    """
-    SO10x robot agent implementing the IRobotAgent interface.
-
-    Maintains compatibility with existing voice assistant integration while
-    adding enhanced features for task management, event streaming, and
-    modular tool management.
-    """
+    'SO10x robot agent implementing the IRobotAgent interface.'
 
     def __init__(
         self,
@@ -256,17 +210,7 @@ class SO10xRobotAgent(IRobotAgent):
         message_broker: Optional[IMessageBroker] = None,
         callback_handler: Callable = None,
     ):
-        """
-        Initialize the SO10x robot agent with explicit dependency injection.
-
-        Args:
-            robot_controller: Required SO100Robot instance for hardware control
-            gr00t_client_instance: Required Gr00t client instance
-            profile: The model provider profile
-            task_manager: task manager instance
-            message_broker: optional message broker instance
-            callback_handler: optional callback handler for agent events
-        """
+        'Initialize the SO10x robot agent with explicit dependency injection.'
         # Required controller and policy client
         self.robot_controller = robot_controller
         self.gr00t_client_instance = gr00t_client_instance
@@ -481,12 +425,7 @@ Note: Colors in images may appear different due to reflections.""",
     async def astream(
         self, instruction: str, task_id: Optional[str] = None
     ) -> AsyncIterator[Dict[str, Any]]:
-        """
-        Execute instruction with streaming progress updates.
-
-        Maintains compatibility with existing voice assistant while adding
-        enhanced progress tracking and message publishing.
-        """
+        'Execute instruction with streaming progress updates.'
         try:
             # Create task if not provided and manager exists
             if self.task_manager is not None:
@@ -641,13 +580,7 @@ Note: Colors in images may appear different due to reflections.""",
             }
 
     async def get_available_tools(self) -> List[ToolDefinition]:
-        """Get list of tools available to this agent.
-
-        Builds a real ``List[ToolDefinition]`` from the Strands ``@tool`` specs.
-        Each decorated tool exposes its spec via ``.tool_spec`` (a dict with
-        ``name``/``description``/``inputSchema``); the JSON parameter schema lives
-        at ``tool_spec["inputSchema"]["json"]``.
-        """
+        'Get list of tools available to this agent.'
         tool_definitions: List[ToolDefinition] = []
         for fn in self._robot_tools:
             spec = getattr(fn, "tool_spec", None)
@@ -713,29 +646,14 @@ def create_robot_agent(
     task_manager: Optional[ITaskManager] = None,
     message_broker: Optional[IMessageBroker] = None,
 ) -> SO10xRobotAgent:
-    """
-    Create a robot agent with customizable hardware configuration.
-
-    This creates fresh instances with specified hardware settings, ideal for
-    multiple agents with different camera configurations.
-
-    Args:
-        robot_type: Robot type (so100_follower or so101_follower)
-        robot_port: Serial port for the arm
-        robot_id: Robot ID
-        wrist_cam_idx: Wrist camera index
-        front_cam_idx: Front camera index
-        policy_host: Host for the GR00T policy server
-        profile: The model provider profile
-        callback_handler: Optional callback handler for agent events
-    """
+    'Create a robot agent with customizable hardware configuration.'
     if robot_port is None:
         raise ValueError("`robot_port` is required for create_robot_agent")
 
     controller_class = SO10xArmController
     controller_options = {}
     if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
-        from scripts.run_checkpoint_sanity import StopGuardedController, StopLatch
+        from embodiment.so_arm10x.safety import StopGuardedController, StopLatch
         controller_class = StopGuardedController
         controller_options["stop"] = StopLatch()
     robot_controller = controller_class(

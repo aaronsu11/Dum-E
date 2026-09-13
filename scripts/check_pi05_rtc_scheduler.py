@@ -3,6 +3,9 @@ import argparse
 import json
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import numpy as np
 
 from policy.galaxea.modalities import JOINTS

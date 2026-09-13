@@ -8,17 +8,15 @@ import os
 from pathlib import Path
 
 from policy.galaxea.modalities import vector
-from policy.molmo_backend import MolmoPolicyBackend
+from policy.http_backend import SO101HTTPPolicyBackend
 from policy.so101_contract import calibration_scale
-from policy_lab.profiles import get_profile
 
 
-class GrootTrialBackend(MolmoPolicyBackend):
+class GrootTrialBackend(SO101HTTPPolicyBackend):
     def __init__(self, *, calibration_path, port=8081, language_instruction=None):
         if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
             raise ValueError("GR00T HTTP trial bridge is synchronous; use LeRobot for async")
-        super().__init__(port=port, language_instruction=language_instruction)
-        self.profile = get_profile("groot-so101")
+        super().__init__(port=port, language_instruction=language_instruction, profile="groot-so101")
         self.calibration_path = Path(calibration_path).resolve(strict=True)
         self.scales, self.calibration_sha256 = calibration_scale(self.calibration_path)
 

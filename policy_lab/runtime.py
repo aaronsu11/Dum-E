@@ -48,7 +48,7 @@ class ModelRuntime:
             raise RuntimeError("Every model parameter must reside on CUDA")
 
     def _verify_groot_checkpoint(self):
-        from policy_guard.replay_contract import checkpoint_inventory, fingerprint_configuration
+        from policy_guard.contracts import checkpoint_inventory, fingerprint_configuration
         refs, _ = checkpoint_inventory(Path(self.snapshot))
         if fingerprint_configuration(refs) != self.profile.revision:
             raise ValueError("GR00T checkpoint differs from the validated Phase 7 input lock")

@@ -1,20 +1,4 @@
-"""
-Mocked-wiring async tests for the SO10x robot agent.
-
-These tests are keyless and hardware-free. They pin three client surfaces:
-
-1. Robot ``@tool`` adapters offload the blocking ``Skill`` via
-   ``asyncio.to_thread`` (the event-loop-responsiveness fix).
-2. ``get_available_tools()`` returns a real ``List[ToolDefinition]``.
-3. ``get_status()`` does NOT await the synchronous ``is_connected()``.
-
-Import note: ``embodiment.so_arm10x.controller`` imports
-``policy.gr00t.service.ExternalRobotInferenceClient`` which transitively imports
-the external ``gr00t`` package (only present on the policy-server host). To keep
-this suite runnable in CI we stub those modules in ``sys.modules`` BEFORE
-importing the agent. This is mocked-wiring, not a behavioral change to
-production code.
-"""
+'Mocked-wiring async tests for the SO10x robot agent.'
 
 import sys
 import types
@@ -23,12 +7,8 @@ from unittest.mock import Mock
 import pytest
 
 
-# ---------------------------------------------------------------------------
 # Stub the unavailable external/parallel-plan import chain before importing the
 # agent. `controller.py` does `from policy.gr00t.service import
-# ExternalRobotInferenceClient`, which imports `gr00t.*`. Neither is available
-# in a keyless/no-hardware CI env.
-# ---------------------------------------------------------------------------
 def _install_import_stubs():
     # Stub the gr00t package tree used by policy.gr00t.service.
     for mod_name in ("gr00t", "gr00t.data", "gr00t.data.types", "gr00t.data.utils"):

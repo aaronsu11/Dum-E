@@ -13,6 +13,12 @@ class SerializedLeRobotPolicyBackend(LeRobotPolicyBackend):
         if self._device not in ('cuda','cuda:0') or self._actions_per_chunk!=16:
             raise ValueError('Async inference requires CUDA and 16-action chunks')
 
+    def prepare_execution(self, observation, instruction, *, deadline_s):
+        """Warm the model, then install the measured deadline under the exchange lock."""
+        with self._exchange_lock:
+            self.get_action(observation, instruction)
+            self._session.configure_requests(deadline_s=deadline_s, max_attempts=1)
+
     def set_task(self, instruction):
         if not isinstance(instruction,str) or not instruction.strip():
             raise ValueError('Instruction must be nonempty')

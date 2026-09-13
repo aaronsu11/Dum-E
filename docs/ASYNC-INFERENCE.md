@@ -1,89 +1,43 @@
-# Async inference checkpoint
+# Async inference
 
-The Phase 8 implementation remains opt-in. Physical pick, server-loss hold, spoken retarget and audible failure checks have passed. The interrupted sustained-run check and GPU latency-outlier investigation were explicitly deferred by Aaron on 2026-09-12; independent review is complete and Aaron accepted the existing descriptive continuity evidence for this milestone. Phase 8 is closed in that amended scope.
+These are two different implementations, not one interchangeable async switch.
 
-## Runtime behavior
+| | GR00T LeRobot queue | Pi0.5 bounded RTC |
+|---|---|---|
+| Entry point | Production agent with `DUME_ASYNC_INFERENCE=1` | `run_policy_trial.py --profile pi05-so101 --scheduler rtc` |
+| Chunk / playback | 16 actions / 20 Hz | 50 actions / 20 Hz |
+| Replacement request | Eight actions remain | 25 bounded queued actions remain |
+| Continuity | 0.3 old / 0.7 new weighted overlap | Model conditions on the actually queued prefix in normalized action space |
+| Deadline | Measured request p99 + 100 ms; validated against overlap | 750 ms bounded trial deadline; 15-step inference delay |
+| Task change | Epoch invalidation and stale-reply refusal | No implicit retargeting in the attended trial |
 
-One inference worker requests a new 16-action chunk when eight actions remain.
-The controller sends actions every 50 ms. Overlapping predictions use a weighted
-average (0.3 old, 0.7 new); expired contributions are discarded at dispatch.
-Retargeting clears queued actions and rejects results from the previous instruction.
-The backend serializes each observation/action exchange, and the server serializes
-preprocessing through decoding so relative actions retain the correct state anchor.
+Pi0.5's normal agent adapter rejects `DUME_ASYNC_INFERENCE`; use its RTC runner. Native GR00T, G0.5 and Molmo do not inherit the LeRobot queue just because they return chunks.
 
-A missed request deadline, stale action, inference error, or controller clamp latches
-a fault, closes the policy connection, and reports failure to the task and voice
-pipelines. Further movement and automatic reset are refused. This stops issuing
-commands; mechanical stopping/holding was observed in one supervised server-loss trial, not guaranteed for every pose or fault.
-The controller owns the serial bus. Robot and inference calls run off the event loop.
+GR00T keeps one inference worker and one serial owner. The server serializes preprocessing through full-chunk decode to preserve the observation anchor; the client serializes exchanges. Inference and robot calls run off the agent event loop. A miss, stale action, inference error or clamp latches failure, closes the policy connection and prevents subsequent motion/reset. Cancellation and retarget propagate through the task/MCP/voice paths. A transmitted motor packet cannot be recalled.
 
-## Measured evidence
+The normal worker reuses a successful policy session; `prepare_execution` performs warmup before applying the measured request deadline. A failure requires explicit recovery, not automatic stop-latch clearing.
 
-`corpus/phase8-latency-20260912/latency.json` records one warmup and 100 warm
-GPU RPCs using one frozen observation and the lightweight observer:
+## GR00T admission measurement
 
-- Median request latency: 143.818 ms.
-- Empirical p99 (higher order statistic): 150.098 ms.
-- Request deadline: p99 + 100 ms = 250.098 ms.
-- Eight-action overlap: 400 ms.
+The existing loader requires at least 100 finite sequential RPC samples, the empirical higher-order p99 and matching source hashes. This larger sample is only needed for this existing async admission contract; ordinary model smoke remains 12 samples.
 
-This is a small operating-point measurement, not a statistical tail guarantee.
-The settings loader checks the artifact, sample count, and bound source hashes.
-Re-measure after changes to those sources or the serving configuration.
-
-`corpus/phase8-async-serving-retry-20260912/async-serving-check.json` records
-real GPU/gRPC inference with a simulated controller. Retargeting kept the loaded
-model instance. Deliberately killing the server produced a fault in 299.872 ms;
-the last simulated command was 250.150 ms after the kill request. Reset was refused
-after the fault. The configured conservative software bound is 700.098 ms, assuming
-timely controller I/O and scheduling. No arm was connected to this test.
-
-The initial simulation exposed expiry of an old blending contribution. Its failed
-artifact is retained in the original latency workspace; the implementation now
-discards expired contributions before dispatch. The final targeted suite passed
-128 tests, including concurrency, staleness, retargeting, failure publication,
-observer identity, MCP control, and existing voice/backend interfaces.
-
-## Configuration
-
-After preparing the supervised physical check, set these controller keys:
-
-```yaml
-controller:
-  policy_backend: lerobot
-  async_inference: true
-  async_latency_path: corpus/phase8-latency-20260912/latency.json
-  async_trace_directory: corpus/phase8-physical-traces
+```bash
+uv run python scripts/benchmark_policy.py --profile lerobot-gr00t \
+  --observations outputs/capture-01/observation.npz \
+  --calibration /absolute/path/calibration.json --instruction 'Pick up the banana' \
+  --samples 100 --warmups 1 --latency-settings --server-container dume-lerobot --output outputs/gr00t-latency-01
 ```
 
-Existing exported environment variables take precedence. The corresponding names
-are `DUME_POLICY_BACKEND`, `DUME_ASYNC_INFERENCE`, `DUME_ASYNC_LATENCY_PATH`,
-and `DUME_ASYNC_TRACE_DIRECTORY`. Async requires CUDA and a loopback server.
-Per-action state readback is optional and intended for physical verification;
-it adds controller I/O. Async remains disabled in the example configuration.
+Use the lightweight CUDA server built from the same sources. Re-measure after source or serving configuration changes. Set `DUME_ASYNC_LATENCY_PATH` to the resulting `latency.json` and explicitly select `DUME_POLICY_BACKEND=lerobot` with `DUME_ASYNC_INFERENCE=1`. The earlier measured operating point was median 143.818 ms, empirical p99 150.098 ms and deadline 250.098 ms within 400 ms overlap. It is not a tail-latency guarantee.
 
-The transport uses pickle and is trusted-local only. Bind Docker publications to
-127.0.0.1; do not expose this server to untrusted clients. Revisit authentication
-and safe serialization before remote access or multiple independent clients.
+## Pi0.5 RTC invariant
 
-## Shared observer images
+The queued prefix must equal the bounded commands the controller will receive. The server maps that prefix through the saved processor into normalized action space; degrees cannot be passed as normalized guidance. It uses `torch.no_grad()` so the RTC implementation can enable gradients locally; `torch.inference_mode()` is incompatible with that guidance. Reply identity, epoch, prefix digest and elapsed steps are checked. Expiration is checked again after projection/evidence work, before dispatch. If current feedback invalidates the queued prefix, stop rather than silently changing guidance.
 
-`scripts/build_observed_policy_images.sh` builds from the existing pinned local
-images without changing model dependencies. Both launchers default to lightweight
-observation; off and exhaustive modes remain available. See
-[Shared chunk observer](SHARED-CHUNK-OBSERVER.md).
+Three recorded local comparisons measured ordinary generation 414.22 ms versus RTC 422.43 ms, about 2% overhead. Supporting dummy playback peaked at 8.87 GiB. Physical trial14 played 100 targets with two nine-tick handoffs and a maximum 50.23 ms command interval; visible smooth motion and hold were confirmed. These small checks do not establish sustained or physical-fault robustness.
 
-Built images:
+## Deferred startup optimization
 
-- `dume-native-lightweight:20260912`: `sha256:78cab5833cb5d41ec08f689e5de2a0143244416fda2d28630ffe334be27bbd59`
-- `dume-lerobot-lightweight:20260912`: `sha256:b7074a5c29c12d90696d51c26ee3d9a3c699aeedde8f65176edb503f4fa126aa`
+A successful voice-triggered trial took 36.729 s from dispatch to the recorded motion-stage entry: 15.429 s process/preflight, 18.660 s policy setup/warmup/checks and 2.639 s controller/calibration setup. This timestamp was not independently measured first physical movement. Warm chunk generation averaged 163.284 ms.
 
-## Physical and voice results
-
-Successful async physical trial 2 completed 320 actions with smooth grasp/lift/delivery confirmed by Aaron. Physical server loss stopped commands 233.512 ms after kill, detected failure 285.784 ms after kill, refused reset and held safely per Aaron. A later voice-triggered physical pick succeeded; startup optimization is deferred.
-
-The integrated closeout trial applied spoken banana→apple retarget with no old-epoch commands afterward. It stopped at 1,568 actions / 78.617 s on a 322.126 ms inference outlier. Aaron confirmed redirection, safe stop and audible failure. Two conversational turns during motion measured1.633 / 1.639 s; baseline1.684 / 1.651 / 4.484 s. The original multi-minute requirement is unfulfilled and now explicitly backlogged. See [latency investigation](PHASE8-LATENCY-SPIKE.md).
-
-Physical voice tests use a fixed guarded runner with real voice/MCP/GPU/controller. Normal robot-agent planning and control integration were tested separately with simulated hardware. Real server-kill/hold and live audible deadline failure are composed evidence, not an identical combined failure trial. Joint velocity evidence is descriptive for one successful run, without a formal periodic-spike threshold.
-
-The authoritative closeout record is `.planning/phases/08-async-inference-staleness-watchdog/08-VERIFICATION.md` (independent review plus explicit operator closeout disposition). No new motion, expanded validation or deadline relaxation follows automatically from closeout.
+Future work: prepare a persistent session once, publish readiness after warmup, and reuse it across tasks while preserving fresh observations, per-task queues/epochs and stop recovery. Measure cold readiness and warm dispatch-to-first-command separately. The software reuse test is not a measured warm hardware startup result. Session-long hardware ownership needs its own review.

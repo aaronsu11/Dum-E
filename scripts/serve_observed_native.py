@@ -21,7 +21,7 @@ def main():
     from gr00t.data.embodiment_tags import EmbodimentTag
     from gr00t.policy.gr00t_policy import Gr00tPolicy
     from gr00t.policy.server_client import PolicyServer
-    from scripts.replay_groot_native import pinned_native_cache
+    from policy_guard.native_cache import pinned_native_cache
     if not torch.cuda.is_available():
         raise RuntimeError('GPU required')
     torch.set_num_threads(args.cpu_threads)

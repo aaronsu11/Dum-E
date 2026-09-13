@@ -1,11 +1,5 @@
 # Dum-E configuration file (YAML)
 #
-# Copy this file to your own config (e.g. my-dum-e.yaml) and edit values.
-# CLI flags override values in this file when provided.
-#
-# Two common scenarios are shown below:
-# 1) Mock agent (no hardware required) -> set agent.use_mock: true
-# 2) Real robot (hardware required)     -> set agent.use_mock: false and fill controller fields
 
 voice:
   # Voice processing mode
@@ -54,25 +48,10 @@ controller:
 
   # Joint-value convention fed to the policy and used for this module's
   # hardcoded poses. Forwarded to the agent worker as DUME_USE_DEGREES; an
-  # exported shell value wins over this file.
-  #   true  -> MotorNormMode.DEGREES
-  #   false -> MotorNormMode.RANGE_M100_100 (percent of the calibrated range)
-  # The RECORDED VERDICT for the GR00T-N1.7-3B-SO101 checkpoint is percent mode,
-  # i.e. false -- see docs/UNITS-VERDICT.md for the evidence. The value shipped
-  # here is nonetheless `true`, the CURRENT EFFECTIVE setting, because the flip is
-  # deferred: four hardcoded pose vectors in the controller encode today's
-  # convention implicitly and must be converted in the same change as the flip.
-  # This key exists so that flip needs no code edit when it is taken.
   use_degrees: true
 
   # Per-step motion clamp, in the same units as the joint values above.
   # Any commanded per-joint delta larger than this is clipped toward the present
-  # position and the clamp is logged. Must be a positive FLOAT -- an int raises a
-  # TypeError inside the clamp at the exact moment it would have engaged. Set to
-  # "none" via DUME_MAX_RELATIVE_TARGET to disable it (not recommended).
-  # 160.0 is derived from the checkpoint's own per-timestep relative-action
-  # extreme (137.47) plus a 15% margin; see the provenance comment on
-  # DEFAULT_MAX_RELATIVE_TARGET in embodiment/so_arm10x/controller.py.
   max_relative_target: 160.0
 
   # Policy server settings
@@ -86,16 +65,9 @@ controller:
 
   # ---- LeRobot policy backend handshake (only read when policy_backend is
   # ---- "lerobot"). Each key is forwarded to the agent worker as the named
-  # ---- DUME_* variable, and ONLY when this file names it, so every default
-  # ---- lives in exactly one place: policy/lerobot/backend.py. An exported
-  # ---- shell value always wins over this file.
 
   # The gRPC port of the lerobot-policy container. Forwarded as
   # DUME_LEROBOT_POLICY_PORT. Allowed values: any TCP port (int).
-  # DISTINCT from policy_port: 5555 above, which is the GR00T-native ZMQ port.
-  # Reusing ONE key for both backends is precisely the wrong-port trap this pair
-  # of keys exists to avoid -- pointing a gRPC client at a zmq.REP socket fails
-  # in a way that looks like a dead server rather than a misconfiguration.
   lerobot_policy_port: 8080
   # Galaxea native WebSocket transport. Requires backend=galaxea and async mode off.
   # Physical use additionally requires the model-specific calibration/camera checks.
@@ -108,23 +80,10 @@ controller:
 
   # The checkpoint path, as seen INSIDE the container. Forwarded as
   # DUME_LEROBOT_CHECKPOINT_PATH. Allowed values: any absolute in-container path.
-  # The client only NAMES this path; the SERVER resolves it. A path the server
-  # cannot resolve falls back to the nvidia/GR00T-N1.7-3B hub default and would
-  # serve BASE weights that look like a working policy -- which is exactly what
-  # the SAFE-01/1 guard refuses to serve.
   lerobot_checkpoint_path: "/checkpoints/model"
 
   # How many action steps the server returns per chunk. Forwarded as
   # DUME_LEROBOT_ACTIONS_PER_CHUNK. Allowed values: a positive int.
-  # 16 is the checkpoint's REAL action horizon. 40 IS THE TRAP, and it has two
-  # independent sources, so it is easy to arrive at by accident:
-  #   1. GrootConfig's own default action_horizon is 40;
-  #   2. this checkpoint's config.json also advertises action_horizon: 40.
-  # The SAFE-01/2 guard asserts THIS configured value against the checkpoint's
-  # delta_indices (which carry 16), so a drift to 40 is caught and refused rather
-  # than obeyed. Note also that a chunk of length 16 coming back proves nothing
-  # on its own: three independent truncations force 16 regardless of the
-  # configured value, which is why the assertion is config-level.
   lerobot_actions_per_chunk: 16
 
   # The device the SERVER puts the policy on. Forwarded as
@@ -133,27 +92,14 @@ controller:
 
   # NOT config keys, deliberately:
   #   * lerobot_features -- DERIVED, never configured. Upstream's
-  #     hw_to_dataset_features() produces the ["observation.state"]["names"] list
-  #     that IS the joint-ordering authority; hand-writing it here would create a
-  #     second source of truth for joint order, which is a silent whole-arm
-  #     failure that every shape check passes.
-  #   * rename_map -- fixed at {}. It feeds RenameObservationsProcessorStep
-  #     INSIDE the preprocessor, which runs AFTER the observation has already been
-  #     indexed by key, so it cannot repair an earlier KeyError. It is the wrong
-  #     tool for the flat-to-named job.
 
   # Which inference backend serves the policy. Forwarded to the agent worker as
   # DUME_POLICY_BACKEND; an exported shell value wins over this file.
-  #   "groot-native" -> Isaac-GR00T native ZMQ server (the v1.0 baseline)
-  #   "lerobot"      -> LeRobot policy backend over gRPC (the lerobot_* keys above)
-  # Note the CODE-level default when DUME_POLICY_BACKEND is unset is "lerobot",
-  # so this example deliberately pins the v1.0 baseline backend rather than
-  # inheriting the default by accident.
   policy_backend: "groot-native"
 
   # Opt-in until Phase 8 physical/voice verification. Requires backend lerobot.
   async_inference: false
   # A measured request-latency artifact; no guessed timeout default.
-  # async_latency_path: "corpus/phase8-latency-20260912/latency.json"
+  # async_latency_path: "outputs/gr00t-latency-01/latency.json"
   # Optional per-action measured state/command traces for physical verification.
-  # async_trace_directory: "corpus/phase8-physical-traces"
+  # async_trace_directory: "outputs/physical-traces"

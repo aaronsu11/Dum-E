@@ -1,28 +1,4 @@
-"""The initial-pose reset ordering, which is a physical-safety property.
-
-The initial pose is the low, extended one (``shoulder_lift`` -102, ``elbow_flex``
-96); the ready pose is retracted (-90, 75). Driving straight to initial from an
-arbitrary pose was observed on hardware sweeping the arm toward the table. Every
-post-task reset is exactly that case, because the policy leaves the arm wherever
-the episode ended.
-
-**The waypoint lives in the controller, not at the call sites.** It was first
-added at two call sites and three others were missed — ``ResetPoseSkill`` (the
-reset tool the model is told to call after a failure, i.e. the most
-arbitrary-pose situation there is) and the post-task resets in both agent run
-paths. A safety invariant enforced per-caller is one the next caller silently
-opts out of, so these tests pin it at the single chokepoint every caller shares.
-
-Two properties are pinned, and the second is easy to lose while fixing the first:
-
-1. ``move_to_initial_pose()`` reaches ready BEFORE commanding the initial vector,
-   for every caller;
-2. ``PickSkill.run(pose="initial")`` still ENDS at ready, because the pick begins
-   from the ready pose and changing that would make the run non-comparable to the
-   v1.0 baseline.
-
-Hermetic: no serial port, no cameras, no policy server.
-"""
+'The initial-pose reset ordering, which is a physical-safety property.'
 
 from types import SimpleNamespace
 from typing import Any, List
@@ -39,12 +15,7 @@ INITIAL = [0.0, -102, 96.0, 76.0, -90.0, 0.0]
 
 
 def _controller_recording_targets() -> Any:
-    """A controller shell that records the pose VECTORS handed to the arm.
-
-    Built via ``__new__`` so no serial port or camera config is demanded. Only
-    ``set_target_state`` and ``time.sleep`` are exercised by the pose helpers, so
-    recording the former captures everything that would reach the hardware.
-    """
+    'A controller shell that records the pose VECTORS handed to the arm.'
     controller = SO10xArmController.__new__(SO10xArmController)
     controller.targets = []  # type: ignore[attr-defined]
 

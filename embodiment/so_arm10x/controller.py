@@ -1,29 +1,4 @@
-"""
-Unified client interfaces for interacting with the SO-ARM10x robots using the LeRobot `robots` API, 
-and the Gr00t policy server expected by the Dum-E agent. This module provides:
-
-- SO10xRobot: thin wrapper around LeRobot's follower robots (SO-100/101) that
-  exposes convenience methods like `move_to_initial_pose`, `move_to_remote_pose`,
-  `release_at_remote_pose`, `get_current_images`, and `set_target_state`, built
-  on top of the new `Robot` API.
-- Gr00tRobotInferenceClient: policy client compatible with the new observation
-  schema but keeping a convenient `set_lang_instruction` and stable return
-  format.
-
-A lightweight eval entrypoint is kept for manual testing with the new API.
-
-Example usage:
-```shell
-python -m embodiment.so_arm10x.controller \
-    --robot_port /dev/tty.usbmodem5A680102371 \
-    --robot_type so101_follower \
-    --robot_id so101_follower_arm \
-    --wrist_cam_idx 0 \
-    --front_cam_idx 1 \
-    --policy_host 127.0.0.1 \
-    --lang_instruction "Grab a banana and put it on the plate"
-```
-"""
+'Unified client interfaces for interacting with the SO-ARM10x robots using the LeRobot `robots` API, and the Gr00t policy server expected by the Dum-E agent. This module provides:'
 
 import hashlib
 import logging
@@ -63,18 +38,7 @@ def _recursive_add_extra_dim(obs: Dict) -> Dict:
 
 
 class Gr00tRobotInferenceClient(IPolicyBackend):
-    """The ``groot-native`` :class:`~shared.IPolicyBackend`: Isaac-GR00T native ZMQ.
-
-    Wrapper for the Isaac-GR00T inference service compatible with the new
-    observation schema and Dum-E's expectations.
-
-    - Accepts `camera_keys` and `robot_state_keys` to build observations.
-    - Provides `set_lang_instruction` and exposes a read-only
-      `language_instruction` property over the `_language_instruction` field.
-    - `get_action` accepts a raw observation dict and returns a list of action dicts.
-    - `reset()` recreates the strict-FSM REQ socket between episodes; `close()`
-      releases socket + context and is idempotent.
-    """
+    'The ``groot-native`` :class:`~shared.IPolicyBackend`: Isaac-GR00T native ZMQ.'
 
     def __init__(
         self,
@@ -116,24 +80,12 @@ class Gr00tRobotInferenceClient(IPolicyBackend):
         return self.policy.ping()
 
     def reset(self) -> None:
-        """Recreate the REQ socket so no mid-FSM socket leaks between episodes.
-
-        `_init_socket()` is the documented close-with-LINGER=0-and-recreate path
-        (see `policy/gr00t/service.py`); it is safe to call when nothing is in
-        flight, and a fresh socket is exactly what a strict-REQ peer needs after
-        an aborted episode.
-        """
+        'Recreate the REQ socket so no mid-FSM socket leaks between episodes.'
         self.policy._init_socket()
         self._closed = False
 
     def close(self) -> None:
-        """Release the transport socket + zmq context. Idempotent.
-
-        Mirrors `BaseInferenceClient.__del__`'s best-effort cleanup
-        (`socket.close(linger=0)` then `context.term()`, each guarded), so a
-        double close — e.g. an explicit `close()` inside a `session()` body plus
-        the `finally` — is a no-op rather than a raise over the original error.
-        """
+        'Release the transport socket + zmq context. Idempotent.'
         if getattr(self, "_closed", False):
             return
         self._closed = True
@@ -178,10 +130,6 @@ class Gr00tRobotInferenceClient(IPolicyBackend):
             "language": {
                 # PINNED N1.7 INFERENCE KEY.
                 # Confirmed against: checkpoint experiment_cfg/conf.yaml language
-                # modality_keys AND the upstream SO100 real-robot eval script
-                # (gr00t/eval/real_robot/SO100/eval_so100.py:128) AND validated by
-                # live server strict-mode rejection of the .action. variant.
-                # The correct key is `annotation.human.task_description` (NO `.action.`).
                 "annotation.human.task_description": instruction
             },
         }
@@ -281,19 +229,7 @@ _CALIBRATION_SEGMENT = "calibration"
 
 
 def resolve_lerobot_calibration_root() -> Path:
-    """Resolve LeRobot's calibration root from the documented env vars.
-
-    Mirrors ``lerobot.utils.constants``: ``HF_LEROBOT_CALIBRATION`` wins outright,
-    otherwise the root is ``HF_LEROBOT_HOME / "calibration"``, with
-    ``HF_LEROBOT_HOME`` itself defaulting to ``HF_HOME / "lerobot"``.
-
-    Re-derived rather than imported on purpose. The upstream constants are
-    module-level and therefore evaluated at import time, so an imported constant
-    cannot reflect an environment variable set after ``lerobot`` was first
-    imported — which is precisely what a hermetic test needs to do. No absolute
-    home-directory path is hardcoded; the fallback is composed from
-    ``Path.home()``.
-    """
+    "Resolve LeRobot's calibration root from the documented env vars."
     explicit = os.getenv("HF_LEROBOT_CALIBRATION")
     if explicit:
         return Path(explicit).expanduser()
@@ -312,14 +248,7 @@ def resolve_lerobot_calibration_root() -> Path:
 
 
 def resolve_calibration_file(robot_name: str, robot_id: str) -> Path:
-    """Derive the calibration file path exactly as ``Robot.__init__`` does.
-
-    Upstream builds ``HF_LEROBOT_CALIBRATION / ROBOTS / self.name`` and appends
-    ``f"{self.id}.json"``. ``robot_name`` is the robot CLASS's ``name`` attribute,
-    not Dum-E's ``robot_type`` string: lerobot 0.6.1 consolidated both follower
-    classes into ``SOFollower``, whose ``name`` is ``so_follower``, so the derived
-    directory moved even though ``robot_type`` did not change.
-    """
+    'Derive the calibration file path exactly as ``Robot.__init__`` does.'
     return (
         resolve_lerobot_calibration_root()
         / _CALIBRATION_ROBOTS_SEGMENT
@@ -333,37 +262,7 @@ def assert_calibration_loaded(
     robot_id: Optional[str] = None,
     expected_path: Optional[Path] = None,
 ) -> Tuple[Path, str]:
-    """Assert the calibration FILE exists; return its path and content checksum.
-
-    Args:
-        robot_name: the robot class's ``name`` (used only when ``expected_path``
-            is not supplied).
-        robot_id: the calibration filename stem (likewise).
-        expected_path: an already-derived path, e.g. the robot object's own
-            ``calibration_fpath``, which is the authoritative answer to which
-            file lerobot will load because it already accounts for a
-            ``config.calibration_dir`` override.
-
-    Returns:
-        ``(resolved path, sha256 hex digest of its bytes)``.
-
-    Raises:
-        FileNotFoundError: the file is absent, with the checked path in the
-            message.
-
-    Two deliberate design points, each from an executed finding:
-
-    * It verifies the **file**, never the containing directory.
-      ``Robot.__init__`` calls ``mkdir(parents=True, exist_ok=True)`` on the
-      derived path, so after the ``so101_follower`` -> ``so_follower`` rename a
-      directory listing shows a freshly created, provisioned-looking, EMPTY
-      directory. Directory existence is not evidence.
-    * The checksum is an **integrity aid, not a security control** — it is not
-      tamper protection and must not be presented as such. Its one job is to make
-      a wrong-file copy visible, which is the failure mode the loud missing-file
-      error does not cover, and which is the accepted tradeoff of copying the
-      calibration rather than pinning its directory.
-    """
+    'Assert the calibration FILE exists; return its path and content checksum.'
     if expected_path is not None:
         path = Path(expected_path)
     else:
@@ -396,19 +295,7 @@ def assert_calibration_loaded(
 
 
 # Dum-E's PID preset, keyed by the Feetech register names the motor bus uses.
-#
 # These values are *not* new — Dum-E has written 10/0/5 since v1.0 to reduce
-# shakiness, against upstream's 16/0/32. What is new at lerobot 0.6.1 is that
-# they became CONFIGURABLE: `SOFollowerConfig` grew `position_p_coefficient`,
-# `position_i_coefficient` and `position_d_coefficient`, and
-# `SOFollower.configure()` — which `connect()` already calls — writes them from
-# the config while still inside `torque_disabled()`.
-#
-# So the preset is declared on the config (see both branches in `__init__`) and
-# upstream lands it on the first pass. Dum-E's remaining job is EVIDENCE, not
-# writing: `_assert_pid_landed()` reads the coefficients back from every motor
-# and refuses to connect on a mismatch. A clean write is not evidence the value
-# landed, and a Feetech bus can drop or corrupt a packet.
 DUME_PID: Dict[str, int] = {
     "P_Coefficient": 10,
     "I_Coefficient": 0,
@@ -444,30 +331,8 @@ _MOTOR_NAMES: Tuple[str, ...] = (
 )
 
 
-# ---------------------------------------------------------------------------
 # The joint-value convention
-# ---------------------------------------------------------------------------
-#
 # `use_degrees` decides whether the motor bus reports and accepts joint values as
-# degrees (`MotorNormMode.DEGREES`) or as percent of the calibrated range
-# (`MotorNormMode.RANGE_M100_100`). It is part of the checkpoint's input
-# contract: the same physical pose yields different numbers into the policy under
-# the two conventions.
-#
-# THE RECORDED VERDICT IS PERCENT MODE — `RANGE_M100_100`, i.e.
-# `use_degrees=False`. See `docs/UNITS-VERDICT.md` for the evidence (a plus/minus
-# 100.0 clip fingerprint on seven checkpoint statistics, an `elbow_flex`
-# falsification, and a `wrist_roll` cross-check against the training dataset).
-# That document is the single source; this comment deliberately does not restate
-# its argument.
-#
-# AND THE VALUE BELOW IS NONETHELESS `True`, THE CURRENT EFFECTIVE SETTING.
-# The flip is deferred, not forgotten. Four hardcoded pose vectors in this module
-# encode today's convention implicitly, so flipping without converting them in
-# the same change would clip the initial pose's `shoulder_lift` of -102 to the
-# percent-mode boundary and move `wrist_roll` roughly 60 degrees from where the
-# policy was trained — and it would invalidate the live re-baseline. This key
-# exists precisely so that the verdict can be acted on later WITHOUT a code edit.
 DEFAULT_USE_DEGREES: bool = True
 
 # Recognised boolean spellings. The set is closed on purpose: YAML yields the
@@ -479,12 +344,7 @@ _FALSE_SPELLINGS = frozenset({"0", "false", "f", "no", "n", "off"})
 
 
 def coerce_bool(value: Any, name: str) -> bool:
-    """Coerce ``value`` to ``bool`` explicitly, raising on anything unrecognised.
-
-    Raises:
-        ValueError: ``value`` is a string outside the recognised spellings, or a
-            type that has no unambiguous boolean reading.
-    """
+    'Coerce ``value`` to ``bool`` explicitly, raising on anything unrecognised.'
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -506,12 +366,7 @@ def coerce_bool(value: Any, name: str) -> bool:
 
 
 def resolve_use_degrees(value: "bool | str | None" = None) -> bool:
-    """Resolve the joint-value convention: argument, then env, then the default.
-
-    Mirrors the serial-port fallback in :class:`SO10xArmController`. The
-    environment value is coerced through :func:`coerce_bool`, never trusted for
-    its truthiness.
-    """
+    'Resolve the joint-value convention: argument, then env, then the default.'
     if value is None:
         raw = os.getenv("DUME_USE_DEGREES")
         if raw is None or not raw.strip():
@@ -520,41 +375,8 @@ def resolve_use_degrees(value: "bool | str | None" = None) -> bool:
     return coerce_bool(value, "use_degrees")
 
 
-# ---------------------------------------------------------------------------
 # The per-step motion clamp
-# ---------------------------------------------------------------------------
-#
 # PROVENANCE OF THIS VALUE — derived arithmetic on recorded statistics, NOT a
-# measurement of this arm.
-#
-#   Source        checkpoints/GR00T-N1.7-3B-SO101/statistics.json
-#                 -> new_embodiment.relative_action.single_arm
-#                 min / max, shape (16, 5): per-timestep relative action bounds
-#                 across all 16 chunk timesteps and all five arm joints.
-#   Extreme       137.47269  (max[15][1] — shoulder_lift at timestep 16; the
-#                 negative extreme is -121.70099 on elbow_flex at the same step)
-#   Margin        x 1.15  ->  158.094
-#   Rounded up    160.0
-#
-# Why the CUMULATIVE per-timestep bound and not the increment between
-# consecutive timesteps (whose extreme is only 12.692): the clamp compares each
-# commanded goal against the arm's PRESENT position, and the pick loop streams a
-# whole chunk at 0.05 s intervals. A perfectly tracking arm would see only the
-# increment, but a lagging arm — which is the real case, PID-limited at these
-# intervals — sees a delta approaching the full cumulative offset. Sizing on the
-# increment would therefore clamp nominal, correctly-tracked motion.
-#
-# Why not smaller: the checkpoint-parity gate requires ZERO clamp warnings
-# during nominal operation, so a clamp below the policy's own trained per-step motion would
-# fire constantly and be read as a parity bug rather than as a mis-set clamp.
-# Why not larger: one far above the arm's own travel would never catch a
-# runaway. 160.0 sits above the checkpoint's motion and below twice any joint's
-# calibrated span.
-#
-# THIS IS AN ASSUMPTION, not a measurement. The live clamp demonstration and the
-# parity gate's zero-warning requirement are what validate it. If
-# nominal operation trips the clamp, the value must be RE-DERIVED — the clamp
-# must not be removed and the warning must not be suppressed.
 DEFAULT_MAX_RELATIVE_TARGET: float = 160.0
 
 # Divergence threshold for deciding the clamp fired, identical to the
@@ -579,32 +401,7 @@ _CLAMP_DISABLED_SPELLINGS = frozenset({"none", "null", "off", "disabled", "false
 def resolve_max_relative_target(
     value: "float | Dict[str, float] | None" = None,
 ) -> "float | Dict[str, float] | None":
-    """Resolve and validate the per-step motion clamp before it reaches the config.
-
-    Resolution order mirrors the serial-port fallback in ``SO10xArmController``:
-    an explicit argument wins, then ``DUME_MAX_RELATIVE_TARGET``, then
-    :data:`DEFAULT_MAX_RELATIVE_TARGET`.
-
-    Args:
-        value: a positive float, a mapping covering every motor name, or ``None``
-            to resolve from the environment and then the derived default.
-
-    Returns:
-        A ``float``, a complete ``dict[str, float]``, or ``None`` when the clamp
-        was explicitly disabled.
-
-    Raises:
-        ValueError: the value is non-positive, non-finite, a ``bool``, an
-            unparseable environment string, or a mapping whose key set does not
-            match the motor names exactly.
-
-    Validating here rather than letting the value flow through is deliberate.
-    ``ensure_safe_goal_position`` only rejects a bad clamp when it is *used*: an
-    ``int`` raises ``TypeError`` and an incomplete mapping raises ``ValueError``,
-    both at the exact moment the clamp would have engaged. Neither fails on
-    ordinary actions, so without a boundary check the mistake stays invisible
-    until the safety mechanism is needed.
-    """
+    'Resolve and validate the per-step motion clamp before it reaches the config.'
     if value is None:
         raw = os.getenv("DUME_MAX_RELATIVE_TARGET")
         if raw is None or not raw.strip():
@@ -668,16 +465,7 @@ def diff_clamped_joints(
     sent: Dict[str, float],
     threshold: float = CLAMP_DIVERGENCE_THRESHOLD,
 ) -> Tuple[Tuple[str, float, float], ...]:
-    """Return ``(joint, requested, clipped)`` for every joint the clamp moved.
-
-    ``send_action``'s docstring guarantees its return is "the action actually
-    sent", so comparing request against return is a detector that does not depend
-    on any logging configuration and needs no hardware to test. That is why it is
-    the PRIMARY clamp mechanism and the stdlib->loguru bridge is the backstop.
-
-    Iteration follows ``requested``'s key order so two runs over the same
-    requested action produce byte-identical report lines.
-    """
+    'Return ``(joint, requested, clipped)`` for every joint the clamp moved.'
     clamped: List[Tuple[str, float, float]] = []
     for key, requested_value in requested.items():
         if key not in sent:
@@ -722,10 +510,6 @@ class SO10xArmController(IRobotController):
 
         # `None` here means "resolve", not "disable" — mirroring the
         # serial-port fallback just above. The clamp is therefore ON by default,
-        # which matters because the production call site passes neither this
-        # parameter nor the units one. Validation happens before the value
-        # reaches the config, since upstream only rejects a bad clamp at the
-        # moment the clamp engages.
         max_relative_target = resolve_max_relative_target(max_relative_target)
 
         # Same fallback shape for the units convention. The environment string is coerced
@@ -761,20 +545,7 @@ class SO10xArmController(IRobotController):
         }
 
         # Build the appropriate config subclass for the chosen robot type.
-        #
         # `robot_type` stays "so101_follower"/"so100_follower": lerobot 0.6.1
-        # consolidated the two modules into `lerobot.robots.so_follower` but kept
-        # BOTH names registered as draccus config choices, and the consolidated
-        # name "so_follower" is NOT a registered choice — renaming it here would
-        # raise. The branch therefore selects on Dum-E's own string, not on the
-        # class: `SO100FollowerConfig is SO101FollowerConfig` (both alias
-        # `SOFollowerRobotConfig`) and `SO100Follower is SO101Follower is
-        # SOFollower`, so the classes cannot discriminate.
-        #
-        # Do NOT read `self.config.type` as the model identity: draccus's
-        # `get_choice_name` returns the first registry key matching the class,
-        # which is "so100_follower" even for an SO-101 arm. Model identity comes
-        # from the `robot_type` argument above, which Dum-E controls.
         if robot_type == "so101_follower":
             from lerobot.robots.so_follower import SO101FollowerConfig
 
@@ -843,12 +614,6 @@ class SO10xArmController(IRobotController):
     def connect(self, calibrate: bool = True) -> None:
         # Pre-arm Goal_Position FIRST, while torque is still off. `robot.connect()`
         # below re-enables torque, and a stale `Goal_Position` of 0 would become a
-        # commanded slam at that instant, so this cannot be reordered after it.
-        # Retained on the instance so a caller can report what the pre-arm found
-        # (the worst pending jump it neutralised, or why it skipped) without
-        # re-implementing it. `scripts/pose_sweep_units_probe.py` used to carry a
-        # near-verbatim second copy for exactly that reason, which meant a tuned
-        # tolerance or skip condition would only change one of them.
         self.last_prearm_record = self._prearm_goal_to_present()
         self.robot.connect(calibrate=calibrate)
         # Assert the calibration FILE loaded before anything reads an observation.
@@ -863,36 +628,7 @@ class SO10xArmController(IRobotController):
         self._assert_pid_landed()
 
     def _prearm_goal_to_present(self) -> Dict[str, Any]:
-        """Write ``Goal_Position <- Present_Position`` while torque is still OFF.
-
-        A SAFETY PRECONDITION FOR CONNECTING. Upstream's ``configure()`` runs
-        inside ``bus.torque_disabled()``, whose ``finally`` calls
-        ``enable_torque()``, and ``enable_torque()`` writes ``Torque_Enable`` and
-        ``Lock`` only — it does NOT synchronise ``Goal_Position`` to the present
-        position. Measured on this arm with torque off after a power cycle, every
-        motor's ``Goal_Position`` register reads **0**, so connecting without
-        pre-arming commands all six joints to raw tick 0 the instant torque comes
-        back: a jump of up to ~3090 ticks on ``elbow_flex``.
-
-        Pre-arming with torque disabled cannot itself move the arm — it makes the
-        subsequent torque-enable a *hold* rather than a *move*. The dangerous path
-        is never exercised, so this does not prove the slam would happen; it
-        prevents it.
-
-        Reads and writes raw ticks (``normalize=False``): the calibration mapping
-        is not necessarily loaded this early, and ticks are what the comparison
-        needs. Every access carries a retry count so one dropped Feetech packet
-        surfaces as a retry rather than as a phantom mismatch that would refuse to
-        connect a healthy arm.
-
-        Returns a record of what was found and written. Skips — and says so —
-        when torque is already enabled, because there ``Goal_Position`` is live
-        and overwriting it would be the very command this exists to avoid.
-
-        Raises:
-            RuntimeError: the pre-arm write did not read back, so enabling torque
-                would still command a jump. Fails closed rather than connecting.
-        """
+        'Write ``Goal_Position <- Present_Position`` while torque is still OFF.'
         bus = self.robot.bus
         num_retry = max(
             _PREARM_READ_MIN_RETRIES,
@@ -955,20 +691,7 @@ class SO10xArmController(IRobotController):
             bus.disconnect(False)
 
     def _assert_calibration_loaded(self) -> Tuple[Path, str]:
-        """Confirm the calibration file loaded, logging its path and checksum.
-
-        Prefers the robot object's own ``calibration_fpath`` — the authoritative
-        answer to which file lerobot will load — and falls back to re-deriving it
-        from the documented environment variables.
-
-        Deliberately does NOT consult the robot's calibrated flag, and does not
-        treat a successful ``connect()`` as evidence: that flag interrogates the
-        MOTORS, so if the servos still hold calibration in firmware the connect
-        path skips calibration entirely while the in-Python calibration mapping
-        stays empty. The resulting error then arrives at the first bus read, after
-        connect already reported success. Asserting the file here is what closes
-        that window.
-        """
+        'Confirm the calibration file loaded, logging its path and checksum.'
         robot = getattr(self, "robot", None)
         path, checksum = assert_calibration_loaded(
             robot_name=getattr(robot, "name", None),
@@ -990,40 +713,7 @@ class SO10xArmController(IRobotController):
         return self.robot.get_observation()
 
     def _assert_pid_landed(self) -> Dict[str, Dict[str, int]]:
-        """Read the PID preset back from every motor and assert it landed.
-
-        Returns:
-            ``{motor: {register: observed value}}`` for all six motors — logged
-            at INFO so a later phase can cite the stiffness the arm *actually*
-            ran at rather than the value that was requested.
-
-        Raises:
-            RuntimeError: a coefficient read failed. The underlying exception is
-                chained.
-            ValueError: one or more read-back values do not match the preset.
-                Every mismatch is aggregated into a single message.
-
-        This method REPLACES the former ``set_so10x_robot_preset()``, which was a
-        torque-disabled write loop wrapped in ``except Exception: pass`` — so a
-        failed stiffness write was indistinguishable from a successful one. Two
-        changes, both deliberate:
-
-        * **It only reads.** At 0.6.1 the write is upstream's responsibility (the
-          three coefficients are config fields that ``configure()`` writes), so
-          re-writing them here would be a redundant second torque-disabled cycle.
-          That also removes the risk that a renamed *write* API would break this
-          path outright.
-        * **It raises.** Do NOT soften this to a warning or a best-effort skip to
-          get past a bus problem: operating the arm at unknown stiffness is the
-          failure this exists to prevent, and a silent stiffness change would
-          present in a later parity comparison as apparent checkpoint drift.
-
-        Two register-access specifics are load-bearing. ``normalize=False``,
-        because normalization is defined for *position* registers through the
-        calibration mapping and is meaningless for coefficient registers. And a
-        non-zero ``num_retry``, so one dropped packet on the Feetech bus surfaces
-        as a retry rather than as a false mismatch.
-        """
+        'Read the PID preset back from every motor and assert it landed.'
         num_retry = max(
             _PID_READ_MIN_RETRIES,
             int(getattr(self.config, "num_read_retries", 0) or 0),
@@ -1100,18 +790,7 @@ class SO10xArmController(IRobotController):
     def _report_clamped_joints(
         self, requested: Dict[str, float], sent: Dict[str, float]
     ) -> Tuple[Tuple[str, float, float], ...]:
-        """Re-emit any clamp divergence on Dum-E's own loguru stream.
-
-        Upstream already warns when it clamps — but through the module-level
-        ``logging.warning``, i.e. the stdlib ROOT logger, which auto-installs a
-        stderr handler, while Dum-E's loguru sink writes to stdout. Two disjoint
-        streams. The bridge in ``utils.install_stdlib_to_loguru_bridge`` closes
-        that for upstream's message; this method is the independent primary
-        detector, working from ``send_action``'s returned action rather than from
-        any log.
-
-        The message embeds upstream's exact sentence so one grep finds both.
-        """
+        "Re-emit any clamp divergence on Dum-E's own loguru stream."
         clamped = diff_clamped_joints(requested, sent)
         if not clamped:
             return ()
@@ -1130,26 +809,7 @@ class SO10xArmController(IRobotController):
         return clamped
 
     def move_to_initial_pose(self) -> None:
-        """Park at the initial pose, always reached via the retracted ready pose.
-
-        The initial pose is the low, extended one (``shoulder_lift`` -102,
-        ``elbow_flex`` 96). Driving to it directly from an arbitrary pose — which
-        is what every post-task reset does, since the policy leaves the arm
-        wherever the episode ended — can sweep the arm into the table. Reaching
-        the retracted ready pose first turns one unbounded move into two bounded
-        ones.
-
-        The waypoint lives HERE, not at the call sites. It was originally added at
-        two call sites and three others were missed (``ResetPoseSkill``, and the
-        post-task resets in both agent run paths), including the reset tool the
-        model is told to call after a failure — precisely the arbitrary-pose case.
-        A safety invariant enforced per-caller is one a new caller silently opts
-        out of.
-
-        Callers that want the arm to *end* at ready (the pick loop) still call
-        :meth:`move_to_ready_pose` afterwards; the extra ready move that implies is
-        a ~1 s no-op when the arm is already there.
-        """
+        'Park at the initial pose, always reached via the retracted ready pose.'
         self.move_to_ready_pose()
         # These target degrees mirror legacy behavior
         self.set_target_state(

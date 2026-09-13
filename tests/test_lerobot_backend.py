@@ -1,20 +1,4 @@
-"""LeRobot policy backend + gRPC mock contract tests (BACK-05, BACK-07).
-
-BACK-05 is the normalized action contract: a flat ``(16, 6)`` tensor off LeRobot's
-async-inference wire becomes the SAME ``list[dict["<joint>.pos", float]]`` that
-``groot-native`` produces from its modality dict — reindexed against the
-handshake's own ``names`` list, never against a hardcoded joint order.
-
-BACK-07 is the keyless conformance suite: every test here is KEYLESS, GPU-FREE
-and HARDWARE-FREE — no policy server, no checkpoint, no SO101 arm, no serial
-port. The only network use is 127.0.0.1 on an ephemeral port.
-
-Every assertion is on the DECODED chunk, never on RPC success alone. That is not
-style: ``GetActions`` can return ``services_pb2.Empty()`` from a method DECLARED
-to return ``Actions`` (``policy_server.py:259-266``), which serializes to ``b''``
-— so a SUCCESSFUL RPC carrying zero bytes is indistinguishable from a real reply
-except by length. A test that asserted only "the RPC returned" would pass on it.
-"""
+'LeRobot policy backend + gRPC mock contract tests (BACK-05, BACK-07).'
 
 import contextlib
 import os
@@ -57,15 +41,8 @@ ROBOT_STATE_KEYS = list(features.ROBOT_STATE_KEYS)
 CAMERA_KEYS = list(features.CAMERA_KEYS)
 
 
-# --- Real-socket harness ------------------------------------------------------
-#
 # CONSCIOUS DUPLICATION, not an oversight: this is the THIRD copy of
 # _free_port/_wait_for_port in the suite (tests/test_container_contract.py and
-# tests/test_policy_backend.py hold the other two). There is no conftest.py in
-# this repo today, and introducing one to share three six-line helpers would
-# change how every existing test module resolves fixtures — a much larger blast
-# radius than the duplication it removes. Recorded here so a later reader sees a
-# decision rather than sloppiness.
 
 
 def _free_port() -> int:
@@ -91,12 +68,7 @@ def _wait_for_port(port: int, host: str = "127.0.0.1", timeout: float = 5.0) -> 
 
 @contextlib.contextmanager
 def grpc_mock(mode: str = "ok"):
-    """Start the gRPC mock on an ephemeral loopback port; yield ``(port, server)``.
-
-    Teardown is ``server.stop(grace=0)`` in a ``finally`` — the returned-handle
-    equivalent of the ZMQ mock's ``"kill"`` endpoint (see ``start_mock``'s
-    DELIBERATE DIVERGENCE note). A mock left running would wedge the session.
-    """
+    'Start the gRPC mock on an ephemeral loopback port; yield ``(port, server)``.'
     port = _free_port()
     server = start_mock(port, "127.0.0.1", mode=mode)
     try:
@@ -118,16 +90,7 @@ def lerobot_session(port: int, host: str = "127.0.0.1"):
 
 @contextlib.contextmanager
 def lerobot_backend(port: int, **kwargs):
-    """Build the ``lerobot`` backend THROUGH THE FACTORY; close it on exit.
-
-    Through the factory deliberately: ``policy/factory.py``'s ``lerobot`` branch
-    is the single line this whole phase exists to replace, so every backend-level
-    test drives the real selector rather than importing the class directly.
-
-    ``clear=True`` guarantees no inherited ``DUME_POLICY_BACKEND`` or
-    ``DUME_LEROBOT_*`` value from the runner environment masks a missing forward
-    or silently changes the handshake this test asserts on.
-    """
+    'Build the ``lerobot`` backend THROUGH THE FACTORY; close it on exit.'
     with mock.patch.dict(os.environ, {"DUME_POLICY_BACKEND": "lerobot"}, clear=True):
         backend = make_policy_backend(
             host="127.0.0.1",
@@ -155,13 +118,7 @@ def _remote_policy_config(actions_per_chunk: int = _ACTION_HORIZON) -> RemotePol
 
 
 def _synthetic_observation(height: int = 64, width: int = 64, state: float = 0.0) -> dict:
-    """A FLAT raw observation, exactly the shape ``IRobotController.get_observation()``
-    produces: ``{"<joint>.pos": float}`` for six joints plus ``{cam: HxWx3 uint8}``.
-
-    Deliberately NOT the nested ``{video, state, language}`` GR00T shape — that
-    nesting belongs to the ZMQ wire; this wire's server does the packing itself
-    via ``raw_observation_to_observation(...)`` plus the preprocessor.
-    """
+    'A FLAT raw observation, exactly the shape ``IRobotController.get_observation()`` produces: ``{"<joint>.pos": float}`` for six joints plus ``{cam: HxWx3 uint8}``.'
     obs: dict = {
         k: np.random.randint(0, 255, (height, width, 3), dtype=np.uint8)
         for k in CAMERA_KEYS
@@ -172,13 +129,7 @@ def _synthetic_observation(height: int = 64, width: int = 64, state: float = 0.0
 
 
 def _session_observation(**kwargs) -> dict:
-    """``_synthetic_observation`` plus the LeRobot language key.
-
-    ``"task"`` is LeRobot's language key (``processor_groot.py:1547``); omitting
-    it is not an error but silently substitutes ``"Perform the task."``, which is
-    a silent degradation of policy quality. Session-level tests must supply it
-    because there is no backend above them to do it.
-    """
+    '``_synthetic_observation`` plus the LeRobot language key.'
     obs = _synthetic_observation(**kwargs)
     obs["task"] = "pick up the banana"
     return obs
@@ -188,14 +139,7 @@ def _session_observation(**kwargs) -> dict:
 
 
 def test_state_names_ordering_is_the_controller_order():
-    """The handshake's own ``names`` list IS the joint order, compared as a LIST.
-
-    ORDERED comparison, never ``set(...)`` and never ``sorted(...)``: a
-    permutation is precisely the failure mode this asserts against, and both of
-    those would pass on one. ``build_dataset_frame`` builds the state vector by
-    iterating this list (``lerobot/utils/feature_utils.py:131-132``), so a
-    disagreement silently moves the arm plausibly to the wrong pose.
-    """
+    "The handshake's own ``names`` list IS the joint order, compared as a LIST."
     names = features.state_names(features.build_lerobot_features())
 
     assert names == [
@@ -269,14 +213,7 @@ def test_stopped_mock_makes_ready_return_false():
 
 
 def test_empty_actions_payload_raises_named_error_not_eoferror():
-    """``Actions(data=b"")`` -> a NAMED RuntimeError, never ``EOFError``.
-
-    This reproduces upstream's REAL behaviour, not a hypothetical: ``GetActions``
-    wraps its body in a blanket ``except`` and returns ``services_pb2.Empty()``
-    from a method declared to return ``Actions``, which serializes to ``b''``. The
-    client must refuse to unpickle zero bytes; letting it through produces
-    ``EOFError: Ran out of input`` from deep inside the transport, naming nothing.
-    """
+    '``Actions(data=b"")`` -> a NAMED RuntimeError, never ``EOFError``.'
     with grpc_mock("empty") as (port, _server):
         with lerobot_session(port) as session:
             session.connect(_remote_policy_config())
@@ -291,15 +228,7 @@ def test_empty_actions_payload_raises_named_error_not_eoferror():
 
 
 def test_refused_handshake_raises_without_retrying():
-    """A ``FAILED_PRECONDITION`` refusal surfaces the SERVER's message, in ONE attempt.
-
-    Two claims, both load-bearing. (1) The server's own diagnosis reaches the
-    operator verbatim — ``RETRYABLE_CODES`` deliberately excludes
-    ``FAILED_PRECONDITION`` so a SAFE-01 refusal is not reworded into a generic
-    "unreachable". (2) It is not retried: a retried handshake starts a SECOND
-    concurrent multi-GB weight load rather than re-asking a finished question, so
-    the elapsed-time bound is the observable proof that one attempt was made.
-    """
+    "A ``FAILED_PRECONDITION`` refusal surfaces the SERVER's message, in ONE attempt."
     with grpc_mock("refuse") as (port, _server):
         with lerobot_session(port) as session:
             started = time.time()
@@ -315,12 +244,7 @@ def test_refused_handshake_raises_without_retrying():
 
 
 def test_unreachable_grpc_server_raises_with_address_and_does_not_hang():
-    """An unbound port raises a descriptive error naming the address, bounded.
-
-    ``wait_for_ready`` is never passed to a stub call; grpc-python defaults it to
-    False, and that default is exactly what makes this true. Setting it True would
-    convert an unreachable server into an indefinite park.
-    """
+    'An unbound port raises a descriptive error naming the address, bounded.'
     port = _free_port()
     with lerobot_session(port) as session:
         started = time.time()
@@ -333,12 +257,7 @@ def test_unreachable_grpc_server_raises_with_address_and_does_not_hang():
 
 
 def test_both_mocks_run_in_one_session_on_distinct_ephemeral_ports():
-    """BACK-07 adjacency edge: the ZMQ mock and the gRPC mock coexist.
-
-    Two mocks that collided on a port would make the parametrized contract suite
-    pass or fail depending on test ORDER. Both round trips are exercised, then the
-    gRPC server is stopped and the ZMQ one is proven still serving.
-    """
+    'BACK-07 adjacency edge: the ZMQ mock and the gRPC mock coexist.'
     zmq_port = _free_port()
     grpc_port = _free_port()
     assert zmq_port != grpc_port
@@ -378,14 +297,7 @@ def test_both_mocks_run_in_one_session_on_distinct_ephemeral_ports():
 
 
 def test_lerobot_end_to_end_over_real_grpc_socket():
-    """The whole slice: env selector -> factory -> IPolicyBackend -> real socket.
-
-    Asserts the SAME contract ``groot-native`` returns from its modality dict —
-    16 dicts, each carrying exactly the six ``"<joint>.pos"`` keys with ``float``
-    values — so ONE normalized action contract now spans both backends. The key
-    ITERATION ORDER is asserted too: a permuted dict with the right keys would
-    satisfy a set comparison and still move the wrong joints.
-    """
+    'The whole slice: env selector -> factory -> IPolicyBackend -> real socket.'
     instruction = "Grab a banana and put it on the plate"
 
     with grpc_mock("ok") as (port, server):
@@ -418,22 +330,7 @@ def test_lerobot_end_to_end_over_real_grpc_socket():
 
 
 def test_reset_re_readies_the_server_without_a_second_handshake():
-    """``reset()`` must NOT trigger a second ``SendPolicyInstructions`` (CR-01).
-
-    This is a VRAM-lifetime assertion wearing a call-count disguise, and the count
-    is the only part a keyless test can reach. On the real server the weight load
-    lives inside the ``SendPolicyInstructions`` handler
-    (``policy_server.py:151``), so every extra call is one more ~6 GB
-    materialization on a 12288 MiB card that is already holding one — while
-    ``Ready`` is what clears ``observation_queue`` and ``_predicted_timesteps``
-    (``policy_server.py:107-113``) and leaves the loaded policy alone.
-    ``run_pick_baseline.py`` calls ``reset()`` between every scored attempt, so the
-    difference is per-episode.
-
-    Driven across a reset with an inference on each side, so the assertion is that
-    the session is genuinely REUSABLE after the reset, not merely that a call was
-    skipped.
-    """
+    '``reset()`` must NOT trigger a second ``SendPolicyInstructions`` (CR-01).'
     with grpc_mock("ok") as (port, server):
         servicer = server.dume_servicer
         with lerobot_backend(port) as backend:
@@ -473,13 +370,7 @@ def test_reset_re_readies_the_server_without_a_second_handshake():
 
 
 def test_reset_raises_when_the_server_cannot_be_reached():
-    """A reset that could not flush server state RAISES rather than returning.
-
-    ``ping()``/``ready()`` deliberately return a bool so a caller can poll. This
-    method deliberately does not: it runs at an episode boundary, and a reset that
-    quietly did nothing is exactly how stale server-side per-client state survives
-    into the next episode and gets read as policy drift.
-    """
+    'A reset that could not flush server state RAISES rather than returning.'
     port = _free_port()
     server = start_mock(port, "127.0.0.1", mode="ok")
     try:
@@ -495,14 +386,7 @@ def test_reset_raises_when_the_server_cannot_be_reached():
 
 
 def test_decoded_dims_zero_to_four_are_arm_and_dim_five_is_gripper():
-    """Dim i of the flat action maps to joint i — asserted, never assumed.
-
-    Driven with a NON-UNIFORM vector, because that is the only kind that can
-    catch a silent reordering: every shape check and every key-set check passes
-    on a permuted chunk of zeros. Dims 0:5 are the ``single_arm`` group and dim 5
-    is ``gripper``, the split the checkpoint's ``action_configs`` encodes as
-    RELATIVE (arm) plus ABSOLUTE (gripper).
-    """
+    'Dim i of the flat action maps to joint i — asserted, never assumed.'
     vector = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
 
     with grpc_mock("ok") as (port, server):
@@ -524,12 +408,7 @@ def test_decoded_dims_zero_to_four_are_arm_and_dim_five_is_gripper():
 
 
 def test_get_action_without_any_instruction_raises():
-    """Fail closed on a missing instruction, BEFORE any gRPC call.
-
-    The port is deliberately unbound: a transport error would prove the guard
-    fired too late, so ``ValueError`` (not ``RuntimeError``) is the observable
-    difference between a fail-closed guard and a wasted round trip.
-    """
+    'Fail closed on a missing instruction, BEFORE any gRPC call.'
     with lerobot_backend(_free_port()) as backend:
         with pytest.raises(ValueError) as excinfo:
             backend.get_action(_synthetic_observation())
@@ -541,12 +420,7 @@ def test_get_action_without_any_instruction_raises():
 
 
 def test_language_instruction_is_readonly_property():
-    """``language_instruction`` is a read-only property backed by a field.
-
-    Adjacency edge: the parenthesis-free READ at
-    ``embodiment/so_arm10x/skills.py`` must work, while assignment is rejected so
-    mutation goes through ``set_lang_instruction``, which a backend can validate.
-    """
+    '``language_instruction`` is a read-only property backed by a field.'
     with lerobot_backend(_free_port()) as backend:
         assert isinstance(
             type(backend).language_instruction, property
@@ -584,12 +458,7 @@ def test_close_is_idempotent_and_session_closes_on_exception():
 
 
 def test_show_images_true_warns_rather_than_silently_ignoring():
-    """``show_images=True`` is not wired here, and says so out loud.
-
-    A silently discarded flag is how an operator concludes the preview is BROKEN
-    rather than absent, and then debugs the camera stack instead of reading this
-    line.
-    """
+    '``show_images=True`` is not wired here, and says so out loud.'
     captured: list[str] = []
     handler_id = logger.add(lambda message: captured.append(str(message)), level="WARNING")
     try:

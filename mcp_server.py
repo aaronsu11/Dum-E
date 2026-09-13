@@ -165,14 +165,20 @@ async def get_robot(robot_id: str) -> Dict[str, Any]:
     return {"robot": _robot_to_dict(info)}
 
 
+def _readiness_is_external(robot):
+    """The owning worker, not a registry toggle, prepares this robot for tasks."""
+    return bool(robot and (robot.metadata.get("externally_managed_readiness")
+                           or robot.metadata.get("managed_trial")))  # Legacy registry entries.
+
+
 @mcp.tool()
 async def set_robot_enabled(robot_id: str, enabled: bool) -> Dict[str, Any]:
     """Enable or disable a robot by ID."""
     if not FLEET_MANAGER:
         return {"error": "Fleet manager not available in this deployment"}
     robot = await FLEET_MANAGER.get_robot(robot_id)
-    if enabled and robot is not None and robot.metadata.get("managed_trial"):
-        return {"robot_id": robot_id, "updated": False, "error": "This one-shot trial must be rearmed by its runner; enabling the registry does not start a worker."}
+    if enabled and _readiness_is_external(robot):
+        return {"robot_id": robot_id, "updated": False, "error": "This robot requires readiness from its owning worker; registry enable cannot prepare hardware."}
     ok = await FLEET_MANAGER.set_enabled(robot_id, enabled)
     return {"robot_id": robot_id, "enabled": enabled, "updated": bool(ok)}
 
@@ -187,19 +193,14 @@ async def execute_robot_instruction(
     ctx: Context,
     timeout_s: int = 900,
 ) -> dict:
-    """This creates a task via ITaskManager and publishes a TASK_CREATED message via IMessageBroker.
-    The edge Dum-E agent should pick up the task, execute it, and publish streaming updates.
-
-    All updates are forwarded to the MCP client through ctx.report_progress,
-    making this tool compatible with streamable HTTP clients.
-    """
+    'This creates a task via ITaskManager and publishes a TASK_CREATED message via IMessageBroker. The edge Dum-E agent should pick up the task, execute it, and publish streaming updates.'
     # Reject unroutable requests before they become silently pending tasks.
     if robot_id is not None and FLEET_MANAGER is not None:
         robot = await FLEET_MANAGER.get_robot(robot_id)
         if robot is None:
             return {"status": "rejected", "error": "Unknown robot_id. Call list_robots and use its exact robot_id."}
-        if robot.metadata.get("managed_trial") and not robot.metadata.get("ready_for_task", False):
-            return {"status": "rejected", "error": "No trial is armed. Prepare a new trial with its runner."}
+        if _readiness_is_external(robot) and not robot.metadata.get("ready_for_task", False):
+            return {"status": "rejected", "error": "Robot worker is not ready for a task. Prepare it before dispatch."}
         if not robot.enabled:
             return {"status": "rejected", "error": "Robot is disabled."}
 
@@ -350,12 +351,7 @@ async def get_task_details(
 
 @mcp.tool()
 async def retarget_robot_instruction(task_id: str, instruction: str) -> Dict[str, Any]:
-    """Retarget an active async pick without starting a second task or reconnecting.
-
-    Use this when the user changes the object/instruction during a running pick.
-    The worker reports whether it applied the instruction through task progress.
-    Get task_id from list_tasks(status="running"); a tool-call ID is not a task ID.
-    """
+    'Retarget an active async pick without starting a second task or reconnecting.'
     if not isinstance(instruction, str) or not instruction.strip():
         return {"status": "rejected", "error": "Nonempty instruction required"}
     task = await TASK_MANAGER.get_task(task_id)

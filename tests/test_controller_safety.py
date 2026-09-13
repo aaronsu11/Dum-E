@@ -1,30 +1,4 @@
-"""Controller safety instruments: the PID read-back and the motion clamp.
-
-Three settings that would otherwise sit at their upstream defaults are made
-explicit. This module covers the two that are safety instruments:
-
-* **The PID preset.** At lerobot 0.6.1 the three
-  coefficients are *config fields*, and upstream ``SOFollower.configure()`` —
-  which ``connect()`` already calls — writes them on the first pass. So the
-  preset becomes declarative and Dum-E's job shrinks to *evidence*: read the
-  coefficients back from every motor and refuse to connect on a mismatch or on a
-  read failure. A clean write is not evidence the value landed, and operating the
-  arm at unknown stiffness would surface in a later parity comparison looking
-  like checkpoint drift rather than the configuration error it is.
-* **The motion clamp.** ``max_relative_target`` plumbing already exists upstream
-  and in Dum-E; the remaining job is "set a real value and surface the warning",
-  not "build the clamp". Two traps make that non-trivial. An ``int``
-  clamp does **not** fail on ordinary actions — it raises ``TypeError`` inside
-  ``ensure_safe_goal_position`` at the exact moment the clamp would have engaged.
-  And upstream's warning goes to the stdlib **root** logger (hence stderr via
-  ``basicConfig``) while Dum-E's loguru sink writes to stdout, so the warning is
-  emitted and architecturally invisible.
-
-Every test here is hermetic: no serial port, no cameras, no network, no
-hardware. The clamp tests drive the real upstream helper and a stub robot that
-mirrors ``SOFollower.send_action``'s body, so the assertions are about upstream's
-actual behaviour rather than a reimplementation of it.
-"""
+'Controller safety instruments: the PID read-back and the motion clamp.'
 
 import contextlib
 import logging
@@ -61,16 +35,7 @@ LEROBOT_DEFAULT_PID = {"P_Coefficient": 16, "I_Coefficient": 0, "D_Coefficient":
 
 
 class StubBus:
-    """Stand-in for ``lerobot.motors.motors_bus.MotorsBus``.
-
-    Records every ``read`` call with its keyword arguments, which is how the
-    normalization and retry assertions are made: those two arguments are
-    load-bearing (normalization is defined for *position* registers through the
-    calibration mapping and is meaningless for coefficient registers, and one
-    dropped Feetech packet must surface as a retry rather than as a false
-    mismatch that refuses to connect a healthy arm) but they are invisible in the
-    return value, so they can only be checked at the call site.
-    """
+    'Stand-in for ``lerobot.motors.motors_bus.MotorsBus``.'
 
     def __init__(
         self,
@@ -104,14 +69,7 @@ class StubBus:
 
 
 class StubRobot:
-    """Stand-in for ``SOFollower`` whose ``send_action`` mirrors upstream's body.
-
-    It calls the **real** ``ensure_safe_goal_position`` with the real config
-    value, so every clamp assertion here is about upstream's actual arithmetic
-    rather than a reimplementation of it — including the ``.pos`` suffix strip on
-    the way in and restore on the way out, which is what makes the requested and
-    returned dicts comparable key-for-key.
-    """
+    "Stand-in for ``SOFollower`` whose ``send_action`` mirrors upstream's body."
 
     name = "so_follower"
 
@@ -146,12 +104,7 @@ class StubRobot:
 
 
 def pid_controller(bus: StubBus) -> SO10xArmController:
-    """An ``SO10xArmController`` shell wired to ``bus``, built without hardware.
-
-    ``__new__`` skips ``__init__`` (which would demand a serial port and build
-    camera configs); the read-back method only ever touches ``self.robot.bus``
-    and ``self.config``.
-    """
+    'An ``SO10xArmController`` shell wired to ``bus``, built without hardware.'
     controller = SO10xArmController.__new__(SO10xArmController)
     controller.robot = SimpleNamespace(bus=bus)
     controller.config = SimpleNamespace(num_read_retries=2)
@@ -169,17 +122,7 @@ def clamp_controller(robot: StubRobot) -> SO10xArmController:
 
 @contextlib.contextmanager
 def capture_loguru(level: str = "WARNING") -> Iterator[List[str]]:
-    """Collect loguru MESSAGES through a real sink, not by inspecting source text.
-
-    Capturing the sink is the whole point: the claim under test is that the clamp is
-    *surfaced on Dum-E's own stream*, and only a sink proves that. Grepping the
-    source would pass even if the message never reached loguru.
-
-    ``record["message"]`` rather than the rendered line, deliberately: the
-    rendered line carries a millisecond timestamp, so no two runs could ever be
-    byte-identical and the determinism assertion below would be untestable. The
-    claim under test is that the *message* is deterministic, not the clock.
-    """
+    'Collect loguru MESSAGES through a real sink, not by inspecting source text.'
     messages: List[str] = []
     sink_id = logger.add(
         lambda message: messages.append(message.record["message"]), level=level
@@ -210,14 +153,7 @@ def stdlib_bridge_installed() -> Iterator[None]:
 
 
 def test_default_clamp_is_a_float_not_an_int():
-    """The default clamp is a strictly positive ``float``, above the policy's own motion.
-
-    Three separate failure modes are excluded here. ``None`` disables the clamp
-    entirely, which is what Dum-E shipped with. An ``int`` is the worse trap (see
-    the next test). And a value *below* the checkpoint's own trained relative
-    motion would fire on nominal operation, which the parity gate requires to be
-    warning-free and would read as a parity bug rather than as a mis-set clamp.
-    """
+    "The default clamp is a strictly positive ``float``, above the policy's own motion."
     clamp = ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
 
     assert isinstance(clamp, float), type(clamp)
@@ -233,14 +169,7 @@ def test_default_clamp_is_a_float_not_an_int():
 
 
 def test_int_clamp_would_raise_typeerror_in_upstream_clamp():
-    """An ``int`` clamp raises inside the helper — proven, not described.
-
-    ``ensure_safe_goal_position`` dispatches on ``isinstance(..., float)`` then
-    ``isinstance(..., dict)`` and otherwise raises ``TypeError``, and
-    ``isinstance(5, float)`` is ``False``. This is the worst available failure
-    mode because it does NOT fail on ordinary actions: an int clamp works
-    perfectly right up to the moment the clamp was supposed to engage.
-    """
+    'An ``int`` clamp raises inside the helper — proven, not described.'
     clamp = ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
     goal_present = {"shoulder_pan": (clamp + 50.0, 0.0)}
 
@@ -254,14 +183,7 @@ def test_int_clamp_would_raise_typeerror_in_upstream_clamp():
 
 
 def test_clamp_exactly_at_bound_is_not_clamped():
-    """A delta exactly at the bound passes through; so does one 1e-5 above it.
-
-    Upstream's divergence test is ``abs(safe_goal_pos - goal_pos) > 1e-4``,
-    strictly greater. So the bound itself is untouched, and a request 1e-5 past
-    it is clipped by 1e-5 — below the threshold, therefore NOT reported. Dum-E's
-    detector uses the same threshold precisely so the two never disagree about
-    whether the clamp fired.
-    """
+    'A delta exactly at the bound passes through; so does one 1e-5 above it.'
     clamp = ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
     robot = StubRobot(max_relative_target=clamp)
     controller = clamp_controller(robot)
@@ -276,12 +198,7 @@ def test_clamp_exactly_at_bound_is_not_clamped():
 
 
 def test_clamp_one_step_above_bound_is_clamped_and_logged():
-    """A delta past the bound comes back clipped AND is reported through loguru.
-
-    The return value is the primary detector rather than the log because it is
-    log-configuration independent and testable with no hardware — which is
-    exactly what this test is.
-    """
+    'A delta past the bound comes back clipped AND is reported through loguru.'
     clamp = ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
     requested = clamp + 25.0
     robot = StubRobot(max_relative_target=clamp)
@@ -302,13 +219,7 @@ def test_clamp_one_step_above_bound_is_clamped_and_logged():
 
 
 def test_clamp_warning_reaches_loguru_sink_with_upstream_wording():
-    """Dum-E's own warning carries upstream's exact sentence.
-
-    One grep must find both signals. Upstream emits
-    ``Relative goal position magnitude had to be clamped to be safe.`` on the
-    stdlib root logger; Dum-E re-emits through loguru. If the wordings diverged,
-    an operator grepping for one would conclude the other never happened.
-    """
+    "Dum-E's own warning carries upstream's exact sentence."
     clamp = ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
     robot = StubRobot(max_relative_target=clamp)
     controller = clamp_controller(robot)
@@ -325,13 +236,7 @@ def test_clamp_warning_reaches_loguru_sink_with_upstream_wording():
 
 
 def test_no_clamp_warning_when_clamp_disabled():
-    """With the clamp disabled, the code path does not run and nothing is reported.
-
-    An absent clamp must be distinguishable from a clamp that never fired. Here
-    the requested action is far past any plausible bound and still comes back
-    untouched, with silence on the log — which is the signature of "no clamp",
-    not of "no violation".
-    """
+    'With the clamp disabled, the code path does not run and nothing is reported.'
     robot = StubRobot(max_relative_target=None)
     controller = clamp_controller(robot)
     requested = {f"{motor}.pos": 500.0 for motor in MOTOR_NAMES}
@@ -344,12 +249,7 @@ def test_no_clamp_warning_when_clamp_disabled():
 
 
 def test_clamp_log_lists_joints_in_requested_key_order():
-    """Two runs over the same requested action produce identical clamp lines.
-
-    Determinism here is what makes the log diffable across runs. The report is
-    built by walking the *requested* action's keys, so its order is the caller's
-    insertion order rather than set or dict-hash order.
-    """
+    'Two runs over the same requested action produce identical clamp lines.'
     clamp = ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
     robot = StubRobot(max_relative_target=clamp)
     controller = clamp_controller(robot)
@@ -385,13 +285,7 @@ def test_clamp_log_lists_joints_in_requested_key_order():
 
 
 def test_clamp_validation_rejects_bad_values_before_they_reach_the_config():
-    """A non-positive clamp or an incomplete per-motor mapping is refused early.
-
-    Validating at the boundary rather than at the first clamped action matters
-    because the upstream mapping branch only raises when it is *used* — so an
-    incomplete mapping, like an int, would fail at the exact moment the clamp was
-    needed. A complete mapping and a positive float both pass through.
-    """
+    'A non-positive clamp or an incomplete per-motor mapping is refused early.'
     resolve = ctrl_mod.resolve_max_relative_target
 
     assert resolve(12.5) == 12.5
@@ -411,13 +305,7 @@ def test_clamp_validation_rejects_bad_values_before_they_reach_the_config():
 
 
 def test_clamp_resolves_from_environment_and_is_on_by_default(monkeypatch):
-    """``None`` means "resolve", not "disable" — the clamp is on by default.
-
-    The production call site passes neither the clamp nor the units parameter, so
-    an unset default that meant "off" would leave the clamp disabled in exactly
-    the configuration that ships. Disabling is therefore explicit and spelled out
-    in the environment.
-    """
+    '``None`` means "resolve", not "disable" — the clamp is on by default.'
     monkeypatch.delenv("DUME_MAX_RELATIVE_TARGET", raising=False)
     assert ctrl_mod.resolve_max_relative_target(None) == ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
 
@@ -435,15 +323,7 @@ def test_clamp_resolves_from_environment_and_is_on_by_default(monkeypatch):
 
 
 def test_stdlib_root_warning_is_bridged_to_loguru():
-    """A plain stdlib root-logger warning reaches a loguru sink, installed once.
-
-    This closes the gap Pitfall 9 names: ``ensure_safe_goal_position`` calls the
-    module-level ``logging.warning``, i.e. the ROOT logger, which auto-installs a
-    stderr ``StreamHandler`` — while Dum-E's loguru sink writes to stdout. Two
-    disjoint streams, and the repo had no bridge at all, so upstream's own clamp
-    warning was emitted and architecturally invisible. Setting the clamp without
-    this bridge does not surface it.
-    """
+    'A plain stdlib root-logger warning reaches a loguru sink, installed once.'
     root = logging.getLogger()
 
     with stdlib_bridge_installed():
@@ -463,14 +343,7 @@ def test_stdlib_root_warning_is_bridged_to_loguru():
 
 
 def test_bridged_record_is_attributed_to_the_originating_frame():
-    """A bridged record names its real origin, not ``utils.py`` or ``logging``.
-
-    Frame depth is not cosmetic here. The clamp warning is emitted from inside
-    ``lerobot/robots/utils.py``, and an operator who greps the log to find where
-    a clamp came from must be pointed there — not at Dum-E's logging setup, and
-    not at ``logging/__init__.py:callHandlers``, both of which are where a naive
-    depth calculation lands.
-    """
+    'A bridged record names its real origin, not ``utils.py`` or ``logging``.'
     seen: List[Dict[str, Any]] = []
     sink_id = logger.add(lambda message: seen.append(message.record), level="WARNING")
     try:
@@ -488,12 +361,7 @@ def test_bridged_record_is_attributed_to_the_originating_frame():
 
 
 def test_upstream_clamp_warning_itself_reaches_loguru_through_the_bridge():
-    """The belt-and-braces half: upstream's OWN warning lands on Dum-E's stream.
-
-    Distinct from the return-value detector — this asserts the bridge carries the
-    warning ``ensure_safe_goal_position`` emits itself, so the two mechanisms are
-    genuinely independent rather than one dressed up as two.
-    """
+    "The belt-and-braces half: upstream's OWN warning lands on Dum-E's stream."
     clamp = ctrl_mod.DEFAULT_MAX_RELATIVE_TARGET
 
     with stdlib_bridge_installed():
@@ -507,13 +375,7 @@ def test_upstream_clamp_warning_itself_reaches_loguru_through_the_bridge():
 
 
 def test_skill_loop_consumes_set_target_state_return_value(monkeypatch):
-    """The pick loop uses the returned action instead of discarding it.
-
-    ``set_target_state``'s return IS the clamp signal; a caller that throws it
-    away reduces the clamp signal to a log line nobody correlates with a task. The
-    assertion is behavioural rather than source-level: with a controller that
-    reports a clipped action, the loop must surface it.
-    """
+    'The pick loop uses the returned action instead of discarding it.'
     from embodiment.so_arm10x import skills as skills_mod
 
     monkeypatch.setattr(skills_mod.time, "sleep", lambda *_: None)
@@ -552,15 +414,7 @@ def test_skill_loop_consumes_set_target_state_return_value(monkeypatch):
 
 
 def test_pid_config_fields_carry_dume_preset(monkeypatch):
-    """The preset is declared on the follower config, not written after connect.
-
-    At 0.6.1 ``configure()`` writes ``position_p/i/d_coefficient`` from the
-    config while still inside ``torque_disabled()``, and ``connect()`` calls
-    ``configure()``. Passing the three fields therefore lands 10/0/5 on the first
-    pass, with no post-connect register overwrite and no second torque-disabled
-    cycle. Both follower-config branches must carry them — an SO-100 arm is not
-    entitled to the library defaults.
-    """
+    'The preset is declared on the follower config, not written after connect.'
     assert ctrl_mod.DUME_PID == {
         "P_Coefficient": 10,
         "I_Coefficient": 0,
@@ -599,13 +453,7 @@ def test_pid_readback_returns_and_logs_the_per_motor_mapping():
 
 
 def test_pid_readback_raises_on_mismatch():
-    """One wrong coefficient on one motor refuses the connect.
-
-    The message must name the motor, the register, the expected value and the
-    observed value: a read-back that is neither the Dum-E preset nor the library
-    default means the write *partially* landed, which is more dangerous than
-    either endpoint, so the message has to be specific enough to tell those apart.
-    """
+    'One wrong coefficient on one motor refuses the connect.'
     bus = StubBus(overrides={("elbow_flex", "P_Coefficient"): 16})
 
     with pytest.raises(Exception) as excinfo:
@@ -640,15 +488,7 @@ def test_pid_readback_aggregates_every_mismatch_into_one_error():
 
 
 def test_pid_readback_raises_and_chains_on_read_failure():
-    """A read that raises re-raises with the cause attached — never swallowed.
-
-    This replaces a bare ``except Exception: pass`` around the former
-    torque-disabled stiffness write loop, which made a failed write
-    indistinguishable from a successful one. Do NOT soften it to a warning even to
-    get past a bus problem, so the assertion is on both the raise and the chained
-    cause: an error that loses its cause is nearly as hard
-    to diagnose as one that never fired.
-    """
+    'A read that raises re-raises with the cause attached — never swallowed.'
     original = OSError("simulated Feetech bus timeout")
     bus = StubBus(read_error=original)
 
@@ -660,14 +500,7 @@ def test_pid_readback_raises_and_chains_on_read_failure():
 
 
 def test_pid_readback_uses_unnormalized_reads_with_retry():
-    """Every coefficient read passes ``normalize=False`` and a non-zero retry.
-
-    Both defaults are wrong here. ``normalize=True`` (upstream's default) applies
-    the calibration mapping, which is defined for position registers and
-    meaningless for coefficient registers. ``num_retry=0`` (also upstream's
-    default) turns a single dropped packet on the Feetech bus into a value
-    mismatch, which refuses to connect a perfectly healthy arm.
-    """
+    'Every coefficient read passes ``normalize=False`` and a non-zero retry.'
     bus = StubBus()
     SO10xArmController._assert_pid_landed(pid_controller(bus))
 
@@ -681,12 +514,7 @@ def test_pid_readback_uses_unnormalized_reads_with_retry():
 
 
 def test_connect_asserts_pid_landed_after_the_calibration_assertion():
-    """``connect()`` still runs the read-back, in the same place the write was.
-
-    Ordering matters twice over: the calibration file governs what the numbers
-    fed to the policy *mean*, and the PID governs how the arm tracks them. Both
-    must be established before anything commands motion.
-    """
+    '``connect()`` still runs the read-back, in the same place the write was.'
     calls: List[str] = []
     stub = SimpleNamespace(
         _prearm_goal_to_present=lambda: calls.append("prearm"),
@@ -702,38 +530,12 @@ def test_connect_asserts_pid_landed_after_the_calibration_assertion():
     assert calls == ["prearm", "robot.connect", "calibration", "pid"]
 
 
-# ---------------------------------------------------------------------------
 # The Goal_Position pre-arm (the connect-time slam guard).
-#
 # Plan 05-06 found this by reading the live registers before commanding
-# anything: with torque OFF after a power cycle, every motor on this arm reports
-# `Goal_Position = 0`. Upstream's `configure()` runs inside `bus.torque_disabled()`,
-# whose `finally` calls `enable_torque()`, and `enable_torque()` writes
-# `Torque_Enable` and `Lock` ONLY -- it never synchronises `Goal_Position` to the
-# present position. So a bare `connect()` commands all six joints to raw tick 0
-# the instant torque returns: a slam of up to ~3090 ticks on `elbow_flex`.
-#
-# The pre-arm was first discovered and guarded inside the units probe, which left
-# production `connect()` exposed. These tests pin the guard in production, where
-# every caller gets it -- including the live re-baseline, which drives this exact
-# path.
-#
-# Pre-arming with torque disabled cannot itself move the arm; it converts the
-# torque-enable from a move into a hold. These tests therefore prove the guard
-# is WIRED and ORDERED correctly, never that the slam happens.
-# ---------------------------------------------------------------------------
 
 
 class PrearmStubBus:
-    """Stand-in for ``MotorsBus`` covering the pre-arm's register traffic.
-
-    ``sync_read``/``write`` record their keyword arguments because ``normalize``
-    and ``num_retry`` are load-bearing and invisible in the return value:
-    normalization must be OFF (the whole point is raw encoder ticks, and the
-    calibration mapping may not even be loaded yet at pre-arm time), and one
-    dropped Feetech packet must surface as a retry rather than as a phantom
-    mismatch that refuses to connect a healthy arm.
-    """
+    "Stand-in for ``MotorsBus`` covering the pre-arm's register traffic."
 
     def __init__(
         self,
@@ -793,13 +595,7 @@ def prearm_controller(bus: PrearmStubBus) -> SO10xArmController:
 
 
 def test_prearm_writes_present_position_into_goal_when_torque_is_off():
-    """The core guard: Goal_Position becomes Present_Position before torque returns.
-
-    The stub starts in exactly the state 05-06 measured on real hardware --
-    torque off, every `Goal_Position` at 0, the arm physically parked at tick
-    1000. Without the pre-arm, enabling torque would command a -1000 tick jump on
-    every joint.
-    """
+    'The core guard: Goal_Position becomes Present_Position before torque returns.'
     bus = PrearmStubBus(present={m: 1000 for m in MOTOR_NAMES}, goal={m: 0 for m in MOTOR_NAMES})
     controller = prearm_controller(bus)
 
@@ -814,12 +610,7 @@ def test_prearm_writes_present_position_into_goal_when_torque_is_off():
 
 
 def test_prearm_skips_when_torque_is_already_enabled():
-    """With torque on, Goal_Position is LIVE -- overwriting it is the very command to avoid.
-
-    Writing `Present_Position` into a live `Goal_Position` on an arm already
-    holding position is a no-op at best; on a moving arm it would countermand an
-    in-flight goal. The guard must detect this and decline.
-    """
+    'With torque on, Goal_Position is LIVE -- overwriting it is the very command to avoid.'
     bus = PrearmStubBus(torque={m: 1 for m in MOTOR_NAMES})
     controller = prearm_controller(bus)
 
@@ -862,12 +653,7 @@ def test_prearm_reads_raw_ticks_with_retries():
 
 
 def test_prearm_leaves_torque_state_exactly_as_found():
-    """`disconnect(False)` -- the guard must not itself change the torque state.
-
-    Passing the default `disable_torque=True` would make the guard mutate the
-    very state it exists to reason about, and on an arm that was already powered
-    it would drop torque under load.
-    """
+    '`disconnect(False)` -- the guard must not itself change the torque state.'
     bus = PrearmStubBus()
     controller = prearm_controller(bus)
 

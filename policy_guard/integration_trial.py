@@ -1,14 +1,15 @@
 """Small-motion plumbing checks, explicitly distinct from policy task evaluation."""
+from types import MappingProxyType
 import numpy as np
 from policy.galaxea.modalities import JOINTS, vector
 
-PROTOCOL = {
+DEFAULT_PROTOCOL = MappingProxyType({
     "profile": "g05-so101", "scheduler": "sync", "chunks": 3,
     "actions": 32, "period_s": 0.05, "max_step": 0.25,
     "max_tracking_error": 3.75, "max_excursion": 5.0, "reset_pose": None,
     "instruction": "Grab a banana and put it on the plate",
     "accuracy_scored": False,
-}
+})
 
 
 def check_camera(frame, name):
@@ -41,20 +42,18 @@ def probe_target(origin, offset_degrees=3.0):
     return target
 
 
-def bounded_command(raw, observed, previous, origin, limits, *, max_tracking_error=0.25):
-    """Project deliberately; preserve raw predictions separately in evidence.
-
-    All arm limits are degrees; gripper limits are normalized 0–100 points.
-    Separate measured-pose tracking allowance from command slew. The default
-    remains the original trial bound; diagnostic callers must opt in explicitly.
-    """
+def bounded_command(raw, observed, previous, origin, limits, *, max_tracking_error=0.25, max_step=0.25, max_excursion=5.0):
+    'Project deliberately; preserve raw predictions separately in evidence.'
+    if (not np.isfinite([max_step, max_excursion]).all() or
+            not 0 < max_step <= 0.25 or not 0 < max_excursion <= 6):
+        raise ValueError("Invalid trial slew/excursion limits")
     raw, observed, previous, origin = map(vector, (raw, observed, previous, origin))
     lower, upper = limits
     if np.any(observed < lower) or np.any(observed > upper):
         raise ValueError("Observed pose outside calibrated limits")
-    if np.any(abs(observed - origin) > PROTOCOL["max_excursion"] + 0.5):
+    if np.any(abs(observed - origin) > max_excursion + 0.5):
         raise ValueError("Observed excursion exceeded trial envelope")
-    step, span = PROTOCOL["max_step"], PROTOCOL["max_excursion"]
+    step, span = max_step, max_excursion
     if not np.isfinite(max_tracking_error) or not 0 < max_tracking_error <= 3.75:
         raise ValueError("Invalid tracking allowance")
     low = np.maximum.reduce([lower, origin - span, observed - max_tracking_error, previous - step])

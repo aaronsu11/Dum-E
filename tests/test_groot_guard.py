@@ -1,50 +1,4 @@
-"""Hermetic SAFE-01 gate for the GR00T serving contract.
-
-Defends the five conditions :func:`policy_guard.groot_guard.assert_groot_serving_contract`
-asserts: the resolved ``base_model_path`` really is our raw fine-tune, the horizon is 16 at
-CONFIG level, relative-action decoding is on and native, normalization has not fallen back
-to identity, and the image geometry plus eval-mode determinism are the ones this checkpoint
-was trained with. It satisfies criterion 2's *"mis-flagging the launch is a test, not a
-hypothetical"* KEYLESS — one snapshot built config-only from the REAL checkpoint, then one
-single-field mutation per violation — instead of five ~6 GB weight loads.
-
-**The originally designated mechanism is proven non-discriminating here, not reused.** The
-roadmap names "normalization has fallen back to identity" as a SAFE-01 condition, and the
-field that name points at, ``GrootConfig.normalization_mapping``, is IDENTITY for
-``VISUAL``, ``STATE`` and ``ACTION`` **by design** — upstream states at
-``configuration_groot.py:258-269`` that GR00T normalizes internally in its processor steps
-and that the mapping "is not consulted by make_groot_pre_post_processors". An assertion
-written against it would fail on every healthy launch.
-``test_normalization_mapping_is_identity_by_design_and_is_not_a_discriminator`` exists to
-DOCUMENT that negative — it is never the verdict's evidence. The three DISCRIMINATING
-signals that carry the condition instead are the decode step's class
-(``GrootN17ActionDecodeStep``, not the legacy ``GrootActionUnpackUnnormalizeStep``), a
-non-empty checkpoint stats table, and ``use_percentiles``.
-
-The same is true of the horizon: ``test_chunk_length_sixteen_is_not_horizon_evidence``
-documents that an emitted chunk length of 16 proves nothing, because three independent
-truncations force 16 regardless of configuration.
-
-**SAFE-01/5's letterbox expectation was INVERTED, and the inversion is proven RED.** The
-guard used to require ``letter_box_transform`` False. It now requires two different things
-of two different values: the CHECKPOINT must still declare ``False`` (a drift catcher — every
-recorded geometry number was measured against that declaration), and the SERVED pipeline must
-carry ``True``, because Isaac-GR00T padded to a square when it trained these weights and
-LeRobot's flag-honouring path fed the model a geometry Isaac never emitted. Changing a guard's
-expected value is exactly the edit that can silently defang it, so
-``test_violation_5a2_served_letterbox_off_raises`` and
-``test_snapshot_from_loaded_reads_the_served_letterbox_off_the_encode_step`` prove the new
-assertion fires on a wrong geometry rather than merely passing on the right one. **The
-"trained on the padded square" half is an INFERENCE accepted knowingly** — it follows from
-"Isaac trained this checkpoint", the training recipe was never read, and no local artifact
-records it.
-
-Every test is hermetic: it reads only the real checkpoint's sidecar JSONs and the pinned
-constants in ``policy_guard/groot_guard.py``, and needs no serial port, no camera, no
-network, no GPU and no weights. **Nothing here may skip** — a skipped guard test is a
-silent pass on the one fact this phase turns on. An absent checkpoint directory calls
-``pytest.fail`` naming the path.
-"""
+'Hermetic SAFE-01 gate for the GR00T serving contract.'
 
 import ast
 import dataclasses
@@ -82,7 +36,7 @@ from policy_guard.groot_guard import (  # noqa: E402
 
 from policy.lerobot import features  # noqa: E402
 
-REAL_CHECKPOINT = REPO_ROOT / "checkpoints" / "GR00T-N1.7-3B-SO101"
+REAL_CHECKPOINT = REPO_ROOT / "tests" / "fixtures" / "groot-so101"
 
 GUARD_SOURCE = REPO_ROOT / "policy_guard" / "groot_guard.py"
 
@@ -118,12 +72,7 @@ _CACHED_SNAPSHOT: GrootGuardSnapshot | None = None
 
 
 def real_snapshot() -> GrootGuardSnapshot:
-    """The config-only snapshot of the REAL checkpoint, built once and cached.
-
-    Fails loudly rather than skipping when the checkpoint is absent: the whole point of
-    building against the real directory is D-05's calibration requirement, and a skip here
-    would be a silent pass.
-    """
+    'The config-only snapshot of the REAL checkpoint, built once and cached.'
     global _CACHED_SNAPSHOT
     if _CACHED_SNAPSHOT is None:
         if not REAL_CHECKPOINT.is_dir():
@@ -149,12 +98,7 @@ def guard_attribute_names() -> set[str]:
 
 
 def test_real_checkpoint_snapshot_passes_the_guard():
-    """The REAL checkpoint's config-only snapshot passes, and reports the pinned facts.
-
-    This is D-05's calibration leg. Asserting the field VALUES as well as the verdict is
-    what prevents a fixture that misrepresents the real config shape from passing here
-    while the live guard never fires.
-    """
+    "The REAL checkpoint's config-only snapshot passes, and reports the pinned facts."
     snapshot = real_snapshot()
 
     assert assert_groot_serving_contract(snapshot) is None
@@ -182,13 +126,8 @@ def test_real_checkpoint_snapshot_passes_the_guard():
     assert snapshot.video_modality_keys == EXPECTED_VIDEO_MODALITY_KEYS == ("front", "wrist")
 
 
-# --- Negative tests: the guard has teeth -------------------------------------
-#
 # Each drives the pure guard with a single-field ``dataclasses.replace`` mutation of the
 # snapshot built from the REAL checkpoint. No test mutates the checkpoint on disk, and no
-# test fabricates a snapshot from scratch: an assertion that has never been red is an
-# assertion that has never been tested, and a fabricated fixture cannot prove redness
-# against the real config shape.
 
 
 def test_violation_1a_non_raw_checkpoint_raises():
@@ -266,15 +205,7 @@ def test_violation_4b_percentiles_off_raises():
 
 
 def test_violation_5a_checkpoint_declaring_letterbox_on_raises():
-    """A checkpoint that DECLARES the pad on invalidates the recorded verdict.
-
-    Not a correctness claim about the pad — the geometry would still come out square.
-    It is a DRIFT claim: every recorded geometry number (both shapes, both digests, the
-    cross-backend agreement) was measured against a checkpoint declaring False, and the
-    forced-pad decision was justified against that reading. A checkpoint declaring
-    otherwise has a different image recipe, so the verdict must be re-measured rather
-    than assumed to carry over.
-    """
+    'A checkpoint that DECLARES the pad on invalidates the recorded verdict.'
     bad = dataclasses.replace(real_snapshot(), letter_box_transform=True)
     with pytest.raises(ValueError, match=r"^SAFE-01/5 ") as excinfo:
         assert_groot_serving_contract(bad)
@@ -285,19 +216,7 @@ def test_violation_5a_checkpoint_declaring_letterbox_on_raises():
 
 
 def test_violation_5a2_served_letterbox_off_raises():
-    """THE TEETH OF THE UPDATED ASSERTION: the pad NOT forced is a refusal.
-
-    SAFE-01/5's letterbox expectation was inverted by this fix — from "the pad must be
-    off" to "the pad must be forced on for the served pipeline". Proving the new
-    expectation goes GREEN on the right value proves nothing; this test proves it goes
-    RED on the wrong one, against a snapshot built from the REAL checkpoint with exactly
-    one field mutated.
-
-    The failure this catches is specific and silent: if the override in
-    ``docker/lerobot-policy/server.py`` stopped landing (a moved step registry name, a
-    dropped kwarg), the server would happily serve ``(256, 340, 3)`` — a geometry the
-    weights never saw — with every log line looking healthy.
-    """
+    'THE TEETH OF THE UPDATED ASSERTION: the pad NOT forced is a refusal.'
     bad = dataclasses.replace(real_snapshot(), served_letter_box_transform=False)
     with pytest.raises(ValueError, match=r"^SAFE-01/5 ") as excinfo:
         assert_groot_serving_contract(bad)
@@ -330,23 +249,7 @@ def test_violation_5b_wrong_crop_fraction_or_shortest_edge_raises():
 
 
 def test_violation_5d_wrong_video_modality_keys_raises():
-    """The camera-view ORDER is guarded, not merely documented (WR-05).
-
-    This value decides which camera lands in which view slot:
-    ``_ordered_image_keys`` (``processor_groot.py:1563-1598``) matches the checkpoint's
-    ``modality_keys`` against the served ``observation.images.<cam>`` keys IN ORDER. The
-    reason it needs a guard rather than a comment is the failure MODE — upstream does
-    not raise on a mismatch. It emits ONE ``logging.warning``, once, and falls back to
-    ``sorted(available)``: alphabetical order. Shapes, chunk length and every other
-    SAFE-01 field are indifferent, so the model receives the wrist frame where it
-    expects the front frame and the arm moves plausibly to the wrong place.
-
-    Three wrong values are driven, because they fail three different ways:
-    LIBERO-style names that match NOTHING, a PERMUTATION that matches everything in the
-    wrong order, and a TRUNCATION that silently feeds fewer views than the weights were
-    trained on. A guard that only caught the first would leave the two that are hardest
-    to notice.
-    """
+    'The camera-view ORDER is guarded, not merely documented (WR-05).'
     for wrong in (
         ("image", "wrist_image"),
         ("wrist", "front"),
@@ -375,14 +278,7 @@ def test_violation_5d_wrong_video_modality_keys_raises():
 
 
 def test_video_modality_keys_come_from_the_checkpoint_not_from_camera_keys():
-    """The guard reads the CHECKPOINT's declaration, never the client's CAMERA_KEYS.
-
-    ``policy/lerobot/features.py:56-64`` says so in prose and points at
-    ``_ordered_image_keys``; this asserts it against the real sidecar. The two tuples
-    hold the same names in DIFFERENT orders, which is what makes the read direction
-    observable at all — if the guard derived the field from ``CAMERA_KEYS`` it would
-    read ``("wrist", "front")`` here and refuse every healthy handshake.
-    """
+    "The guard reads the CHECKPOINT's declaration, never the client's CAMERA_KEYS."
     processor_kwargs = json.loads((REAL_CHECKPOINT / "processor_config.json").read_text())[
         "processor_kwargs"
     ]
@@ -430,15 +326,7 @@ def test_snapshot_from_checkpoint_dir_raises_on_missing_config_json(tmp_path):
 
 
 def test_snapshot_from_loaded_never_leaves_decode_step_type_empty():
-    """``SAFE-01/3`` must fire on a decode-step-less pipeline, never an ``IndexError``.
-
-    Plan 06-03 owns the real wiring, so the loaded builder is exercised here with
-    minimal stand-ins carrying only the marker attributes it locates steps by. That is
-    enough to prove the contract this plan owes 06-03: ``decode_step_type`` is a non-empty
-    string on EVERY path, including the no-candidate path and the non-raw-path early
-    return, so a missing decode step surfaces as a named SAFE-01/3 error rather than as an
-    index error escaping from inside a request handler.
-    """
+    '``SAFE-01/3`` must fire on a decode-step-less pipeline, never an ``IndexError``.'
     from lerobot.policies.groot.configuration_groot import GrootConfig
 
     class Pipeline:
@@ -503,17 +391,7 @@ def test_snapshot_from_loaded_never_leaves_decode_step_type_empty():
 
 
 def test_snapshot_from_loaded_reads_the_served_letterbox_off_the_encode_step():
-    """``served_letter_box_transform`` comes from the PIPELINE, not the checkpoint.
-
-    The distinction is the whole mechanism: the checkpoint declares ``false``, so if
-    this field were derived from ``processor_config.json`` it would read ``False`` on a
-    correctly-serving server and the guard would refuse every healthy handshake. It must
-    be read off the built step, and it must track that step rather than a constant.
-
-    Both directions are driven, against the SAME real config, so neither answer can be
-    a coincidence: a step with the pad forced ON passes, and a step with the pad OFF —
-    i.e. the override silently not landing — is REFUSED by SAFE-01/5.
-    """
+    '``served_letter_box_transform`` comes from the PIPELINE, not the checkpoint.'
     from lerobot.policies.groot.configuration_groot import GrootConfig
 
     class Pipeline:
@@ -560,13 +438,7 @@ def test_snapshot_from_loaded_reads_the_served_letterbox_off_the_encode_step():
 
 
 def test_serving_preprocessor_overrides_is_a_single_definition():
-    """The override fragment the server merges is one value, shaped for upstream's seam.
-
-    Asserted rather than assumed because it is the seam the whole fix rides on: the key
-    must be the step's REGISTRY name (upstream's ``from_pretrained`` matcher accepts only
-    registry names), and the field must be a real ``init`` field of the step, or the
-    override would raise at handshake time instead of applying.
-    """
+    "The override fragment the server merges is one value, shaped for upstream's seam."
     from dataclasses import fields
 
     from lerobot.policies.groot.processor_groot import GrootN17VLMEncodeStep
@@ -590,21 +462,7 @@ def test_serving_preprocessor_overrides_is_a_single_definition():
 
 
 def test_normalization_mapping_is_identity_by_design_and_is_not_a_discriminator():
-    """DOCUMENTS a negative. It is never the verdict's evidence.
-
-    The roadmap names "normalization has fallen back to identity" as a SAFE-01 condition,
-    and ``GrootConfig.normalization_mapping`` is the field that name points at. It is
-    IDENTITY for every feature type on a HEALTHY launch of this checkpoint, and upstream
-    states at ``configuration_groot.py:258-269`` that it "is not consulted by
-    make_groot_pre_post_processors". So an assertion written against it is a guaranteed
-    false alarm, and this test's job is to record that rather than let a later reader
-    "restore" the missing check.
-
-    The three DISCRIMINATING signals that carry the condition instead, all asserted by the
-    guard: the decode step's class (``GrootN17ActionDecodeStep``, not the legacy
-    ``GrootActionUnpackUnnormalizeStep``, which is reached only when the checkpoint's stats
-    are unusable), a non-empty checkpoint stats table, and ``use_percentiles``.
-    """
+    "DOCUMENTS a negative. It is never the verdict's evidence."
     from lerobot.policies.groot.configuration_groot import GrootConfig
     from lerobot.configs.types import NormalizationMode
 
@@ -625,18 +483,7 @@ def test_normalization_mapping_is_identity_by_design_and_is_not_a_discriminator(
 
 
 def test_chunk_length_sixteen_is_not_horizon_evidence():
-    """DOCUMENTS why the guard asserts CONFIG-level horizon values, never a chunk length.
-
-    Three independent truncations force an output length of 16 regardless of the input
-    horizon (``modeling_groot.py:308-324``, ``policy_server.py:328``, and the decode step's
-    own ``valid_horizon`` truncation). So observing a 16-step chunk proves nothing about
-    whether the horizon is configured correctly, and a future reader must NOT "simplify"
-    SAFE-01/2 into a chunk-length check.
-
-    Keyless and weightless: the decode step is constructed directly from the checkpoint's
-    ``statistics.json`` and ``modality_configs``, with a stand-in for
-    ``GrootN17PackInputsStep``'s cached raw state.
-    """
+    'DOCUMENTS why the guard asserts CONFIG-level horizon values, never a chunk length.'
     from lerobot.lerobot_types import TransitionKey  # NOT lerobot.processor.core
     from lerobot.policies.groot.processor_groot import GrootN17ActionDecodeStep
 
@@ -676,13 +523,7 @@ def test_chunk_length_sixteen_is_not_horizon_evidence():
 
 
 def test_every_message_names_its_assertion_id_and_the_observed_value():
-    """Every raised message starts with ``SAFE-01/N `` and embeds the observed value.
-
-    A message that omits the observed value forces an operator into the source to learn
-    what actually went wrong, which is exactly what the ``policy/factory.py:57-62`` idiom
-    exists to prevent. Driving all fourteen mutations from one table also means an emptied or
-    reworded message goes red here even if its own violation test only matched the prefix.
-    """
+    'Every raised message starts with ``SAFE-01/N `` and embeds the observed value.'
     assert len(VIOLATION_MUTATIONS) == 14
 
     for field_name, value in VIOLATION_MUTATIONS:

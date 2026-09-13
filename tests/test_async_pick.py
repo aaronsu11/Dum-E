@@ -5,7 +5,7 @@ import time
 import pytest
 from embodiment.so_arm10x.async_pick import AsyncPickSkill
 from policy.lerobot.async_chunks import AsyncSettings,InferenceStopped
-from policy_guard.replay_contract import JOINT_ORDER
+from policy_guard.contracts import JOINT_ORDER
 
 
 class Controller:
@@ -21,6 +21,10 @@ class Policy:
     def __init__(self):
         self._handshaken=True;self._session=SimpleNamespace();self.language_instruction='banana'
         self.calls=[];self.closed=False;self.fail=False
+    def prepare_execution(self, observation, instruction, *, deadline_s):
+        if not self._handshaken:
+            self._handshake()
+        self.get_action(observation, instruction)
     def get_action(self,obs,task):
         self.calls.append((threading.current_thread().name,obs,task))
         if self.fail and len(self.calls)>2:raise RuntimeError('server killed')

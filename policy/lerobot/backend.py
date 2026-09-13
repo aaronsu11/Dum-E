@@ -1,43 +1,4 @@
-"""The ``lerobot`` :class:`~shared.IPolicyBackend`: LeRobot's async policy server
-over loopback gRPC.
-
-This module is the ADAPTER, not the transport. ``policy/lerobot/session.py`` owns
-the channel and the four-method wire; this class owns the things the wire has no
-opinion about: the stored language instruction, the handshake payload, the
-per-episode reset, and — the load-bearing one — the flat ``(16, 6)``-to-named
-action reindex that makes ``get_action`` return the SAME
-``list[dict["<joint>.pos", float]]`` contract that ``groot-native`` returns from
-its modality dict.
-
-Every member is deliberately SYNCHRONOUS. Concurrency is handled at the ``@tool``
-boundary in ``embodiment/so_arm10x/agent.py`` via
-``await asyncio.to_thread(sync_method, *args)``; an ``async def`` here would break
-that offload pattern and every existing call site, and this module must never
-create an event loop of its own.
-
-==================== THE D-11 HANDSHAKE VALUES ====================
-Four handshake values plus the port are read from the environment, each with a
-documented default, and each is a visible ``controller.lerobot_*`` key in
-``config.example.yaml``. ``dum_e.py`` forwards a key ONLY when the config names
-it, so every default lives in exactly one place — right here — and cannot drift
-between the launcher and the process that owns inference.
-
-``actions_per_chunk`` is the one that matters most: **40 is the well-lit wrong
-value**, and it has TWO sources (``GrootConfig``'s own default AND the
-checkpoint's ``config.json: action_horizon: 40``), while 16 is correct. The
-constructor therefore logs every effective value on ONE line, because D-11's whole
-point is that this number must be readable from a log and a config file without
-reading code.
-
-==================== WHY rename_map IS {} ====================
-``RemotePolicyConfig.rename_map`` is deliberately empty and must not be pressed
-into service as the flat-to-named mapper. It feeds
-``RenameObservationsProcessorStep`` *inside* the preprocessor
-(``policy_server.py:160-163``, ``processor_groot.py:1255``), which runs strictly
-AFTER ``raw_observation_to_observation`` has already indexed the observation by
-key — so a ``KeyError`` raised in that earlier step can never be repaired by a
-rename that runs later. See ``policy/lerobot/features.py`` for the full note.
-"""
+"The ``lerobot`` :class:`~shared.IPolicyBackend`: LeRobot's async policy server over loopback gRPC."
 
 import os
 from typing import Any
@@ -77,15 +38,7 @@ DEFAULT_DEVICE = "cuda"
 
 
 class LeRobotPolicyBackend(IPolicyBackend):
-    """The ``lerobot`` policy backend over ``LeRobotPolicySession``.
-
-    Accepts exactly the keyword set ``Gr00tRobotInferenceClient`` accepts, so
-    ``policy.factory.make_policy_backend(**kwargs)`` stays uniform across
-    backends and ``embodiment/so_arm10x/agent.py``'s
-    ``make_policy_backend(host=policy_host)`` call site needs no change. Every
-    value that call site does NOT pass is therefore reachable from the
-    environment instead.
-    """
+    'The ``lerobot`` policy backend over ``LeRobotPolicySession``.'
 
     def __init__(
         self,
@@ -173,43 +126,7 @@ class LeRobotPolicyBackend(IPolicyBackend):
         return self._session.ready()
 
     def reset(self) -> None:
-        """Rebuild the channel and flush the server's per-client observation state.
-
-        **Deliberately does NOT clear ``_handshaken``.** Upstream reloads the
-        policy INSIDE ``SendPolicyInstructions`` (``policy_server.py:151``), so a
-        re-handshake is not a cheap re-ask of a finished question — it is one more
-        full multi-GB weight materialization on a GPU that is already holding one
-        (this phase measured ``cuda_allocated_MiB=6015`` on a 12288 MiB card, so
-        two live copies do not fit). ``scripts/run_pick_baseline.py`` calls this
-        between every scored attempt and ``shared``'s ``session()`` calls it on
-        entry, so a reload here is a per-episode OOM risk and a multi-minute stall,
-        not a one-off cost.
-
-        ``Ready`` alone is what this method actually needs: it calls upstream's
-        ``_reset_server()`` (``policy_server.py:107-113``), which clears
-        ``observation_queue`` and ``_predicted_timesteps`` and leaves the loaded
-        policy in place. It does NOT clear ``last_processed_obs`` — nothing a
-        client can send does — which is why every observation carries
-        ``must_go=True``; that flag short-circuits the similarity filter
-        ``last_processed_obs`` feeds (see ``session.py``'s ``infer``).
-
-        When there IS server-side state to flush — i.e. this backend has already
-        handshaken — the ``Ready`` RAISES on an unreachable or refusing server
-        rather than returning quietly, unlike :meth:`ping`. A reset that silently
-        did nothing is how stale per-client state survives into the next episode
-        and then reads as policy drift.
-
-        Before the first handshake the probe is SKIPPED, deliberately: there is no
-        per-client state on the server to flush yet, so there is nothing that can
-        go stale, and this backend connects lazily — ``IPolicyBackend.session()``
-        calls ``reset()`` on entry, and probing there would turn "the server is not
-        up yet" into a failure at scope entry instead of at the first
-        ``get_action()``, where the handshake's own error message is. The raise
-        condition is therefore exactly "we had state to flush and could not".
-
-        Raises:
-            RuntimeError: if a handshaken backend's server does not answer ``Ready``.
-        """
+        "Rebuild the channel and flush the server's per-client observation state."
         self._session.close()
         self._session = LeRobotPolicySession(f"{self._host}:{self._port}")
         self._closed = False
@@ -218,12 +135,7 @@ class LeRobotPolicyBackend(IPolicyBackend):
             self._session.probe_ready_or_raise()
 
     def close(self) -> None:
-        """Release the gRPC channel. Idempotent.
-
-        A double close — an explicit ``close()`` inside a ``session()`` body plus
-        the ``finally`` — must be a no-op rather than a raise over the original
-        error.
-        """
+        'Release the gRPC channel. Idempotent.'
         if getattr(self, "_closed", False):
             return
         self._closed = True
@@ -237,21 +149,7 @@ class LeRobotPolicyBackend(IPolicyBackend):
     def get_action(
         self, observation_dict: dict[str, Any], lang: str | None = None
     ) -> list[dict[str, float]]:
-        """Run one inference step and return the horizon of named joint targets.
-
-        Args:
-            observation_dict: The FLAT observation ``IRobotController.get_observation()``
-                produces — ``{"<joint>.pos": float}`` for six joints plus
-                ``{cam: HxWx3 uint8}`` per camera.
-            lang: Instruction to condition on; falls back to the stored one.
-
-        Returns:
-            ``list[dict["<joint>.pos", float]]`` of length ``actions_per_chunk``.
-
-        Raises:
-            ValueError: when no instruction is available (before any gRPC call).
-            RuntimeError: on a transport failure or a malformed chunk.
-        """
+        'Run one inference step and return the horizon of named joint targets.'
         # Fail closed on a missing instruction BEFORE any transport send: the
         # server accepts a null task and returns motion conditioned on nothing,
         # which reads downstream as checkpoint drift instead of as the
@@ -270,10 +168,6 @@ class LeRobotPolicyBackend(IPolicyBackend):
 
         # The FLAT raw observation this wire expects. Deliberately NOT the nested
         # {video, state, language} GR00T shape: that nesting belongs to the ZMQ
-        # wire (embodiment/so_arm10x/controller.py builds it), whereas this wire's
-        # SERVER does the packing itself via raw_observation_to_observation() plus
-        # the preprocessor. The two backends' observation shapes differ BY DESIGN
-        # — do not "unify" them.
         raw_observation: dict[str, Any] = {
             name: float(observation_dict[name]) for name in self._state_names
         }
@@ -308,11 +202,6 @@ class LeRobotPolicyBackend(IPolicyBackend):
                 )
             # self._state_names — NOT a hardcoded list — is the ordering
             # authority, because build_dataset_frame builds the state vector by
-            # iterating exactly that list
-            # (lerobot/utils/feature_utils.py:131-132), so client and server agree
-            # by construction rather than by coincidence. strict=True is
-            # load-bearing: a silent length mismatch here is a whole-arm failure
-            # that every shape check passes.
             actions.append(
                 {
                     name: float(value)
@@ -342,12 +231,7 @@ class LeRobotPolicyBackend(IPolicyBackend):
 
 
 def _as_float_list(action: Any) -> list[float]:
-    """Flatten one action into a plain list of floats.
-
-    Duck-typed rather than ``torch``-typed: the real server sends torch tensors
-    and the mock sends the same, but this module has no other reason to import
-    torch, and a numpy array or a plain list must decode identically.
-    """
+    'Flatten one action into a plain list of floats.'
     if hasattr(action, "detach"):
         action = action.detach().cpu()
     if hasattr(action, "tolist"):

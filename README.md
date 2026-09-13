@@ -91,9 +91,18 @@ are mounted at runtime, never baked into the image.
     export HF_TOKEN=<your-hf-token>
     # SO101 fruit-picking checkpoint (mounted :ro at runtime)
     uv run hf download aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking \
+        --revision 26b179c37f35168359ccdf2e51fed6c2690186cf \
         --local-dir ./checkpoints/GR00T-N1.7-3B-SO101 --exclude "optimizer.pt"
     # Gated backbone (read from the mounted HF cache at runtime)
-    uv run hf download nvidia/Cosmos-Reason2-2B
+    uv run python - <<'PYCODE'
+    from pathlib import Path
+    from huggingface_hub import snapshot_download
+    revision = "9ce19a195e423419c349abfc86fd07178b230561"
+    snapshot = Path(snapshot_download("nvidia/Cosmos-Reason2-2B", revision=revision))
+    refs = snapshot.parent.parent / "refs"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "main").write_text(revision)
+    PYCODE
     ```
 
 3. Build the image at the pinned commit. The wrapper delegates to the upstream
@@ -131,7 +140,7 @@ are mounted at runtime, never baked into the image.
     The server is ready once port `5555` is listening and the model has finished
     loading (GPU memory settles). Keep the container running while you use the policy
     for inference. Note the server's IP (`<policy_host>`) and make sure port 5555 is
-    reachable from the client.
+    reachable through a loopback tunnel from a remote client.
 
 > [!NOTE]
 > **Security:** the server has no auth by default. Publish/bind `:5555` to `localhost`
@@ -139,136 +148,20 @@ are mounted at runtime, never baked into the image.
 > `scripts/build_gr00t_image.sh` (SHA-pinned), never an ad-hoc `docker build`, so the
 > image provenance stays locked to the verified upstream commit.
 
-#### 🧩 LeRobot-Native Policy Server (`lerobot-policy`)
-> Requires 1) NVIDIA GPU 2) Linux or WSL2 3) Docker with the NVIDIA Container Runtime
+#### Additional policy servers and validation
 
-`DUME_POLICY_BACKEND=lerobot` (the default) talks to a **different container** from the
-one above: LeRobot's own async policy server, serving the *same* fine-tuned
-`GR00T-N1.7-3B-SO101` checkpoint **unconverted** over gRPC on `8080`. The GR00T-native
-container above stays available as the `groot-native` fallback, and the two are
-**mutually exclusive processes** — they do not both fit on one 12 GB card — not a pair
-you run side by side.
+Dum-E includes LeRobot GR00T, native G0.5, mapped Pi0.5 and MolmoAct 2 serving.
+The launcher defaults to native GR00T; choose another backend explicitly.
 
-1. Download the checkpoint. Skip this if you already did it for the GR00T-native
-   container above; it is the same checkpoint directory, mounted read-only both times.
+- [Build, checkpoints and supported routes](docs/POLICY-SERVING.md)
+- [SO101 cameras, calibration and joint mapping](docs/SO101-POLICY-CONTRACTS.md)
+- [Reproduce tests, benchmarks and bounded trials](docs/POLICY-VALIDATION.md)
+- [GR00T async and Pi0.5 RTC](docs/ASYNC-INFERENCE.md)
+- [EC2 deployment and network measurements](docs/EC2-INFERENCE.md)
+- [Add another embodiment, including a future R1 Pro integration](docs/EXTENDING-EMBODIMENTS.md)
 
-    ```bash
-    uv run hf download aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking \
-        --local-dir ./checkpoints/GR00T-N1.7-3B-SO101 --exclude "optimizer.pt"
-    ```
-
-    You do **not** pre-fetch the gated `nvidia/Cosmos-Reason2-2B` backbone into the host
-    Hugging Face cache for this container. It is baked into the image at a pinned
-    revision by step 2, and the container then runs with `HF_HUB_OFFLINE=1` so it can
-    never silently pull a different revision.
-
-2. Build the image. The wrapper is fail-closed: it refuses to build without a token,
-   refuses to build if the pinned backbone cache cannot satisfy an *offline* processor
-   build, and refuses to tag the `lerobot-policy` name onto an image whose backbone
-   layer does not carry the pinned revision SHA.
-
-    ```bash
-    bash scripts/build_lerobot_policy_image.sh
-    ```
-
-    `HF_TOKEN` is needed **at build time only**, because `nvidia/Cosmos-Reason2-2B` is a
-    gated repo. It is passed to BuildKit as a `--secret` (never a `--build-arg`, which
-    would land in the image history), and the wrapper reads it from the repo-root `.env`
-    if it is not exported. It is never baked into the image and never needed at run time.
-
-3. Start the policy server. Remove any previous container first:
-
-    ```bash
-    docker rm -f lerobot-policy-server 2>/dev/null || true
-    ```
-
-    The command below is the **only** documented run command for this container, and its
-    publish spec is a security contract rather than a default — see the divergences
-    immediately after it.
-
-    # lerobot-policy container (LRG-06: loopback publish only)
-    ```bash
-    docker run -d \
-        --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
-        -p 127.0.0.1:8080:8080 \
-        -v "$(pwd)/checkpoints/GR00T-N1.7-3B-SO101:/checkpoints/model:ro" \
-        --name lerobot-policy-server \
-        lerobot-policy
-    ```
-
-    **Three deliberate divergences from the GR00T-native `docker run` block above.** They
-    are differences on purpose — do not "restore parity":
-
-    - **The published port carries a mandatory `127.0.0.1:` host-IP prefix.** The
-      GR00T-native line above publishes `5555` with no host-IP prefix at all. For *this*
-      container the prefix **is** the access control: LeRobot's async gRPC transport
-      `pickle.loads` peer bytes in **both** directions by upstream design, so anyone who
-      can reach the port can execute code in the server process. There is no auth to add
-      on top. Dropping the prefix silently converts an accepted, mitigated risk into an
-      unmitigated one. `--network host` was considered and **rejected** for the same
-      reason: it would place the server on every interface with no publish spec to
-      constrain it. Inside the container the server deliberately binds `0.0.0.0` (a
-      container-internal loopback bind is unreachable from the host) — the loopback
-      guarantee lives here, in the publish spec, and nowhere else.
-    - **It mounts only the fine-tuned checkpoint.** There is no Hugging Face cache mount
-      and no `-e HF_TOKEN`, both of which the GR00T-native block above legitimately needs.
-      The backbone is baked into this image at the pinned revision with `HF_HUB_OFFLINE=1`,
-      and the token is a *build* secret, so a runtime token would be a credential handed
-      to a process that has no use for it.
-    - **The build wrapper vendors a Dockerfile instead of delegating to upstream.**
-      `scripts/build_gr00t_image.sh` is a thin delegator to Isaac-GR00T's own
-      `docker/build.sh`; LeRobot ships **no** policy-server image build, so there is
-      nothing to delegate to. The reproducibility anchor is therefore a pip pin
-      (`lerobot==0.6.1`) plus an HF revision SHA rather than a git SHA.
-
-    **The GR00T-native block's `5555` publish line above is deliberately left unchanged.**
-    Narrowing the GR00T-native container's reachability would change the fallback path the
-    live parity gate runs on, which is a different failure axis and a different decision.
-    If it is ever tightened, that should be its own change with its own verification — not
-    a side effect of documenting this container.
-
-4. Verify the refusal path without starting a server. The container runs a six-check
-   preflight before it constructs the gRPC server, and it **refuses to serve** rather than
-   warning: an absent or wrong checkpoint mount, a non-raw checkpoint, an action horizon
-   that is not the checkpoint's real 16, a SAFE-01 serving-contract violation, a missing or
-   mismatched pinned backbone snapshot, or a processor build that cannot reach its offline
-   cache each print a red `FAIL:` naming the observed value and exit non-zero before
-   anything listens. A check that never runs at all also fails, rather than passing quietly.
-   `--preflight-only` runs exactly those checks and exits with their verdict, constructing
-   no server:
-
-    ```bash
-    docker run --rm --gpus all \
-        -v "$(pwd)/checkpoints/GR00T-N1.7-3B-SO101:/checkpoints/model:ro" \
-        lerobot-policy python3 /app/docker/lerobot-policy/entrypoint.py --preflight-only
-    ```
-
-    A wrong mount matters more than it looks: with `base_model_path` unset, LeRobot falls
-    back to the hub model `nvidia/GR00T-N1.7-3B`, so the server would serve **base** weights
-    instead of the SO101 fine-tune while every log line looked healthy.
-
-> [!NOTE]
-> **Security:** this server has no auth, and its wire is `pickle` in both directions by
-> upstream design. Publish it on `127.0.0.1` only, exactly as documented above — that
-> publish spec is the whole mitigation. Never route it off-host and never use
-> `--network host`. Always build via `scripts/build_lerobot_policy_image.sh`, never an
-> ad-hoc `docker build`, so the `lerobot==0.6.1` pin and the pinned backbone revision
-> both stay enforced.
-
-> [!NOTE]
-> **Two recorded conventions for this container**, written down so they are not
-> re-litigated:
->
-> - **`docker/` stays script-driven; no `docker compose` file is added.** The publish spec
->   above is the sole mitigation for a `pickle`-in-both-directions wire, and a compose file
->   would create a **second source of truth** for it — the one thing that must not have two,
->   since the guard that enforces it reads exactly one documented command. Revisit only if a
->   future phase needs the three policy containers started together, and then *move* the
->   guard with it rather than duplicating the spec.
-> - **Naming:** the image/tag is `lerobot-policy`, the running container is
->   `lerobot-policy-server`, and the in-container checkpoint mount path is
->   `/checkpoints/model` — the same mount path the GR00T-native block above uses, so an
->   operator reads one pattern across both runbooks.
+The additional policies have bounded plumbing validation, not general task-accuracy
+qualification. Model support does not imply a matching robot/embodiment mapping.
 
 #### On Single Workstation or Client
 
@@ -295,7 +188,7 @@ you run side by side.
 > If you have never set up SO-ARM before:
 > - Find the `wrist_cam_idx` and `front_cam_idx` by running `lerobot-find-cameras`
 > - Find the `robot_port` of by running `lerobot-find-port`
-> - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `robot_id`. For example with SO-101, run: `lerobot-calibrate --robot.type=so101_follower --robot.port=<robot_port> --robot.id=<robot_id>`
+> - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `robot_id`. For example with SO-101, run: `lerobot-calibrate --robot.type=so_follower --robot.port=<robot_port> --robot.id=<robot_id>`
     
 
 4. Configure Dum-E
@@ -504,22 +397,4 @@ This project builds on top of the following open-source projects:
 
 *Built with ❤️ for the future of robotics*
 
-</div> 
-
-
-### Inference observation modes
-
-Normal native serving (the command above) and new LeRobot image builds default
-to the shared lightweight observer. It logs chunk time, backbone metadata and
-flow steps without per-operation interception. Existing images must be rebuilt
-or explicitly launched with the current read-only source mounts and wrapper.
-
-- Native: `--observer-mode lightweight|off|exhaustive`.
-- LeRobot: `DUME_CHUNK_OBSERVER=lightweight|off|exhaustive`.
-- Source-bound Phase 7 diagnostics: keep the original entrypoint with
-  `DUME_PARITY_ATTESTATION_PATH`, or select `exhaustive` explicitly with the new
-  wrapper. Lightweight/off modes refuse that attestation path.
-
-Exhaustive telemetry alone is not a release attestation. The original model
-configuration, controller safety controls and historical evidence remain separate
-from observation mode. See `docs/SHARED-CHUNK-OBSERVER.md`.
+</div>

@@ -92,8 +92,6 @@ def test_relaxed_probe_reaches_target_without_feedback_but_keeps_slew_and_total_
 
 
 def test_six_degree_probe_keeps_other_joints_and_tracking_limit(monkeypatch):
-    from policy_guard.integration_trial import PROTOCOL
-    monkeypatch.setitem(PROTOCOL, "max_excursion", 6.)
     origin = np.array([0.] * 5 + [50.])
     target = probe_target(origin, 6.)
     limits = (np.array([-180.] * 5 + [0.]), np.array([180.] * 5 + [100.]))
@@ -102,7 +100,7 @@ def test_six_degree_probe_keeps_other_joints_and_tracking_limit(monkeypatch):
         for _ in range(40):
             observed = previous if follows else origin
             command = bounded_command(target, observed, previous, origin, limits,
-                                      max_tracking_error=3.75)
+                                      max_tracking_error=3.75, max_excursion=6.)
             assert np.max(abs(command - previous)) <= 0.25
             assert np.max(abs(command - observed)) <= 3.75
             assert np.max(abs(command - origin)) <= 6.

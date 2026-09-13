@@ -1,13 +1,4 @@
-"""
-Standardized run-time and logging configuration for Dum-E.
-
-This module provides:
-- Clean, structured logging without verbose output using loguru
-- Custom callback handler that filters out binary data and signatures
-- Configurable log levels and formatters
-- Integration with voice assistant for clean terminal output
-- Config file loading utilities
-"""
+'Standardized run-time and logging configuration for Dum-E.'
 
 import inspect
 import json
@@ -43,42 +34,17 @@ class CleanFormatter(logging.Formatter):
 
 
 class RobotCallbackHandler:
-    """
-    Clean callback handler for robot agent that filters out verbose content.
-
-    This handler follows the same pattern as PrintingCallbackHandler but provides:
-    - Filters out binary data (images, signatures)
-    - Structured, readable output with emojis
-    - Integrates cleanly with voice assistant
-    - Focuses on task progress and completion
-    """
+    'Clean callback handler for robot agent that filters out verbose content.'
 
     def __init__(self, log_level: str = "INFO", show_thinking: bool = False):
-        """
-        Initialize the clean callback handler.
-
-        Args:
-            log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-            show_thinking: Whether to show reasoning content (default: False)
-        """
+        'Initialize the clean callback handler.'
         self.log_level = log_level.upper()
         self.show_thinking = show_thinking
         self.tool_count = 0
         self.previous_tool_use = None
 
     def __call__(self, **kwargs: Any) -> None:
-        """
-        Main callback method that processes strands agent events.
-
-        This follows the same signature as PrintingCallbackHandler but with clean filtering.
-
-        Args:
-            **kwargs: Callback event data including:
-            - reasoningText (Optional[str]): Reasoning text (filtered unless show_thinking=True)
-            - data (str): Text content to display
-            - complete (bool): Whether this is the final chunk of a response
-            - current_tool_use (dict): Information about the current tool being used
-        """
+        'Main callback method that processes strands agent events.'
         reasoning_text = kwargs.get("reasoningText", "")
         data = kwargs.get("data", "")
         complete = kwargs.get("complete", False)
@@ -159,22 +125,7 @@ class RobotCallbackHandler:
 
 
 class InterceptHandler(logging.Handler):
-    """Forward stdlib ``logging`` records into loguru.
-
-    Why this exists: LeRobot's motion clamp warns
-    via ``lerobot.robots.utils.ensure_safe_goal_position`` -> the *module-level*
-    ``logging.warning``, i.e. the stdlib **root** logger. With no handler on root,
-    that call auto-invokes ``basicConfig()`` and installs a ``StreamHandler`` on
-    **stderr** — while Dum-E's loguru sink writes to **stdout**. Two disjoint
-    streams, and before this handler the repo had no bridge at all, so a
-    safety-relevant warning was emitted and architecturally invisible: wrong
-    stream, unformatted, outside loguru, and never reaching the message broker or
-    the voice narration.
-
-    Installing this on root also has a second effect worth naming: once root has
-    a handler, ``logging.warning`` stops auto-installing the stderr one, so the
-    record travels to loguru instead of being duplicated onto another stream.
-    """
+    'Forward stdlib ``logging`` records into loguru.'
 
     def emit(self, record: logging.LogRecord) -> None:
         # Map the stdlib level onto loguru's, falling back to the numeric level
@@ -186,13 +137,6 @@ class InterceptHandler(logging.Handler):
 
         # Walk out of the logging machinery so loguru reports the ORIGINATING
         # frame rather than this handler or a `logging/__init__.py` internal.
-        # Without this the clamp warning would be attributed to Dum-E's logging
-        # setup instead of to lerobot, which is actively misleading when someone
-        # greps the log to find where a clamp came from.
-        #
-        # Starts at THIS frame (`emit`, which lives in utils.py) and always steps
-        # at least once — hence the `depth == 0` clause — then skips every frame
-        # belonging to the stdlib logging module.
         frame, depth = inspect.currentframe(), 0
         while frame is not None and (
             depth == 0 or frame.f_code.co_filename == logging.__file__
@@ -206,16 +150,7 @@ class InterceptHandler(logging.Handler):
 
 
 def install_stdlib_to_loguru_bridge() -> bool:
-    """Install :class:`InterceptHandler` on the stdlib ROOT logger, idempotently.
-
-    Returns:
-        ``True`` when a handler was added, ``False`` when one was already
-        present.
-
-    Idempotence is load-bearing: a duplicated handler duplicates every bridged
-    record, and a clamp warning appearing twice reads as the clamp having fired
-    twice.
-    """
+    'Install :class:`InterceptHandler` on the stdlib ROOT logger, idempotently.'
     root = logging.getLogger()
     if any(isinstance(handler, InterceptHandler) for handler in root.handlers):
         return False
@@ -235,15 +170,7 @@ _logging_configured = False
 def setup_robot_logging(
     log_level: str = "INFO", include_timestamps: bool = True
 ) -> None:
-    """
-    Setup standardized logging for the robot system using loguru.
-
-    If loguru already has handlers (e.g., from pipecat), skip custom setup.
-
-    Args:
-        log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        include_timestamps: Whether to include timestamps in console output
-    """
+    'Setup standardized logging for the robot system using loguru.'
     global _logging_configured
 
     # Only configure once to avoid duplicate handlers
@@ -301,15 +228,7 @@ def setup_logging(log_level: str = "INFO", include_timestamps: bool = True) -> N
 
 
 def create_clean_callback_handler(show_thinking: bool = False) -> RobotCallbackHandler:
-    """
-    Create a clean callback handler for robot agents.
-
-    Args:
-        show_thinking: Whether to show model reasoning (default: False for clean output)
-
-    Returns:
-        Configured callback handler
-    """
+    'Create a clean callback handler for robot agents.'
     return RobotCallbackHandler(show_thinking=show_thinking)
 
 

@@ -1,41 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone hardware-free mock LeRobot async-inference server (gRPC on :8080).
-
-Speaks the EXACT four-method ``transport.AsyncInference`` contract that
-``lerobot.async_inference.policy_server`` serves, with NO GPU, NO model, and NO
-checkpoint. This is the gRPC sibling of ``scripts/mock_policy_server.py`` (the
-``zmq.REP`` mock for the ``groot-native`` backend). Reusable two ways:
-
-  * imported by ``tests/test_lerobot_backend.py`` and
-    ``tests/test_container_contract.py`` via ``start_mock(port)`` for an
-    in-process real-socket round trip (the container-boundary probe);
-  * run standalone by an operator to exercise a client against a fake server.
-
-It mirrors the bytes on the wire (the FIXED transport boundary), not policy
-quality: ``GetActions`` always returns zeros of the correct shape.
-
-Usage:
-    uv run python scripts/mock_grpc_policy_server.py                 # bind 127.0.0.1:8080
-    uv run python scripts/mock_grpc_policy_server.py --port 8081     # custom port
-    uv run python scripts/mock_grpc_policy_server.py --mode empty    # inject a failure
-
-Contract served (see policy/lerobot/session.py's PINNED WIRE CONTRACT block):
-    Ready(Empty)                        -> Empty
-    SendPolicyInstructions(PolicySetup) -> Empty
-        PolicySetup.data = pickle.dumps(RemotePolicyConfig)
-    SendObservations(stream Observation) -> Empty
-        Observation.data = pickle.dumps(TimedObservation), split across messages
-        by send_bytes_in_chunks' TRANSFER_BEGIN/MIDDLE/END state machine
-    GetActions(Empty)                   -> Actions
-        Actions.data = pickle.dumps(list[TimedAction]), 16 actions of shape (6,)
-
-Injectable failure modes (``MOCK_MODES``) exist so the client's guards are
-PROVABLE rather than merely written:
-    "ok"      -> the contract above
-    "empty"   -> GetActions returns Actions(data=b"") (the zero-length path)
-    "refuse"  -> SendPolicyInstructions aborts FAILED_PRECONDITION (the
-                 non-retryable path a SAFE-01 guard refusal takes)
-"""
+'Standalone hardware-free mock LeRobot async-inference server (gRPC on :8080).'
 
 import argparse
 import os
@@ -65,12 +29,7 @@ MOCK_MODES = ("ok", "empty", "refuse")
 
 
 class MockAsyncInferenceServicer(services_pb2_grpc.AsyncInferenceServicer):
-    """The four-method wire, and nothing else.
-
-    Records the last handshake and the last observation on the instance so a
-    test can assert what the CLIENT sent without reaching for a global. The
-    started server exposes this object as ``server.dume_servicer``.
-    """
+    'The four-method wire, and nothing else.'
 
     def __init__(self, mode: str = "ok") -> None:
         self.mode = mode
@@ -78,10 +37,6 @@ class MockAsyncInferenceServicer(services_pb2_grpc.AsyncInferenceServicer):
         self.last_observation = None
         # Per-method CALL COUNTS, not just the last payload. The two handshake
         # halves cost wildly different things on the real server — ``Ready`` flushes
-        # per-client state, ``SendPolicyInstructions`` reloads multi-GB weights
-        # (``policy_server.py:151``) — so "how many times was each called" is the
-        # only thing that can distinguish a cheap reset from an accidental reload,
-        # and a keyless test must be able to assert it without a GPU.
         self.ready_calls = 0
         self.handshake_calls = 0
         # Injection point for a NON-UNIFORM action vector, so a test can prove
@@ -120,12 +75,7 @@ class MockAsyncInferenceServicer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
-        """``stream Observation -> Empty``, reassembling the chunked payload.
-
-        The client sends via ``send_bytes_in_chunks``, so the server MUST consume
-        every message in the iterator: a client-streaming handler that returns
-        early leaves the client blocked on an unread stream.
-        """
+        '``stream Observation -> Empty``, reassembling the chunked payload.'
         buffer = bytearray()
         for item in request_iterator:
             if item.transfer_state == services_pb2.TRANSFER_BEGIN:
@@ -140,10 +90,6 @@ class MockAsyncInferenceServicer(services_pb2_grpc.AsyncInferenceServicer):
         if self.mode == "empty":
             # NOT a hypothetical. Upstream's GetActions wraps its whole body in a
             # blanket `except Exception` and returns services_pb2.Empty() from a
-            # method DECLARED to return Actions (policy_server.py:214-266). protobuf
-            # serializes that mismatch to b'', so the client sees a SUCCESSFUL RPC
-            # carrying zero bytes. This mode is what proves the client's
-            # zero-length check has teeth instead of an EOFError out of pickle.
             return services_pb2.Actions(data=b"")
 
         vector = self.action_vector
@@ -167,30 +113,7 @@ class MockAsyncInferenceServicer(services_pb2_grpc.AsyncInferenceServicer):
 
 
 def start_mock(port: int, host: str = "127.0.0.1", mode: str = "ok") -> grpc.Server:
-    """Start a mock AsyncInference server on ``host:port`` and RETURN the handle.
-
-    DELIBERATE DIVERGENCE from ``scripts/mock_policy_server.py``: the ZMQ
-    sibling is stopped by a ``"kill"`` endpoint because a ``zmq.REP`` loop has no
-    other exit, so its teardown had to become part of its wire. This mock returns
-    the ``grpc.Server`` and callers stop it with ``server.stop(grace=0)``, which
-    is gRPC's first-class equivalent of the ZMQ mock's ``LINGER=0`` teardown. Do
-    NOT "restore parity" by adding a ``"kill"``-style sentinel RPC: that would add
-    a FIFTH method to the four-method wire this phase exists to pin, and the mock
-    would stop being the contract.
-
-    Args:
-        port: TCP port to bind. Tests pass an ephemeral port; never hard-code.
-        host: Bind host. Defaults to loopback (see ``main``'s ``--host``).
-        mode: One of ``MOCK_MODES``.
-
-    Returns:
-        The started ``grpc.Server``, with the servicer instance attached as
-        ``server.dume_servicer``.
-
-    Raises:
-        ValueError: on an unknown ``mode``, naming the value and the allowed set
-            (the ``policy/factory.py`` fail-closed idiom).
-    """
+    'Start a mock AsyncInference server on ``host:port`` and RETURN the handle.'
     if mode not in MOCK_MODES:
         raise ValueError(
             f"mode={mode!r} is not a known mock mode; allowed values are "
@@ -209,12 +132,7 @@ def start_mock(port: int, host: str = "127.0.0.1", mode: str = "ok") -> grpc.Ser
 
 
 def serve_mock(port: int, host: str = "127.0.0.1", mode: str = "ok") -> None:
-    """Blocking wrapper: start, then wait for termination.
-
-    Keeps the operator-facing two-positional-argument shape of
-    ``scripts/mock_policy_server.py``'s ``serve_mock(port, host)``. The
-    ``try/finally`` means a ``KeyboardInterrupt`` cannot leave a bound port.
-    """
+    'Blocking wrapper: start, then wait for termination.'
     server = start_mock(port, host=host, mode=mode)
     try:
         server.wait_for_termination()

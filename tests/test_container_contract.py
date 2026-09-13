@@ -1,51 +1,4 @@
-"""CI-runnable container contract probe + stack-isolation guard.
-
-Every test here is CI-runnable with NO live policy server, NO GPU, and NO SO101
-hardware. Unlike ``tests/test_gr00t_service.py`` (which mocks the ZMQ socket with
-a ``MagicMock``), this module stands up the real ``scripts/mock_policy_server.py``
-``zmq.REP`` server on an EPHEMERAL loopback port and connects a *real*
-``ExternalRobotInferenceClient`` over actual TCP — proving the msgpack/numpy
-bytes survive a real socket, i.e. the container boundary.
-
-Surfaces covered:
-- Wire contract: the :5555 ``MsgSerializer`` contract is preserved across a real
-  socket (get_action 2-tuple with single_arm (1,16,5) / gripper (1,16,1) float32;
-  ping non-error; {"error": ...} reply -> RuntimeError).
-- BOTH backend legs: the same three rules — a real socket round trip returns a
-  correctly-shaped chunk, ``ping()`` is truthy against a live mock, and a
-  server-side error reply raises ``RuntimeError`` — are asserted on the
-  ``groot-native`` ZMQ leg AND the ``lerobot`` gRPC leg, parametrized over
-  ``BACKEND_LEGS`` rather than duplicated, because the two legs' return SHAPES
-  differ by design while the RULE is shared.
-- Dependency isolation: the client's declared ``lerobot`` extras stay
-  within an allowlist with ``feetech`` required, the pin stays exact, no
-  server-only GPU or model package is a DIRECT dependency, the resolved closure
-  from ``uv.lock`` carries no server-only package, and ``requires-python`` stays
-  ``>=3.12``. The client is Py3.12. The two policy servers differ and the
-  distinction matters: the Isaac-GR00T container is Py3.10, while the newer
-  ``lerobot-policy`` container is Py3.12 because ``lerobot==0.6.1`` declares
-  ``Requires-Python: >=3.12``.
-  Six negative tests drive the helpers with synthetic input to prove the guard
-  actually fails when a violation is injected.
-
-Scope — this guard is a LOCAL pytest gate, and no CI workflow is created.
-Recorded as a decision so a later reader does not read the absent workflow as an
-oversight. The reasoning: this is one developer on one machine with the arm
-attached to it, so CI's value (which scales with contributors and machines) is
-small here; the guard runs in the suite before every commit; the word "CI" in
-the requirement's own text names this contract-test file rather than a hosted
-service; and the realistic GPU-dependency leak arrives with the
-``lerobot[groot]`` extra, where a local ``pytest`` run catches it. The
-requirement is therefore satisfied at the pytest level.
-
-What this guard deliberately does NOT assert: that ``torch`` or the nvidia CUDA
-wheels are absent from the RESOLVED environment. ``torch`` is an unconditional
-base dependency of ``lerobot`` and the CUDA wheels resolve with it, so such an
-assertion is unsatisfiable by construction and its inevitable remedy is to weaken
-the guard. See ``FORBIDDEN_RESOLVED_PACKAGES``.
-
-No live policy server, no GPU, no hardware is required; the suite completes fast.
-"""
+'CI-runnable container contract probe + stack-isolation guard.'
 
 import os
 import re
@@ -147,22 +100,8 @@ def _client(port: int) -> ExternalRobotInferenceClient:
     )
 
 
-# --- The two backend legs ----------------------------------------------------
-#
 # The same three RULES hold on both backends over a real loopback socket: a round
 # trip returns a correctly-shaped chunk, ping() is truthy against a live mock, and
-# a server-side error reply raises RuntimeError. The ASSERTION BODIES cannot be
-# shared, because the two legs' return shapes differ BY DESIGN:
-#
-#   groot-native : the ZMQ transport returns an (action_chunk, info) tuple of
-#                  modality arrays {single_arm: (1,16,5), gripper: (1,16,1)}
-#   lerobot      : the backend returns list[dict["<joint>.pos", float]], len 16
-#
-# So the parametrization carries a THIRD element, ``assert_chunk``, holding each
-# leg's own shape assertion. Forcing one body onto both legs would either weaken
-# the incumbent groot-native assertions or fabricate a shape the lerobot leg does
-# not produce. The groot-native assertions below are the incumbent contract,
-# copied unchanged.
 
 
 class _ZmqLegMock:
@@ -386,13 +325,7 @@ BACKEND_ERROR_CASES = tuple(
 
 @pytest.mark.parametrize("leg", BACKEND_LEGS, ids=lambda leg: leg.id)
 def test_real_socket_get_action_returns_the_leg_contract(leg):
-    """A real client over real TCP returns THIS leg's chunk contract.
-
-    Proves the bytes survive an actual socket round trip — the container
-    boundary — for both backends. The assertion is on the DECODED chunk, never on
-    the call merely returning: the lerobot wire can deliver a SUCCESSFUL RPC
-    carrying zero bytes, which a "did it return" check would pass.
-    """
+    "A real client over real TCP returns THIS leg's chunk contract."
     port = _free_port()
     server = leg.mock_factory(port)
     try:
@@ -424,13 +357,7 @@ def test_real_socket_ping_returns_truthy(leg):
     "leg,case", BACKEND_ERROR_CASES, ids=lambda item: getattr(item, "id", "")
 )
 def test_real_socket_error_reply_raises_runtimeerror(leg, case):
-    """A server-side error reply over a real socket raises RuntimeError, on both legs.
-
-    The match is per-shape rather than a bare ``RuntimeError``: on the lerobot leg
-    the two shapes are a non-retryable FAILED_PRECONDITION refusal and a
-    zero-length action payload, and accepting any RuntimeError would let the
-    zero-length guard be replaced by an EOFError without the suite noticing.
-    """
+    'A server-side error reply over a real socket raises RuntimeError, on both legs.'
     port = _free_port()
     server = case.start(port)
     try:
@@ -441,13 +368,7 @@ def test_real_socket_error_reply_raises_runtimeerror(leg, case):
 
 
 def test_both_legs_bind_distinct_ephemeral_ports_in_one_session():
-    """BACK-07 adjacency edge, at the suite level: the two mocks coexist.
-
-    Two mocks that collided on a port would make the parametrized suite above
-    pass or fail depending on test ORDER — the worst kind of green. Both legs are
-    started in one test, both are exercised, one is stopped, and the other is
-    proven to still answer.
-    """
+    'BACK-07 adjacency edge, at the suite level: the two mocks coexist.'
     ports = {leg.id: _free_port() for leg in BACKEND_LEGS}
     assert len(set(ports.values())) == len(BACKEND_LEGS), ports
 
@@ -477,59 +398,14 @@ def test_both_legs_bind_distinct_ephemeral_ports_in_one_session():
 # --- Dependency isolation guard ---------------------------------------------
 
 # RECORDED SUPPLY-CHAIN GATE — the two packages the ``async`` extra introduces.
-#
 # Widening the allowlist below to include ``async`` pulls exactly two names into
-# the client closure, and BOTH were reviewed and approved by a human before the
-# single ``uv add`` ran. Recorded here, at the guard that lets them in, so the
-# approval is greppable from the code rather than buried in a chat log:
-#
-#   * ``grpcio``   — the gRPC project's official PyPI distribution
-#     (https://pypi.org/project/grpcio/, homepage https://grpc.io). GENUINELY
-#     NEW to the closure. Declared by the installed wheel's own metadata as
-#     ``grpcio<2.0.0,>=1.73.1; extra == "grpcio-dep"``
-#     (lerobot-0.6.1.dist-info/METADATA:81) — upstream's range, not one this
-#     project chose — and named by lerobot's own fail-closed import guard:
-#     ``import lerobot.transport`` raises "'grpcio' is required but not
-#     installed. Install it with: pip install 'lerobot[grpcio-dep]'".
-#   * ``protobuf`` — Google's Protocol Buffers runtime
-#     (https://pypi.org/project/protobuf/). Declared as
-#     ``protobuf<8.0.0,>=6.31.1; extra == "grpcio-dep"`` (METADATA:82) and
-#     ALREADY RESOLVED at 6.33.6, so it is not actually entering the
-#     environment — only being re-declared through an extra.
-#
-# An automated legitimacy audit returned [SUS] for both. Both verdicts were
-# ACCEPTED AS FALSE POSITIVES of a ``too-new`` + ``unknown-downloads`` recency
-# heuristic in which ``publishedAt`` is the most recent release date of a
-# long-established project rather than the project's age. Neither name was
-# invented by a researcher: both are reached transitively via
-# ``lerobot[async] -> lerobot[grpcio-dep]`` (METADATA:227). The version decision
-# that actually matters — ``lerobot==0.6.1`` — is the unchanged incumbent pin.
-#
-# ``async`` was chosen over the leaner ``grpcio-dep`` deliberately: it is the
-# extra lerobot's own ImportError names, and it is the one this comment
-# predicted. ``matplotlib`` arrives with it (via ``lerobot[matplotlib-dep]``)
-# and trips nothing — ``pyproject.toml`` already declares ``matplotlib``
-# directly, and the name is in neither ``FORBIDDEN_DIRECT_DEPENDENCIES`` nor
-# ``FORBIDDEN_RESOLVED_PACKAGES``.
 
 # An ALLOWLIST, not a denylist: an extra that is not named here fails by
 # default, so a new heavyweight extra cannot slip in unnoticed. Phase 6 (the
-# LeRobot policy container + gRPC backend) IS the "later phase" this comment
-# predicted: it widens the set to include lerobot's ``async`` extra, because
-# ``lerobot.async_inference`` fails closed without ``grpcio``
-# (``lerobot/async_inference/__init__.py`` raises "'grpcio' is required but not
-# installed. Install it with: pip install 'lerobot[async]'"), and the gRPC
-# policy session cannot exist without it. That widening landed as a deliberate
-# edit here in the same commit as the ``pyproject.toml`` change — not as a
-# surprise failure — behind the human-approved supply-chain gate recorded above.
 LEROBOT_EXTRAS_ALLOWLIST = frozenset({"feetech", "async"})
 
 # Server-only GPU and model packages that must never be DIRECT client
 # declarations. This is the ONLY place torch and the nvidia-cuda prefix belong:
-# both are legitimately present in the RESOLVED closure (torch is an
-# unconditional base dependency of lerobot, and the nvidia CUDA wheels come with
-# it), so they are meaningful only as a statement about what this project itself
-# declares.
 FORBIDDEN_DIRECT_DEPENDENCIES = frozenset(
     {
         "torch",
@@ -544,30 +420,6 @@ NVIDIA_CUDA_PREFIX = "nvidia-cuda"
 
 # Genuinely server-only packages that must not appear anywhere in the resolved
 # closure.
-#
-# torch, torchvision and every nvidia-* wheel are DELIBERATELY EXCLUDED. torch is
-# an unconditional base dependency of lerobot and roughly a dozen nvidia CUDA
-# wheels resolve transitively with it, so asserting their absence from the
-# resolved closure is unsatisfiable BY CONSTRUCTION — and the inevitable "fix"
-# for a permanently red assertion is to gut the whole guard. Do not add them
-# here to make the guard look stricter.
-#
-# diffusers was ADDED HERE by the same commit that bumps lerobot
-# from 0.3.3 to 0.6.1 — because that bump is what makes the assertion satisfiable.
-# diffusers 0.38.0 was a member of the resolved closure under the incumbent 0.3.3
-# pin and is not a base dependency of 0.6.1 (it lives only in the groot extra), so
-# this entry would have FAILED before that commit and passes after it. That
-# fail-first property is the non-vacuity proof for the whole resolved-closure
-# assertion: an entry that has never been red is an entry that has never been
-# tested.
-#
-# `av` is DELIBERATELY NOT here, and it is the one name in the bump's
-# dataset-reader group that survives. av 16.1.0 is required by aiortc
-# (av<17.0.0,>=14.0.0), which pipecat-ai pulls through its webrtc extra for the
-# voice transport — verified with `uv tree --invert --package av`. Its presence is
-# nothing to do with lerobot's dataset extra, so asserting its absence would be
-# unsatisfiable-by-construction in the same way a resolved-`torch` assertion would
-# be, and its only available remedy would be dropping WebRTC voice support.
 FORBIDDEN_RESOLVED_PACKAGES = frozenset(
     {
         "flash-attn",
@@ -683,12 +535,7 @@ def resolved_package_names(lock_text: str) -> list[str]:
 
 
 def forbidden_resolved_packages(lock_text: str) -> list[str]:
-    """Normalized server-only packages found in the resolved closure.
-
-    Raises when the text declares no packages at all: an empty closure is not a
-    clean closure, and reporting it clean would be exactly the vacuous pass this
-    guard exists to prevent.
-    """
+    'Normalized server-only packages found in the resolved closure.'
     names = resolved_package_names(lock_text)
     if not names:
         raise ValueError(
@@ -702,13 +549,7 @@ def forbidden_resolved_packages(lock_text: str) -> list[str]:
 
 
 def test_client_lerobot_extras_within_allowlist():
-    """The lerobot extras set is an ALLOWLIST subset, and feetech is required.
-
-    An allowlist, not a denylist: a new heavyweight extra fails by default. This
-    is the assertion that catches ``lerobot[groot]``, which pulls transformers,
-    peft, diffusers, timm, dm-tree and an x86-only decoder on top of the torch
-    that is already present transitively.
-    """
+    'The lerobot extras set is an ALLOWLIST subset, and feetech is required.'
     extras, _spec = parse_lerobot_requirement(client_dependencies())
     assert extras <= LEROBOT_EXTRAS_ALLOWLIST, (
         f"lerobot extras {sorted(extras)} exceed the allowlist "
@@ -729,13 +570,7 @@ def test_client_lerobot_pin_is_exact():
 
 
 def test_client_has_no_direct_gpu_or_model_dependencies():
-    """No DIRECT dependency is a server-only GPU or model package.
-
-    Parsed, not substring-matched: parsing kills both the false pass on
-    ``lerobot[groot]`` and the false fail on a package whose name merely contains
-    a forbidden name as a substring. This is the only place torch and the
-    nvidia-cuda prefix belong.
-    """
+    'No DIRECT dependency is a server-only GPU or model package.'
     leaked = forbidden_direct_dependencies(client_dependencies())
     assert leaked == [], f"server GPU stack declared as a direct dependency: {leaked}"
 
@@ -747,19 +582,7 @@ def test_client_lock_has_no_server_only_packages():
 
 
 def test_client_lock_no_longer_resolves_diffusers():
-    """diffusers has left the resolved closure, and the denylist says so.
-
-    This is the guard's own non-vacuity proof, asserted against the REAL lockfile
-    rather than a synthetic one. diffusers 0.38.0 was in the closure under the
-    incumbent ``lerobot[feetech]==0.3.3`` pin; it is not a base dependency of
-    0.6.1 (only the groot extra pulls it). So this test would have failed before
-    the bump commit and passes after it — an entry with a demonstrated fail-first
-    property, not a name added because it was already absent.
-
-    A future regression here means something re-introduced the model stack, most
-    likely the groot extra. The correct response is to find what pulled it in, not
-    to remove diffusers from ``FORBIDDEN_RESOLVED_PACKAGES``.
-    """
+    'diffusers has left the resolved closure, and the denylist says so.'
     resolved = resolved_package_names(read_lock_text(REPO_ROOT / "uv.lock"))
     assert "diffusers" not in resolved, (
         "diffusers is back in the resolved closure — investigate which dependency "
@@ -771,17 +594,7 @@ def test_client_lock_no_longer_resolves_diffusers():
 
 
 def test_client_lock_no_longer_resolves_the_dataset_reader_stack():
-    """The dataset readers 0.6.0 moved behind the ``dataset`` extra are gone.
-
-    lerobot 0.6.0 stopped bundling dataset dependencies; five of the six readers
-    that were present only as a side effect of the 0.3.3 pin leave with the bump.
-    Asserted against the real lockfile so a later ``lerobot[dataset]`` addition is
-    caught as the closure enlargement it is.
-
-    ``av`` is deliberately excluded from this list: it is required by aiortc for
-    the WebRTC voice transport (``uv tree --invert --package av``), so it never
-    depended on the lerobot pin and its presence is not a dataset-extra leak.
-    """
+    'The dataset readers 0.6.0 moved behind the ``dataset`` extra are gone.'
     resolved = set(resolved_package_names(read_lock_text(REPO_ROOT / "uv.lock")))
     readers = {"torchcodec", "pandas", "pyarrow", "datasets", "jsonlines"}
     assert readers & resolved == set(), (
@@ -797,12 +610,7 @@ def test_client_lock_no_longer_resolves_the_dataset_reader_stack():
 
 
 def test_guard_detects_torch_injected_as_direct_dependency():
-    """A deliberately injected DIRECT torch declaration is reported.
-
-    "Deliberately injected" means a direct declaration or a selected extra —
-    never transitive base-dependency presence, which is unavoidable and would
-    make the assertion unsatisfiable.
-    """
+    'A deliberately injected DIRECT torch declaration is reported.'
     injected = ["fastapi>=0.129.0", "torch>=2.7", "lerobot[feetech]==0.6.1"]
     assert forbidden_direct_dependencies(injected) == ["torch"]
 
@@ -820,12 +628,7 @@ def test_guard_detects_torch_injected_as_direct_dependency():
 
 
 def test_guard_detects_lerobot_groot_extra():
-    """A lerobot requirement carrying the groot extra is reported as a violation.
-
-    This is the exact false pass the previous substring guard exhibited: the
-    string ``lerobot[feetech,groot]==0.6.1`` contains none of that guard's six
-    forbidden substrings.
-    """
+    'A lerobot requirement carrying the groot extra is reported as a violation.'
     extras, spec = parse_lerobot_requirement(["lerobot[feetech,groot]==0.6.1"])
     assert "groot" in extras
     assert not extras <= LEROBOT_EXTRAS_ALLOWLIST, (
@@ -927,27 +730,13 @@ def test_guard_rejects_requirement_declaring_no_extras():
 
 
 def test_client_requires_python_stays_312():
-    """The client interpreter floor stays >=3.12.
-
-    The floor is load-bearing and unchanged. What needed clarifying is WHICH
-    container is which: the Isaac-GR00T inference container is Py3.10, while the
-    newer ``lerobot-policy`` container is Py3.12 because
-    ``lerobot-0.6.1.dist-info/METADATA`` declares ``Requires-Python: >=3.12``. So
-    "the server is Py3.10" is true only of the older of the two, and the client's
-    ``>=3.12`` floor is what lets it import ``lerobot.transport`` at all.
-    """
+    'The client interpreter floor stays >=3.12.'
     text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'requires-python = ">=3.12"' in text
 
 
 def _load_container_entrypoint():
-    """Load the container's entrypoint module from source, without Docker.
-
-    The Dockerfile copies only ``docker/lerobot-policy/*.py`` into the image, so
-    there is no package to import from the host tree. Loading the file directly
-    is what lets the preflight harness's exit contract be pinned by a keyless CI
-    test instead of resting on a manual ``docker run`` observation.
-    """
+    "Load the container's entrypoint module from source, without Docker."
     import importlib.util
 
     path = REPO_ROOT / "docker" / "lerobot-policy" / "entrypoint.py"
@@ -959,18 +748,7 @@ def _load_container_entrypoint():
 
 
 def _load_container_server():
-    """Load the container's ``server.py`` from source, without Docker.
-
-    Importable from the client venv: ``server.py``'s imports are all ``lerobot``,
-    ``torch``, ``grpc`` and ``policy_guard``, every one of which the Dum-E venv
-    already carries (``transformers`` is reached only transitively through
-    ``lerobot``, never named here). That is what makes the SAFE-01 post-load call
-    site's fail-closed behaviour pinnable by a keyless test instead of resting on a
-    live ``docker run``.
-
-    Unlike ``_load_container_entrypoint`` this loads no ``sys.path`` mutation of its
-    own — ``server.py`` performs none.
-    """
+    "Load the container's ``server.py`` from source, without Docker."
     import importlib.util
 
     path = REPO_ROOT / "docker" / "lerobot-policy" / "server.py"
@@ -985,15 +763,7 @@ BUILD_WRAPPER = REPO_ROOT / "scripts" / "build_lerobot_policy_image.sh"
 
 
 def _run_build_wrapper_sandboxed(tmp_path, dotenv_body: str):
-    """Run the build wrapper in a throwaway tree with ``docker`` stubbed out.
-
-    Executes the REAL script, so the dotenv handling under test is the shipped one.
-    ``docker`` is replaced by a shim that echoes its argv and exits 0, which is what
-    makes the ``--build-arg`` values observable: they are the pins the script actually
-    handed the build, not a restatement of its own variables.
-
-    Nothing here touches the real repo, the real ``.env`` or the real Docker daemon.
-    """
+    'Run the build wrapper in a throwaway tree with ``docker`` stubbed out.'
     import shutil
     import subprocess
 
@@ -1025,21 +795,7 @@ def _run_build_wrapper_sandboxed(tmp_path, dotenv_body: str):
 
 
 def test_dotenv_cannot_replace_the_build_wrappers_reproducibility_pins(tmp_path):
-    """A ``.env`` entry cannot silently replace ``LEROBOT_PIN``/``BACKBONE_REVISION``.
-
-    WR-08. The wrapper assigned its five pins and THEN ran ``set -a; . .env; set +a``,
-    which executes .env in the current shell and exports everything it assigns — so any
-    of those five names appearing in .env overwrote the pin, unconditionally and with no
-    message. The post-build assertion could not catch it, because it compares the image
-    against ``$BACKBONE_REVISION``: the SAME overridden variable. The "reproducibility
-    anchor" was self-referential once .env was in play, and the image would still be
-    tagged ``lerobot-policy`` while carrying a different backbone revision than the
-    script declares.
-
-    Asserted against the pins the script actually handed ``docker build``, and against
-    the value it handed the in-image assertion — the two places the override would show
-    up — rather than against the script's own echo of its variables.
-    """
+    'A ``.env`` entry cannot silently replace ``LEROBOT_PIN``/``BACKBONE_REVISION``.'
     hostile = (
         "HF_TOKEN=hf_sandbox_not_a_real_token\n"
         "LEROBOT_PIN=9.9.9\n"
@@ -1075,12 +831,7 @@ def test_dotenv_cannot_replace_the_build_wrappers_reproducibility_pins(tmp_path)
 
 
 def test_the_build_wrapper_still_reads_hf_token_from_dotenv(tmp_path):
-    """Hardening the dotenv path did not break the thing it exists for.
-
-    The token still has to come out of ``.env`` — this repo's convention is that
-    credentials live there, not in the shell — and a wrapper that stopped reading it
-    would fail closed on every normal invocation.
-    """
+    'Hardening the dotenv path did not break the thing it exists for.'
     result = _run_build_wrapper_sandboxed(tmp_path, "HF_TOKEN=hf_sandbox_not_a_real_token\n")
     combined = result.stdout + result.stderr
 
@@ -1105,29 +856,7 @@ def test_the_build_wrapper_fails_closed_without_a_token(tmp_path):
 
 
 def test_container_camera_and_frame_geometry_match_the_client_handshake():
-    """The server's declared geometry IS the client's, asserted ACROSS the boundary.
-
-    WR-06. ``docker/lerobot-policy/server.py`` states the requirement — its
-    ``CAMERA_KEYS``/``FRAME_*``/``STATE_DIM``/``ACTION_DIM`` "must agree with
-    ``policy/lerobot/features.py``" — but nothing asserted it, and the values cannot
-    be imported: the Dockerfile copies ``policy_guard/`` and
-    ``docker/lerobot-policy/*.py`` into the image, not ``policy/``. So they are pinned
-    copies, and this is the keyless cross-check that keeps them from drifting (the
-    same idiom ``scripts/dump_preprocessed_image.py`` uses for
-    ``SERVING_LETTER_BOX_TRANSFORM``).
-
-    **The two halves fail differently, and this test exists for the quiet one.** The
-    client's ``lerobot_features`` decides which ``observation.images.<cam>`` keys
-    arrive; ``config.input_features`` decides which are looked up AND what they are
-    resized to. A camera-NAME disagreement is a loud ``KeyError`` in
-    ``prepare_raw_observation``. A frame-SIZE disagreement is silent:
-    ``raw_observation_to_observation`` -> ``prepare_raw_observation`` *resizes* every
-    incoming frame to the declared shape (``helpers.py:165-168``), which is blocker
-    3's mechanism — so a drift reintroduces the aspect-ratio corruption the module
-    says it prevents, with correct shapes end to end. It is shape-invisible
-    downstream too, because the forced pad squares every input. Nothing else in the
-    suite would notice.
-    """
+    "The server's declared geometry IS the client's, asserted ACROSS the boundary."
     server_module = _load_container_server()
     server = server_module.DumEGrootPolicyServer
 
@@ -1224,14 +953,7 @@ class _EncodeStep:
 
 
 class GrootN17ActionDecodeStep:  # noqa: N801 - the NAME is the assertion
-    """Stands in for upstream's relative-aware decode step.
-
-    Deliberately NOT underscore-prefixed: SAFE-01/3 compares
-    ``type(step).__name__`` against ``EXPECTED_DECODE_STEP``, so the class name IS
-    the thing under test. The legacy ``GrootActionUnpackUnnormalizeStep`` is what a
-    real refusal here would name. ``env_action_dim`` is the marker
-    ``_decode_step_type`` locates it by.
-    """
+    "Stands in for upstream's relative-aware decode step."
 
     env_action_dim = 6
 
@@ -1243,27 +965,14 @@ class _StubPipeline:
 
 
 def _guard_passing_pipelines():
-    """Pipeline stubs whose shape the SAFE-01 guard ACCEPTS against the real checkpoint.
-
-    A harness that could only ever produce a refusal would make every
-    ``"SAFE-01 guard: PASS" not in log`` assertion below vacuous, so the default is
-    the passing shape and ``test_..._logs_pass_on_a_conforming_pipeline`` is the
-    positive control that proves it.
-    """
+    'Pipeline stubs whose shape the SAFE-01 guard ACCEPTS against the real checkpoint.'
     return _StubPipeline([_PackStep(), _EncodeStep()]), _StubPipeline(
         [GrootN17ActionDecodeStep()]
     )
 
 
 def _armed_handshake_server(server_module, monkeypatch):
-    """A ``DumEGrootPolicyServer`` whose weight load and pipelines are stubbed out.
-
-    Stubs exactly the three things a 12.6 GB load would otherwise require — the
-    model materialization, the processor build and the dtype histogram — and NOTHING
-    on the guard path: every SAFE-01 field except the four the pipelines carry is
-    read from the REAL checkpoint's sidecars. The handler body under test is the
-    real one.
-    """
+    'A ``DumEGrootPolicyServer`` whose weight load and pipelines are stubbed out.'
 
     class _StubConfig:
         embodiment_tag = "new_embodiment"
@@ -1317,22 +1026,7 @@ def _armed_handshake_server(server_module, monkeypatch):
 
 
 def test_safe01_post_load_guard_drops_the_policy_on_a_non_valueerror_failure(monkeypatch):
-    """An ``AttributeError`` from ``snapshot_from_loaded`` REFUSES and drops the policy.
-
-    This is CR-02, and it is the discriminating case: the call site used to catch
-    ``except ValueError`` only. ``assert_groot_serving_contract`` raises only
-    ``ValueError``, but ``snapshot_from_loaded``'s own docstring advertises that it
-    fails **at attribute-access time** — i.e. ``AttributeError`` — and
-    ``infer_groot_n1_7_action_horizon`` can raise ``KeyError`` on a reshaped
-    sidecar. Under the narrow clause none of those reached the handler, so
-    ``self.policy`` stayed bound to a loaded, un-validated policy and the exception
-    escaped as ``UNKNOWN``; a client that ignored that and called
-    ``SendObservations``/``GetActions`` anyway would have been served from it.
-
-    A test that only proves the ``ValueError`` path still works cannot close this —
-    that path was never broken. So the failure is injected at a REAL read site by
-    deleting the attribute ``snapshot_from_loaded`` reads first.
-    """
+    'An ``AttributeError`` from ``snapshot_from_loaded`` REFUSES and drops the policy.'
     server_module = _load_container_server()
     if not REAL_CHECKPOINT_FOR_SERVER.is_dir():
         pytest.fail(
@@ -1344,11 +1038,6 @@ def test_safe01_post_load_guard_drops_the_policy_on_a_non_valueerror_failure(mon
 
     # THE INJECTION, at a real read site inside snapshot_from_loaded: a pack step
     # that carries `state_dropout_prob` (so `_require_step` locates it and does NOT
-    # raise its own ValueError) but no `training`. `groot_guard.py:524` then does
-    # `bool(pack_step.training)` and raises AttributeError — the module's documented
-    # "breaks LOUDLY, at attribute-access time" behaviour, produced by the guard
-    # itself rather than hand-thrown. This is exactly the shape a pinned-lerobot
-    # pipeline reshape takes: the marker survives, the field next to it moves.
     class _ReshapedPackStep:
         state_dropout_prob = 0.2
         # `training` deliberately ABSENT.
@@ -1393,12 +1082,7 @@ def test_safe01_post_load_guard_drops_the_policy_on_a_non_valueerror_failure(mon
 
 
 def test_safe01_post_load_guard_still_refuses_a_valueerror_violation(monkeypatch):
-    """Broadening the catch did not replace the ``ValueError`` message path.
-
-    The guard's own refusals must keep arriving with their ``SAFE-01/N`` identifier
-    intact, because that identifier is what the live suite greps for and what tells
-    an operator which assertion fired.
-    """
+    'Broadening the catch did not replace the ``ValueError`` message path.'
     server_module = _load_container_server()
     server = _armed_handshake_server(server_module, monkeypatch)
     context = _FakeContext()
@@ -1426,19 +1110,7 @@ def test_safe01_post_load_guard_still_refuses_a_valueerror_violation(monkeypatch
 
 
 def test_safe01_post_load_guard_logs_pass_on_a_conforming_pipeline(monkeypatch):
-    """THE POSITIVE CONTROL for the three refusal tests above.
-
-    They assert ``"SAFE-01 guard: PASS" not in log``. If this harness could never
-    produce that line, all three would be vacuous. So: with pipeline stubs whose
-    markers and flags conform — a pack step carrying ``state_dropout_prob`` and
-    ``training=False``, an encode step with the serving pad FORCED on, and a decode
-    step named ``GrootN17ActionDecodeStep`` — the real handler body runs the real
-    guard against the REAL checkpoint's sidecars and passes.
-
-    Note what this does NOT stub: the SAFE-01 assertions themselves, the snapshot
-    builder, or any of the thirteen checkpoint-derived fields. Only the weight load
-    and the processor build are stubbed.
-    """
+    'THE POSITIVE CONTROL for the three refusal tests above.'
     server_module = _load_container_server()
     server = _armed_handshake_server(server_module, monkeypatch)
     context = _FakeContext()
@@ -1460,30 +1132,7 @@ def test_safe01_post_load_guard_logs_pass_on_a_conforming_pipeline(monkeypatch):
 
 
 def test_a_returning_abort_cannot_produce_a_safe01_pass_line(monkeypatch):
-    """A refusal never reaches the ``SAFE-01 guard: PASS`` log, even if abort returns.
-
-    WR-04. ``_refuse`` was called as a bare statement and control left the handler
-    only because ``context.abort`` happens to raise. If that ever stopped being true
-    — an ``aio`` servicer context, a test double, an upstream change — execution fell
-    through to the unconditional ``SAFE-01 guard: PASS`` line and
-    ``return services_pb2.Empty()``: a PASS log and an OK handshake reply for a
-    handshake the guard REFUSED. That is the precise inverse of T-06-14, and
-    ``tests/test_lerobot_serving_live.py`` greps that exact line as positive
-    evidence. (It would also reference the unbound ``snapshot`` local, masking the
-    real diagnosis behind an ``UnboundLocalError``.)
-
-    The property is asserted with the inversion actually injected — an ``abort``
-    that RETURNS — rather than by reading the code, because "abort raises" is the
-    assumption under test.
-
-    The refusal is injected at ``assert_groot_serving_contract``, NOT at
-    ``snapshot_from_loaded``, and the difference is the whole point: a
-    snapshot-build failure leaves ``snapshot`` unbound, so the fall-through would
-    die on ``UnboundLocalError`` before the PASS line and the hazard would be
-    invisible. A guard REFUSAL — the common case, e.g. SAFE-01/2's wrong horizon —
-    leaves ``snapshot`` bound with real values, so the fall-through logs a fully
-    populated, entirely false PASS line and returns OK.
-    """
+    'A refusal never reaches the ``SAFE-01 guard: PASS`` log, even if abort returns.'
     server_module = _load_container_server()
     server = _armed_handshake_server(server_module, monkeypatch)
     context = _FakeContext(abort_returns=True)
@@ -1514,19 +1163,7 @@ def test_a_returning_abort_cannot_produce_a_safe01_pass_line(monkeypatch):
 
 
 def test_preflight_refuses_when_a_check_never_runs():
-    """A vanished preflight check FAILS; it is not silently absent (T-06-37).
-
-    This is the repudiation gap the Phase 6 security audit found. The harness is
-    a ported copy whose original gates on ``passed == len(self.results)`` — every
-    *recorded* check. Under that contract, deleting a check from
-    ``run_preflight`` records nothing for it, the remaining checks all pass, and
-    the container starts on an incomplete preflight, indistinguishable from one
-    that genuinely verified everything.
-
-    Both halves are pinned, because only asserting the happy path is how this
-    regressed in the first place: all-ran-and-passed exits 0, and
-    fewer-ran-but-all-passed exits non-zero.
-    """
+    'A vanished preflight check FAILS; it is not silently absent (T-06-37).'
     entrypoint = _load_container_entrypoint()
 
     # All expected checks ran and passed -> serve.
@@ -1557,12 +1194,7 @@ def test_preflight_refuses_when_a_check_never_runs():
 
 
 def test_preflight_numbered_lines_track_total_checks():
-    """``TOTAL_CHECKS`` is the single source of the ``[n/N]`` prefixes.
-
-    Guards against the stale-literal drift the audit looked for: the count was
-    raised 5 -> 6 when SAFE-01 was armed, and the prefixes must follow the
-    constant rather than a hardcoded number.
-    """
+    '``TOTAL_CHECKS`` is the single source of the ``[n/N]`` prefixes.'
     entrypoint = _load_container_entrypoint()
     source = (REPO_ROOT / "docker" / "lerobot-policy" / "entrypoint.py").read_text(
         encoding="utf-8"

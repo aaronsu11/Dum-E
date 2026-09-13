@@ -1,18 +1,4 @@
-"""Policy-backend selector.
-
-One entry point — ``make_policy_backend()`` — turns the ``DUME_POLICY_BACKEND``
-environment variable into a concrete :class:`shared.IPolicyBackend`. This is the
-ONLY way production code reaches inference; there is no remaining hardcoded path
-to a specific policy stack.
-
-Selection is an explicit allowlist plus explicit branches. A backend
-name is never used to build an import path, a module attribute lookup or a class
-name, and is never ``eval``'d — the allowlist IS the whole validation surface
-(ASVS V5).
-
-Each branch lazy-imports its own dependencies so a selection never pays for a
-stack it does not use.
-"""
+'Policy-backend selector.'
 
 import os
 from typing import Any
@@ -25,27 +11,12 @@ POLICY_BACKEND_ENV_VAR = "DUME_POLICY_BACKEND"
 #: The allowlist. Anything not in here is rejected — never defaulted.
 POLICY_BACKENDS = ("lerobot", "groot-native", "galaxea", "pi05-so101")
 
-#: Code-level default when the environment variable is unset. Deliberately the
-#: target backend rather than the one that works today, so an unset variable
-#: raises the "not wired" error below instead of silently selecting a fallback.
-DEFAULT_POLICY_BACKEND = "lerobot"
+# Match dum_e.py and config.example.yaml; explicit selection overrides this.
+DEFAULT_POLICY_BACKEND = "groot-native"
 
 
 def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
-    """Build the policy backend selected by ``DUME_POLICY_BACKEND``.
-
-    Args:
-        **kwargs: Forwarded verbatim to the selected backend's constructor
-            (``host``, ``port``, ``camera_keys``, ``robot_state_keys``,
-            ``show_images``, ``language_instruction`` — the SAME keyword set for
-            all backends), so every constructor default stays reachable.
-
-    Returns:
-        A concrete :class:`shared.IPolicyBackend`.
-
-    Raises:
-        ValueError: on an unknown value.
-    """
+    'Build the policy backend selected by ``DUME_POLICY_BACKEND``.'
     backend = os.getenv(POLICY_BACKEND_ENV_VAR, DEFAULT_POLICY_BACKEND)
 
     if backend not in POLICY_BACKENDS:
@@ -64,10 +35,6 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
     if backend == "lerobot":
         # Lazy-import INSIDE the branch, and this is the branch that proves why the
         # discipline exists: this import DOES pull the LeRobot policy stack (torch
-        # and grpc, transitively), so at module scope it would make every
-        # groot-native process pay for a stack it never uses. Asserted by
-        # tests/test_policy_backend.py::test_factory_module_import_pulls_no_torch_or_lerobot,
-        # which runs in a subprocess so the rest of the suite cannot mask it.
         if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
             from policy.lerobot.serialized_backend import SerializedLeRobotPolicyBackend
             return SerializedLeRobotPolicyBackend(**kwargs)

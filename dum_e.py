@@ -117,11 +117,6 @@ def _spawn_agent_worker(
 
     # Pass policy configuration via environment variables for the agent worker,
     # which is the process that reaches policy.factory.make_policy_backend().
-    # Precedence: inherited shell env var (DUME_POLICY_BACKEND) > config file >
-    # built-in default. An operator who exports DUME_POLICY_BACKEND=groot-native
-    # to pin which network commands the arm must win over a stale my-dum-e.yaml
-    # value — do NOT unconditionally overwrite an already-set env var with the
-    # config value, which is exactly what `env.update` would do.
     controller_cfg = controller_config or {}
     policy_env_defaults = {
         "DUME_POLICY_BACKEND": controller_cfg.get("policy_backend", "groot-native"),
@@ -137,13 +132,6 @@ def _spawn_agent_worker(
 
     # The joint-value convention and the per-step motion clamp are forwarded
     # only when the config actually names them, so their
-    # defaults live in exactly one place (embodiment/so_arm10x/controller.py) and
-    # cannot drift between the launcher and the process that owns the arm.
-    #
-    # `use_degrees` is stringified lowercase so the controller's explicit boolean
-    # coercion recognises it. Do NOT rely on truthiness here: a YAML `false`
-    # arriving as the string "false" is truthy in Python, which is exactly the
-    # trap the controller's coerce_bool() closes.
     if "use_degrees" in controller_cfg:
         policy_env_defaults["DUME_USE_DEGREES"] = str(
             controller_cfg["use_degrees"]

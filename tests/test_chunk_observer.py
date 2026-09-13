@@ -79,9 +79,6 @@ def test_lerobot_entrypoint_routes_prediction_through_shared_observer(monkeypatc
     def serve():
         instance=entry.DumEGrootPolicyServer()
         assert instance._predict_action_chunk(value) is value
-        instance._parity_attestor=object()
-        with pytest.raises(RuntimeError, match='cannot be bypassed'):
-            instance._predict_action_chunk(value)
         return 0
     entry.main=serve
     monkeypatch.setitem(sys.modules, 'entrypoint', entry)
@@ -95,7 +92,7 @@ def test_lerobot_entrypoint_routes_prediction_through_shared_observer(monkeypatc
 def test_lerobot_refuses_attestation_downgrade(monkeypatch):
     from scripts import serve_observed_lerobot as script
     monkeypatch.setenv('DUME_PARITY_ATTESTATION_PATH', '/evidence/runtime.json')
-    with pytest.raises(RuntimeError, match='cannot replace exhaustive'):
+    with pytest.raises(RuntimeError, match='attestation is archived'):
         script.main()
 
 
@@ -104,7 +101,7 @@ def test_native_endpoint_uses_shared_observer(monkeypatch, tmp_path, mode):
     import sys
     from contextlib import nullcontext
     from scripts import serve_observed_native as script
-    from scripts import replay_groot_native
+    from policy_guard import native_cache
     m=model();value=torch.ones(1);calls=[]
     class Policy:
         def __init__(self, *a, **kw):
@@ -127,33 +124,13 @@ def test_native_endpoint_uses_shared_observer(monkeypatch, tmp_path, mode):
         'gr00t.policy.gr00t_policy': SimpleNamespace(Gr00tPolicy=Policy),
         'gr00t.policy.server_client': SimpleNamespace(PolicyServer=Server),
     }.items():monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(replay_groot_native, 'pinned_native_cache', nullcontext)
+    monkeypatch.setattr(native_cache, 'pinned_native_cache', nullcontext)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
     monkeypatch.setattr(torch, 'set_num_threads', lambda n: None)
     monkeypatch.setattr(sys, 'argv', ['serve', '--model-path', str(tmp_path), '--observer-mode', mode])
     script.main()
     assert calls==[{'test': 1}]
-
-
-def test_exhaustive_mode_is_explicit_and_preserves_rng():
-    m=model();x=torch.ones(1,2);rng=torch.get_rng_state().clone()
-    observer=ChunkObserver('exhaustive')
-    assert observer.run(m,predict,m,x) is x
-    assert torch.equal(rng,torch.get_rng_state())
-    assert observer.last['coverage']=='operations'
-    assert observer.last['flow_steps']==4
-    assert observer.last['exhaustive_attestation'] is False
-
-
-def test_exhaustive_attestation_delegates_to_original_entrypoint(monkeypatch):
-    import sys
-    from scripts import serve_observed_lerobot as script
-    calls=[]
-    monkeypatch.setenv('DUME_PARITY_ATTESTATION_PATH','/evidence/runtime.json')
-    monkeypatch.setenv('DUME_CHUNK_OBSERVER','exhaustive')
-    monkeypatch.setitem(sys.modules,'entrypoint',SimpleNamespace(main=lambda: calls.append('original') or 0))
-    assert script.main()==0 and calls==['original']
 
 
 def test_server_serializes_relative_anchor_through_decode(monkeypatch):

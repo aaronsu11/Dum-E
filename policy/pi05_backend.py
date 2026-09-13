@@ -3,13 +3,12 @@ import os
 import time
 import numpy as np
 
-from policy.molmo_backend import MolmoPolicyBackend
+from policy.http_backend import SO101HTTPPolicyBackend
 from policy.galaxea.modalities import JOINTS
-from policy_lab.profiles import get_profile
 from policy_lab.protocol import encode_image, prefix_digest
 
 
-class Pi05SO101PolicyBackend(MolmoPolicyBackend):
+class Pi05SO101PolicyBackend(SO101HTTPPolicyBackend):
     def __init__(self, host="127.0.0.1", port=None, camera_keys=None,
                  robot_state_keys=None, show_images=False, language_instruction=None):
         if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
@@ -23,8 +22,7 @@ class Pi05SO101PolicyBackend(MolmoPolicyBackend):
         if show_images:
             raise ValueError("Image display is not implemented for the Pi0.5 bridge")
         super().__init__(port=port or int(os.getenv("DUME_PI05_POLICY_PORT", "18081")),
-                         language_instruction=language_instruction)
-        self.profile = get_profile("pi05-so101")
+                         language_instruction=language_instruction, profile="pi05-so101")
 
     def rtc_ping(self):
         """Independent health connection: never wait for the inference lock."""

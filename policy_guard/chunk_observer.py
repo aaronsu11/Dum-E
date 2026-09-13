@@ -6,7 +6,7 @@ precision proof. Off and lightweight use the same optional timing boundaries.
 from contextlib import ExitStack
 from time import perf_counter
 
-MODES = ('off', 'lightweight', 'exhaustive')
+MODES = ('off', 'lightweight')
 
 
 def tensor_metadata(value):
@@ -34,14 +34,10 @@ class ChunkObserver:
         self.last = None
 
     def run(self, model, predict, *args, **kwargs):
-        record = {'observer_mode': self.mode, 'coverage': {'off': 'none', 'lightweight': 'module_boundaries', 'exhaustive': 'operations'}[self.mode],
+        record = {'observer_mode': self.mode, 'coverage': {'off': 'none', 'lightweight': 'module_boundaries'}[self.mode],
                   'exhaustive_attestation': False, 'status': 'failed'}
         self.last = record
         with ExitStack() as stack:
-            exhaustive = None
-            if self.mode == 'exhaustive':
-                from policy_guard.exhaustive_observer import ServingObservation
-                exhaustive = stack.enter_context(ServingObservation(model))
             if self.mode == 'lightweight':
                 record['flow_steps'] = 0
                 def before_backbone(module, inputs, kwargs):
@@ -60,11 +56,5 @@ class ChunkObserver:
                 self.synchronize()
             finally:
                 record['generation_ms'] = (perf_counter() - start) * 1000
-            if exhaustive is not None:
-                for key in ('flow_steps', 'noise_draws', 'noise_shape', 'noise_dtype', 'noise_device',
-                            'sdpa_calls', 'floating_operation_count', 'autocast', 'tf32_matmul', 'tf32_cudnn'):
-                    record[key] = getattr(exhaustive, key)
-                for key in ('compute_dtypes', 'input_dtypes', 'backbone_dtypes', 'kernels'):
-                    record[key] = sorted(getattr(exhaustive, key))
             record['status'] = 'complete'
             return result

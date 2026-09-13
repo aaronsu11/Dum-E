@@ -1,101 +1,4 @@
-"""SAFE-01: the ONE implementation of the GR00T serving contract's five assertions.
-
-This module is a pure validator. It builds a frozen :class:`GrootGuardSnapshot` of the
-facts SAFE-01 turns on, and :func:`assert_groot_serving_contract` raises a named,
-specific ``ValueError`` naming the failing assertion and the observed value. There is
-**one implementation and two call sites**, not two code paths:
-
-1. ``docker/lerobot-policy/entrypoint.py``'s preflight calls
-   :func:`snapshot_from_checkpoint_dir` — config-only, no weights, no GPU, no network —
-   so a missing or wrong checkpoint bind-mount is caught *before* 12.6 GB of shards are
-   read. That is what makes "refuses to **start** with a named, specific error" literally
-   true rather than "refuses on the first request".
-2. The ``PolicyServer`` subclass's post-``super()`` hook calls
-   :func:`snapshot_from_loaded` — the only place that sees the object which will actually
-   run inference, because the policy load happens inside a request handler.
-
-Plan 06-03 wires both sites. Nothing here imports the arm, opens a serial port, or
-commands a motor.
-
-DELIBERATE DIVERGENCE (location)
---------------------------------
-PATTERNS.md proposed ``shared/groot_guard.py``. This module deliberately lives OUTSIDE
-``shared/`` because importing anything from ``shared`` executes ``shared/__init__.py``,
-which imports ``pydantic`` at module scope (``shared/__init__.py:23``) — a client-side
-dependency the policy container has no reason to carry. Do NOT "restore parity" by moving
-this module into ``shared/``; ``policy_guard/__init__.py`` is deliberately zero bytes for
-the same reason.
-
-WHY ``GrootConfig.normalization_mapping`` IS NOT READ HERE
----------------------------------------------------------
-The roadmap names "normalization has fallen back to identity" as a SAFE-01 condition. The
-originally designated mechanism for detecting it is a guaranteed FALSE ALARM: that mapping
-is IDENTITY for ``VISUAL``, ``STATE`` and ``ACTION`` **by design** on every healthy launch.
-Upstream says so at ``configuration_groot.py:258-269``:
-
-    GR00T normalizes state/action internally in its processor steps (min/max with
-    q01/q99 percentiles, per embodiment), and the Qwen3-VL backbone's image processor
-    handles image normalization. The policy therefore does NOT use LeRobot's
-    NormalizerProcessorStep/UnnormalizerProcessorStep, so this mapping is intentionally
-    IDENTITY for every feature and is not consulted by make_groot_pre_post_processors.
-
-The intent survives; the mechanism is replaced. The three DISCRIMINATING identity-fallback
-signals, all asserted below under ``SAFE-01/4`` and ``SAFE-01/3``, are:
-
-* ``decode_step_type != EXPECTED_DECODE_STEP`` — the legacy ``GrootActionUnpackUnnormalizeStep``
-  is installed only when the checkpoint's stats are unusable, and it collapses ``(B,T,D)``
-  chunks to a single timestep (``processor_groot.py:2459-2463``). Its presence in a live
-  pipeline IS the identity-normalization tell.
-* ``stats_non_empty is False`` — an empty stats table makes the decoder return normalized
-  ``[-1, 1]`` actions while every log line looks healthy.
-* ``use_percentiles is False`` — this checkpoint requires q01/q99.
-
-That negative is DOCUMENTED, not silently omitted:
-``tests/test_groot_guard.py::test_normalization_mapping_is_identity_by_design_and_is_not_a_discriminator``
-asserts the field is identity on the real checkpoint and that this module reads no attribute
-of that name. It is never the guard's evidence.
-
-WHY THE SERVING PATH FORCES THE LETTERBOX PAD
----------------------------------------------
-This checkpoint's ``processor_config.json`` sets ``letter_box_transform: false``, and
-LeRobot HONOURS that flag: ``if letter_box_transform:`` wraps its ``cv2.copyMakeBorder``
-call (``processor_groot.py:1423-1433``), so no pad runs and a 480x640 frame reaches the
-VLM as ``(256, 340, 3)``. Isaac-GR00T, which TRAINED these weights, puts ``LetterBoxPad()``
-first in **both** its albumentations pipelines unconditionally and files
-``letter_box_transform`` under ``# Backward-compat params (stored but not actively used)``
-(``image_augmentations.py:420-487``, ``processing_gr00t_n1d7.py:171-172, 198``) — so it pads
-480x640 -> 640x640 and produces ``(256, 256, 3)``.
-
-Measured, not reasoned: forcing the pad ON in LeRobot makes its output BYTE-IDENTICAL to
-Isaac's (sha256 ``c30150ec…`` from both, across Python 3.10/3.12, numpy 1.26.4/2.2.6 and
-OpenCV 4.11.0/4.13.0). Both ``INTER_AREA`` resizes and the floored 95% crop already agree
-bit-for-bit, so the pad gating is the WHOLE of the divergence.
-
-**The serving path therefore forces the pad on** (:data:`SERVING_LETTER_BOX_TRANSFORM`),
-injected as an upstream step override at the seam in ``docker/lerobot-policy/server.py``,
-and ``SAFE-01/5`` below asserts it landed on the step that will actually run.
-
-**THE INFERENCE THIS RESTS ON, stated because it was accepted knowingly and never proven.**
-"The weights were trained on Isaac's padded square" is INFERRED from "Isaac trained this
-checkpoint". The actual training recipe was **not read** — no local artifact records it —
-and the operator chose to act on the inference rather than spend a step confirming it. If
-Phase 7's parity work disappoints, this assumption is the FIRST thing to re-examine. Do not
-present it as settled fact, and do not quietly upgrade it to one.
-
-THE WRONG KNOBS
----------------
-``GrootConfig.use_relative_actions`` (PLURAL, ``configuration_groot.py:330-336``) and
-``GrootConfig.relative_exclude_joints`` are NOT the knobs that decide relative-action
-decoding for this checkpoint. Verified against the real checkpoint:
-``GrootConfig(base_model_path=CK).use_relative_actions is False`` while the checkpoint's
-``processor_config.json`` carries ``use_relative_action: True`` (SINGULAR), and it is the
-CHECKPOINT value the inference path reads (``processor_groot.py:190``, and the
-native-vs-fallback branch at ``processor_groot.py:1271-1273``). This guard therefore reads
-the singular checkpoint value. Setting the plural config flag could only install the generic
-``RelativeActionsProcessorStep`` fallback, whose own warning says it normalizes relative
-deltas with ABSOLUTE action stats (``processor_groot.py:1275-1282``) — strictly worse than
-the native path, and not what SAFE-01/3 is asking about.
-"""
+"SAFE-01: the ONE implementation of the GR00T serving contract's five assertions."
 
 import json
 from dataclasses import dataclass
@@ -125,11 +28,6 @@ EXPECTED_HORIZON = 16
 
 #: The one embodiment tag whose ``delta_indices`` are 16. This checkpoint's
 #: ``processor_config.json`` carries NINE modality configs and the other eight all carry 40,
-#: so the tag is a load-bearing input rather than a label. Tag INFERENCE cannot rescue a
-#: wrong value here: ``infer_groot_n1_7_embodiment_tag`` returns ``None`` for this checkpoint
-#: (it only infers when exactly one modality config exists — ``configuration_groot.py:145-163``),
-#: so the value comes from ``GrootConfig.embodiment_tag``'s default. Every statistics lookup
-#: and the horizon read are both keyed by it.
 EXPECTED_TAG = "new_embodiment"
 
 #: ``processor_kwargs.crop_fraction``. Set, so ``image_crop_size: [230, 230]`` is INERT —
@@ -139,10 +37,6 @@ EXPECTED_CROP_FRACTION = 0.95
 
 #: ``processor_kwargs.shortest_image_edge``. On the SERVING path the effective geometry is
 #: letterbox-pad-to-square -> resize-shortest-edge-to-256 -> center-crop-95% ->
-#: resize-shortest-edge-to-256, giving **(256, 256, 3)** for a 480x640 frame. Without the
-#: forced pad the same three stages give (256, 340, 3) — that is what the UNPATCHED upstream
-#: function does as this checkpoint configures it, and it is why the pad is forced (see the
-#: module docstring). 224 would be the placeholder-path pre-resize.
 EXPECTED_SHORTEST_IMAGE_EDGE = 256
 
 #: ``processor_kwargs.letter_box_transform`` as THIS checkpoint DECLARES it. Asserted as a
@@ -154,39 +48,14 @@ EXPECTED_CHECKPOINT_LETTER_BOX_TRANSFORM = False
 
 #: **What the SERVING path must actually DO, and it is the opposite of the flag above.** The
 #: pad is FORCED ON so the model sees the padded square Isaac's code produced at training
-#: time. Injected at the config seam in ``docker/lerobot-policy/server.py`` via
-#: :func:`serving_preprocessor_overrides`; verified here by ``SAFE-01/5`` against the step
-#: that will actually run. The inference this rests on is stated in the module docstring and
-#: must not be upgraded to a fact.
 SERVING_LETTER_BOX_TRANSFORM = True
 
 #: ``processor_kwargs.modality_configs[EXPECTED_TAG]["video"]["modality_keys"]`` — **the value
 #: that decides WHICH CAMERA LANDS IN WHICH VIEW SLOT.** It is not a label: upstream's
-#: ``GrootN17PackInputsStep._ordered_image_keys`` (``processor_groot.py:1563-1598``) matches these
-#: names against the ``observation.images.<cam>`` keys the handshake declares, in THIS order, and
-#: that ordering is what the trained weights expect. ``policy/lerobot/features.py``'s
-#: ``CAMERA_KEYS`` is ``("wrist", "front")`` and deliberately does NOT decide the order — it only
-#: decides which feature keys exist.
-#:
-#: Asserted because the failure mode is silent and physical. When NONE of these names matches a
-#: served camera — a camera rename, or a LIBERO-style checkpoint carrying
-#: ``["image", "wrist_image"]`` — upstream does not raise. It emits ONE ``logging.warning``, once
-#: (``self._warned_image_keys``), and falls back to ``sorted(available)``: **alphabetical order**.
-#: Shapes stay correct, the 16x(6,) chunk stays correct, and all seventeen other SAFE-01 fields
-#: are indifferent to it, so the model receives the wrist frame where it expects the front frame
-#: and the arm moves plausibly to the wrong place. A partial match is worse still: it silently
-#: feeds FEWER views than the weights were trained on.
 EXPECTED_VIDEO_MODALITY_KEYS: tuple[str, ...] = ("front", "wrist")
 
 #: Registry name of the pipeline step that applies the image geometry
 #: (``@ProcessorStepRegistry.register(name=...)`` on ``GrootN17VLMEncodeStep``,
-#: ``processor_groot.py:2039``). The registry name is used rather than the class name because
-#: upstream's own override matcher prefers it — ``PolicyProcessorPipeline.from_pretrained``
-#: matches registered steps by registry name ONLY, so a registry-named override keeps working
-#: if this checkpoint is ever converted and reloaded from a serialized pipeline
-#: (``processor_groot.py:405-415``). An unmatched key RAISES ``KeyError`` listing the
-#: available keys, so a rename fails loudly at handshake rather than silently dropping the
-#: pad.
 VLM_ENCODE_STEP_KEY = "groot_n1_7_vlm_encode_v1"
 
 #: The relative-aware decode step. Its alternative, ``GrootActionUnpackUnnormalizeStep``, is
@@ -225,14 +94,7 @@ _REQUIRED_PROCESSOR_KWARGS = (
 
 @dataclass(frozen=True)
 class GrootGuardSnapshot:
-    """The facts SAFE-01 turns on, decoupled from how they were obtained.
-
-    Frozen for two reasons: a call site cannot mutate a snapshot between building it and
-    asserting on it, and tests mutate exactly ONE field via :func:`dataclasses.replace`
-    against a snapshot built from the REAL checkpoint — which is what makes each violation
-    test a fail-first proof against the real config shape rather than against a fabricated
-    fixture that might misrepresent it.
-    """
+    'The facts SAFE-01 turns on, decoupled from how they were obtained.'
 
     base_model_path: str | None
     is_raw_checkpoint: bool
@@ -255,39 +117,12 @@ class GrootGuardSnapshot:
 
 
 def serving_preprocessor_overrides() -> dict[str, dict[str, Any]]:
-    """The image-geometry override the serving path MUST apply, as ONE definition.
-
-    Returned as an upstream ``preprocessor_overrides`` fragment so
-    ``docker/lerobot-policy/server.py`` can merge it into the same
-    ``make_pre_post_processors`` call that already carries the device and rename-map
-    overrides. That is upstream's own public override seam
-    (``processor_groot.py:401-455``), not a monkeypatch: ``letter_box_transform`` is a real
-    ``init`` field of ``GrootN17VLMEncodeStep``, an unknown FIELD raises ``TypeError``
-    listing the available fields, and an unknown STEP KEY raises ``KeyError`` listing the
-    available steps. A hand-rolled pad or a patched private function would instead have to
-    reproduce upstream's ``cv2.INTER_AREA`` resize and floored center crop, which upstream
-    documents as needing to stay bit-exact (``processor_groot.py:1394-1401``) — i.e. it would
-    manufacture the very mismatch this override removes.
-
-    It lives HERE rather than in the server module on purpose: the guard below is what
-    verifies the override landed, so the value asserted and the value injected resolve to one
-    definition and cannot drift into two.
-    """
+    'The image-geometry override the serving path MUST apply, as ONE definition.'
     return {VLM_ENCODE_STEP_KEY: {"letter_box_transform": SERVING_LETTER_BOX_TRANSFORM}}
 
 
 def assert_groot_serving_contract(snapshot: GrootGuardSnapshot) -> None:
-    """Raise ``ValueError`` unless every SAFE-01 condition holds.
-
-    Returns ``None`` on success and raises on failure — deliberately NOT a bool and
-    deliberately not a log line. A caller that forgets to check a returned bool, or an
-    operator who misses a warning in a container log, is exactly the silent failure this
-    guard exists to remove.
-
-    Every message starts with its own identifier (``SAFE-01/1`` .. ``SAFE-01/5``) followed
-    by a short condition name, embeds the OBSERVED value, and closes by saying what the
-    guard is refusing to do and why — the ``policy/factory.py:57-62`` idiom.
-    """
+    'Raise ``ValueError`` unless every SAFE-01 condition holds.'
     # --- SAFE-01/1: the resolved path really is our raw fine-tune -------------
     if not snapshot.is_raw_checkpoint:
         raise ValueError(
@@ -444,17 +279,7 @@ def snapshot_from_checkpoint_dir(
     checkpoint_path: str | Path,
     configured_actions_per_chunk: int,
 ) -> GrootGuardSnapshot:
-    """Build a snapshot from a checkpoint directory alone. No weights, no GPU, no network.
-
-    This is the container entrypoint's preflight builder: it answers "is the bind-mounted
-    checkpoint the one we think it is, configured the way we think it is" before any shard
-    is read.
-
-    Raises:
-        ValueError: if the directory or any of the three sidecar JSONs is absent, or a
-            required ``processor_kwargs`` key is missing. It never returns a snapshot with
-            silently defaulted fields — that snapshot would pass the guard (T-06-08).
-    """
+    'Build a snapshot from a checkpoint directory alone. No weights, no GPU, no network.'
     path = Path(checkpoint_path).expanduser()
     if not path.is_dir():
         raise ValueError(
@@ -476,15 +301,6 @@ def snapshot_from_checkpoint_dir(
     return GrootGuardSnapshot(
         # The config-only site does NOT validate these FOUR. There is no processor object
         # on this path, so a decode step, two training flags and the SERVED letterbox value
-        # simply do not exist yet; they are the post-load site's job. They are set to their
-        # passing values on purpose, and pretending otherwise would make this preflight look
-        # stronger than it is. If you need them checked, you need snapshot_from_loaded.
-        #
-        # served_letter_box_transform is the newest member of that set and the easiest to
-        # misread: the override that forces the pad is applied when the PIPELINE is built,
-        # which happens inside the request handler, so there is nothing here to read it off.
-        # Setting it to the passing value keeps this site honest about being config-only
-        # rather than silently reporting a serving fact it cannot observe.
         decode_step_type=EXPECTED_DECODE_STEP,
         served_letter_box_transform=SERVING_LETTER_BOX_TRANSFORM,
         preprocessor_training=False,
@@ -499,19 +315,7 @@ def snapshot_from_loaded(
     postprocessor: Any,
     configured_actions_per_chunk: int,
 ) -> GrootGuardSnapshot:
-    """Build a snapshot from the objects that will actually run inference.
-
-    Every attribute read here is a place a lerobot version bump can break — and it breaks
-    LOUDLY, at attribute-access time, naming what it looked for. That is the D-03 design
-    intent: composition over a pinned upstream fails at the seam, where a monkeypatch would
-    have failed silently three layers down inside a request handler.
-
-    Args:
-        config: the resolved ``GrootConfig`` off the loaded policy.
-        preprocessor: the built ``PolicyProcessorPipeline`` (input side).
-        postprocessor: the built ``PolicyProcessorPipeline`` (output side).
-        configured_actions_per_chunk: the operator-supplied horizon (D-11).
-    """
+    'Build a snapshot from the objects that will actually run inference.'
     base_model_path = config.base_model_path
     if not is_raw_groot_n1_7_checkpoint(base_model_path):
         # Deliberately an early return, not a raise: the caller's next line is the guard,
@@ -549,10 +353,6 @@ def snapshot_from_loaded(
         decode_step_type=_decode_step_type(postprocessor),
         # The EFFECTIVE letterbox value, read off the step that will actually transform
         # frames — never re-derived from the checkpoint, which declares the opposite. This is
-        # what turns "the server applies the override" from an intention into an assertion:
-        # if the override in docker/lerobot-policy/server.py stopped landing (a moved registry
-        # name, a dropped kwarg), this reads False and SAFE-01/5 refuses the handshake instead
-        # of silently serving the unpadded (256, 340, 3) geometry.
         served_letter_box_transform=bool(encode_step.letter_box_transform),
         # `training` is a make_*_processors kwarg set from dataset_meta
         # (`processor_groot.py:1225, 1266` — `training=dataset_meta is not None`), NOT a
@@ -593,17 +393,7 @@ def _snapshot_common(
 
 
 def _video_modality_keys(processor_kwargs: dict[str, Any], embodiment_tag: str) -> tuple[str, ...]:
-    """The checkpoint's declared camera-view ORDER for ``embodiment_tag``.
-
-    Returns an EMPTY tuple rather than raising when the tag, its ``video`` block or its
-    ``modality_keys`` list is absent or malformed. That is not a silent default in the T-06-08
-    sense — the point of T-06-08 is that a defaulted field would PASS the guard, and ``()`` can
-    never equal :data:`EXPECTED_VIDEO_MODALITY_KEYS`, so every deviation is REFUSED loudly by
-    ``SAFE-01/5``. Returning instead of raising also keeps the error attribution right in the one
-    case that matters: a WRONG ``embodiment_tag`` should be reported by ``SAFE-01/2``'s message
-    (which explains the nine tags and the delta_indices), not by a builder exception here that
-    fires first and names something else.
-    """
+    "The checkpoint's declared camera-view ORDER for ``embodiment_tag``."
     modality_configs = processor_kwargs.get("modality_configs")
     if not isinstance(modality_configs, dict):
         return ()
@@ -643,14 +433,7 @@ def _read_processor_kwargs(checkpoint_path: Path) -> dict[str, Any]:
 
 
 def _decode_step_type(postprocessor: Any) -> str:
-    """Class name of the postprocessor's action-decode step, or :data:`NO_DECODE_STEP`.
-
-    ``env_action_dim`` is the action-decode surface: both candidate steps declare it
-    (``GrootN17ActionDecodeStep`` at ``processor_groot.py:2325``, the legacy
-    ``GrootActionUnpackUnnormalizeStep`` at ``:2464``), and none of the surrounding
-    device/absolute-action steps do. The LAST such step is taken, because it is the one
-    whose output leaves the pipeline.
-    """
+    "Class name of the postprocessor's action-decode step, or :data:`NO_DECODE_STEP`."
     steps = getattr(postprocessor, "steps", None) or ()
     candidates = [step for step in steps if hasattr(step, "env_action_dim")]
     if not candidates:

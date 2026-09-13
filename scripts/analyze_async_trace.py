@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
-from policy_guard.replay_contract import JOINT_ORDER, sha256_file, write_evidence
+from policy_guard.contracts import JOINT_ORDER, sha256_file, write_evidence
 
 
 def analyze(path, output):

@@ -1,15 +1,4 @@
-"""
-Tests for MCP tools exposed by mcp_server.py using shared-memory backends.
-
-These tests:
-- Create ephemeral SharedMemory segments and expose them via env vars
-- Start only the MCP HTTP server process (no robot agent or pipecat)
-- Use FastMCP Client to invoke server tools and validate responses
-- Interact with the same SHM buffers directly via SharedMemoryTaskManager and
-  SharedMemoryMessageBroker to seed tasks and messages
-
-All tests are robot-agnostic and validate only the server interfaces.
-"""
+'Tests for MCP tools exposed by mcp_server.py using shared-memory backends.'
 
 import asyncio
 import socket
@@ -51,16 +40,7 @@ async def _wait_for_port(host: str, port: int, timeout: float = 5.0):
 
 @pytest_asyncio.fixture
 async def shm_env_and_server(monkeypatch):
-    """Start an MCP HTTP server wired to SHM backends and yield context.
-
-    Yields a dict containing:
-    - client: FastMCP Client connected to the server
-    - tm: SharedMemoryTaskManager bound to the same SHM segment
-    - broker: SharedMemoryMessageBroker bound to the same SHM segments
-    - port: server port
-    - namespace: namespace used for SHM and server
-    - cleanup: async callable to terminate the server process
-    """
+    'Start an MCP HTTP server wired to SHM backends and yield context.'
 
     namespace = "test_mcp"
     port = _find_free_port()
@@ -353,7 +333,7 @@ async def test_async_agent_mcp_integration(shm_env_and_server,monkeypatch,scenar
     from embodiment.so_arm10x.agent import SO10xRobotAgent, _agent_worker_loop
     from embodiment.so_arm10x.async_pick import AsyncPickSkill
     from policy.lerobot.async_chunks import AsyncSettings
-    from policy_guard.replay_contract import JOINT_ORDER
+    from policy_guard.contracts import JOINT_ORDER
     import embodiment.so_arm10x.async_pick as driver
     client=shm_env_and_server['client'];tm=shm_env_and_server['tm'];broker=shm_env_and_server['broker']
     monkeypatch.setenv('DUME_ASYNC_INFERENCE','1')
@@ -377,6 +357,8 @@ async def test_async_agent_mcp_integration(shm_env_and_server,monkeypatch,scenar
         def __init__(self):self._session=SimpleNamespace();self.calls=[];self.fail=False;self.closed=False
         def set_lang_instruction(self,text):self.language_instruction=text
         def set_task(self,text):self.language_instruction=text
+        def prepare_execution(self, observation, instruction, *, deadline_s):
+            self.get_action(observation, instruction)
         def get_action(self,obs,instruction):
             self.calls.append((instruction,threading.current_thread().name));time.sleep(.04)
             if self.fail:raise RuntimeError('injected inference failure')
@@ -479,9 +461,9 @@ async def test_execute_rejects_unknown_or_disabled_robot_before_creating_task(sh
 
 
 @pytest.mark.asyncio
-async def test_managed_trial_cannot_be_reenabled_or_dispatched_when_spent(shm_env_and_server):
+async def test_externally_managed_readiness_cannot_be_reenabled_or_dispatched_when_spent(shm_env_and_server):
     client=shm_env_and_server['client'];tm=shm_env_and_server['tm']
-    await client.call_tool('register_robot',{'robot_id':'trial','metadata':{'managed_trial':True,'ready_for_task':False}})
+    await client.call_tool('register_robot',{'robot_id':'trial','metadata':{'externally_managed_readiness':True,'ready_for_task':False}})
     enabled=await client.call_tool('set_robot_enabled',{'robot_id':'trial','enabled':True})
     assert enabled.data['updated'] is False
     result=await client.call_tool('execute_robot_instruction',{'robot_id':'trial','instruction':'pick banana'})
@@ -505,3 +487,15 @@ async def test_pending_expiry_cannot_overwrite_worker_claim(shm_env_and_server):
     assert await tm.claim_task(tid,'worker')
     assert not await tm.expire_pending_task(tid,'late timeout')
     assert (await tm.get_task(tid)).status==TaskStatus.RUNNING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("readiness_key", ["externally_managed_readiness", "managed_trial"])
+async def test_unprepared_worker_cannot_be_enabled_or_dispatched(shm_env_and_server, readiness_key):
+    client = shm_env_and_server["client"]
+    await client.call_tool("register_robot", {"robot_id": "unprepared-arm", "name": "Unprepared worker",
+        "metadata": {readiness_key: True, "ready_for_task": False}})
+    enabled = await client.call_tool("set_robot_enabled", {"robot_id": "unprepared-arm", "enabled": True})
+    assert enabled.data["updated"] is False
+    result = await client.call_tool("execute_robot_instruction", {"robot_id": "unprepared-arm", "instruction": "pick banana"})
+    assert result.data["status"] == "rejected"

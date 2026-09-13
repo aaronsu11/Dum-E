@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-image="${1:-dume-g05:phase9}"
+image="${1:-dume-g05:local}"
 checkpoint="${G05_CHECKPOINT_ROOT:-$HOME/.cache/huggingface/hub/models--OpenGalaxea--G05/snapshots/e312be81e90c56a55bcb26b57429bd39a335b449}"
-evidence="${G05_EVIDENCE:-$PWD/corpus/phase9-g05-20260912/local-startup}"
+evidence="${G05_EVIDENCE:-$PWD/outputs/g05-startup}"
 # Check before Docker or checkpoint loading; X/desktop graphics alone are allowed.
 gpu_users="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
 [[ -z "$gpu_users" ]] || {

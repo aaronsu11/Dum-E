@@ -1,16 +1,4 @@
-"""
-Interfaces for the Dum-E robotic system.
-
-This module defines the core interfaces that enable modular, loosely-coupled
-components in the robotic assistant architecture. These interfaces support:
-- Multiple robot agent implementations
-- Shared tool management between components
-- Task lifecycle management with status tracking
-- Event streaming for real-time updates
-
-The interfaces follow the dependency inversion principle, allowing high-level
-modules to depend on abstractions rather than concrete implementations.
-"""
+'Interfaces for the Dum-E robotic system.'
 
 import logging
 from abc import ABC, abstractmethod
@@ -112,13 +100,7 @@ class ToolDefinition:
 
 
 class IRobotController(ABC):
-    """
-    Interface for robot controller abstraction.
-
-    Provides a consistent interface for running predefined robot operations,
-    enabling different controller implementations or mock interfaces
-    for testing without changing higher-level code.
-    """
+    'Interface for robot controller abstraction.'
 
     @property
     @abstractmethod
@@ -156,48 +138,19 @@ class IRobotController(ABC):
 
 
 class IPolicyBackend(ABC):
-    """
-    Interface for policy (inference) backend abstraction.
-
-    Covers every policy call site in the codebase so a robot skill can drive an
-    action policy without knowing which inference stack serves it. Concrete
-    backends are selected by ``policy.factory.make_policy_backend()`` via the
-    ``DUME_POLICY_BACKEND`` environment variable.
-
-    Every member is deliberately SYNCHRONOUS. Concurrency is handled at the
-    ``@tool`` boundary in ``embodiment/so_arm10x/agent.py`` via
-    ``await asyncio.to_thread(sync_method, *args)``; an ``async def`` here would
-    break that offload pattern and every existing call site.
-    """
+    'Interface for policy (inference) backend abstraction.'
 
     @abstractmethod
     def get_action(
         self, observation_dict: dict[str, Any], lang: str | None = None
     ) -> list[dict[str, float]]:
-        """Run one inference step and return a list of per-timestep action dicts.
-
-        Args:
-            observation_dict: Raw observation keyed by camera name and
-                ``"<joint>.pos"`` — the shape produced by
-                ``IRobotController.get_observation()``.
-            lang: Instruction to condition on. When omitted, the backend falls
-                back to its stored ``language_instruction``.
-
-        Returns:
-            A list (length = action horizon) of ``{"<joint>.pos": float}`` dicts.
-        """
+        'Run one inference step and return a list of per-timestep action dicts.'
         pass
 
     @property
     @abstractmethod
     def language_instruction(self) -> str | None:
-        """The instruction the backend conditions on when ``lang`` is omitted.
-
-        Read-only: mutate it through ``set_lang_instruction`` so a backend can
-        validate/normalize the value. Declared as a property (not a method) to
-        stay source-compatible with the parenthesis-free read at
-        ``embodiment/so_arm10x/skills.py``.
-        """
+        'The instruction the backend conditions on when ``lang`` is omitted.'
         pass
 
     @abstractmethod
@@ -238,14 +191,7 @@ class IPolicyBackend(ABC):
 
 
 class IRobotAgent(ABC):
-    """
-    Interface for robot agent implementations.
-
-    This interface defines the contract for agents that can execute natural
-    language instructions, stream progress updates, and manage robotic tasks.
-    Implementations might use different LLMs, reasoning strategies, or hardware
-    interfaces while maintaining the same API.
-    """
+    'Interface for robot agent implementations.'
 
     @property
     @abstractmethod
@@ -257,36 +203,14 @@ class IRobotAgent(ABC):
     async def arun(
         self, instruction: str, task_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Execute a natural language instruction asynchronously.
-
-        Args:
-            instruction: Natural language command to execute
-            task_id: Optional task identifier for tracking
-
-        Returns:
-            Dict containing execution results and metadata
-        """
+        'Execute a natural language instruction asynchronously.'
         pass
 
     @abstractmethod
     async def astream(
         self, instruction: str, task_id: Optional[str] = None
     ) -> AsyncIterator[Dict[str, Any]]:
-        """
-        Execute instruction with streaming progress updates asynchronously.
-
-        This method yields events during execution, compatible with Strands
-        agents' streaming API. Events should include 'message' and/or 'data'
-        fields for integration with voice assistant streaming.
-
-        Args:
-            instruction: Natural language command to execute
-            task_id: Optional task identifier for tracking
-
-        Yields:
-            Dict with 'message', 'data', or other event information
-        """
+        'Execute instruction with streaming progress updates asynchronously.'
         pass
 
     @abstractmethod
@@ -301,12 +225,7 @@ class IRobotAgent(ABC):
 
 
 class ITaskManager(ABC):
-    """
-    Interface for task lifecycle management.
-
-    Manages the creation, tracking, and lifecycle of tasks in the system.
-    Supports task queuing, status updates, and persistence across restarts.
-    """
+    'Interface for task lifecycle management.'
 
     @abstractmethod
     async def create_task(
@@ -345,22 +264,12 @@ class ITaskManager(ABC):
 
     @abstractmethod
     async def claim_task(self, task_id: str, worker_id: str) -> bool:
-        """
-        Atomically claim a PENDING task for execution by a worker.
-
-        Returns True if the task was successfully claimed and moved to RUNNING,
-        False if it was not claimable (e.g., already claimed or not found).
-        """
+        'Atomically claim a PENDING task for execution by a worker.'
         pass
 
 
 class IMessageBroker(ABC):
-    """
-    Interface for publishing and subscribing to messages during task execution.
-
-    Enables real-time streaming of events to subscribers like the ROS, MQTT, or monitoring systems.
-    Events can include task progress, tool execution results, and streaming data.
-    """
+    'Interface for publishing and subscribing to messages during task execution.'
 
     @abstractmethod
     async def publish(self, message: Message) -> None:
@@ -373,16 +282,7 @@ class IMessageBroker(ABC):
         message_types: Optional[List[MessageType]] = None,
         task_id: Optional[str] = None,
     ) -> AsyncIterator[Message]:
-        """
-        Subscribe to messages with optional filtering.
-
-        Args:
-            message_types: Optional list of message types to filter
-            task_id: Optional task ID to filter messages for specific task
-
-        Yields:
-            Message objects matching the filter criteria
-        """
+        'Subscribe to messages with optional filtering.'
         pass
 
     @abstractmethod
@@ -394,12 +294,7 @@ class IMessageBroker(ABC):
 
 
 class IFleetManager(ABC):
-    """
-    Interface for basic fleet management operations.
-
-    Implementations may be backed by shared memory for local development or by
-    cloud services (e.g., AWS IoT Device Management, Supabase) in production.
-    """
+    'Interface for basic fleet management operations.'
 
     @abstractmethod
     async def register_robot(
@@ -438,12 +333,7 @@ class IFleetManager(ABC):
 
 
 class BackendConfig(BaseModel):
-    """
-    Backend configuration for coordinating agent/server communication.
-
-    Transport-agnostic with optional cloud backends. Uses Pydantic for
-    validation and easy introspection/logging of the effective config.
-    """
+    'Backend configuration for coordinating agent/server communication.'
 
     # Local same-process coordination key
     namespace: str = "default"

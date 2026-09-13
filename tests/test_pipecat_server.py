@@ -1,28 +1,4 @@
-"""
-Tests for pipecat_server.py voice interface and language configuration.
-
-This file tests:
-- Language presets structure and completeness
-- Language, mode, and profile validation
-- Configuration selection for different languages
-- Pipecat 1.x wiring (D-03 / PIPE-05): import resolution, long-running-aware
-  tool registration, LLM function-call timeout, aggregator VAD/turn config,
-  and PipelineWorker/tracing — all mocked / keyless so they run in CI without
-  any DEEPGRAM/ANTHROPIC/AWS/LANGFUSE keys.
-
-The wiring-test approach (per the 01-03 plan): the behaviour-critical
-``register_tools_schema`` long-running policy is asserted with a fully mocked
-``llm`` (capturing ``register_function`` call kwargs); the remaining 1.x wiring
-facts (LLM ``function_call_timeout_secs``, the aggregator
-``LLMUserAggregatorParams`` + ``VADParams(stop_secs=0.8)`` build, and the
-``PipelineWorker`` + ``enable_tracing`` + ``additional_span_attributes`` block)
-are asserted by AST/source introspection of ``pipecat_server.py``. Source
-introspection is used (rather than mocking the full ``run_jarvis`` pipeline
-build) because constructing the cascaded pipeline keyless would require patching
-~10 service/transport classes — the introspection assertions stay in the
-existing lightweight, no-live-keys test style while still pinning the exact
-1.x wiring the migration requires.
-"""
+'Tests for pipecat_server.py voice interface and language configuration.'
 
 import ast
 import os
@@ -205,14 +181,7 @@ class TestPipecat1xImportSmoke:
 
 
 class TestRegisterToolsSchemaTimeoutPolicy:
-    """Catches Pitfall 2 + PIPE-04 / D-02: long-running-aware tool registration.
-
-    Drives ``AsyncMCPClient.register_tools_schema`` with a fully mocked ``llm``
-    and a mocked live MCP session, then asserts on the captured
-    ``llm.register_function`` call kwargs. No live keys / network — the session
-    ``list_tools`` (the source of the ``long_running`` flag under 1.x, since the
-    ``tools_schema`` FunctionSchemas no longer carry ``.meta``) is mocked.
-    """
+    'Catches Pitfall 2 + PIPE-04 / D-02: long-running-aware tool registration.'
 
     @staticmethod
     def _make_tool(name, long_running):
@@ -305,16 +274,7 @@ class TestRegisterToolsSchemaTimeoutPolicy:
 
 
 class TestLLMFunctionCallTimeout:
-    """Catches Pitfall 3 (PIPE-04): every LLM service is constructed with a
-    non-None function_call_timeout_secs (the 1.x default flipped to None, which
-    would hang the voice loop on a stalled normal tool).
-
-    Asserted by AST introspection of pipecat_server.py: each LLM-service
-    constructor call must carry an explicit, non-None function_call_timeout_secs
-    keyword. (Mocking the full run_jarvis build keyless would require patching
-    ~10 classes; the AST assertion stays in the lightweight test style while
-    pinning the exact constructor kwarg.)
-    """
+    'Catches Pitfall 3 (PIPE-04): every LLM service is constructed with a non-None function_call_timeout_secs (the 1.x default flipped to None, which would hang the voice loop on a stalled normal tool).'
 
     @pytest.mark.parametrize(
         "service_name",
@@ -338,16 +298,7 @@ class TestLLMFunctionCallTimeout:
 
 
 class TestAggregatorVadTurnConfig:
-    """Catches a regression of the explicit stop_secs=0.8 (SC5 / D-03
-    "aggregator VAD/turn config"): the user aggregator must be built with
-    LLMUserAggregatorParams AND a SileroVADAnalyzer carrying
-    VADParams(stop_secs=0.8) (NOT the 1.x default of 0.2).
-
-    Asserted by AST introspection: a LLMUserAggregatorParams(...) call exists
-    with a vad_analyzer keyword, and a VADParams(...) call passes
-    stop_secs=0.8. (Source introspection keeps this keyless and in-style; the
-    mocked-build alternative would need the whole pipeline patched.)
-    """
+    'Catches a regression of the explicit stop_secs=0.8 (SC5 / D-03 "aggregator VAD/turn config"): the user aggregator must be built with LLMUserAggregatorParams AND a SileroVADAnalyzer carrying VADParams(stop_secs=0.8) (NOT the 1.x default of 0.2).'
 
     def test_user_aggregator_uses_llm_user_aggregator_params_with_vad(self):
         tree = _server_ast()
@@ -382,12 +333,7 @@ class TestAggregatorVadTurnConfig:
 
 
 class TestPipelineWorkerTracing:
-    """Catches Pitfall 4 + PIPE-05: PipelineWorker (not the deprecated
-    PipelineTask) is used, with enable_tracing=True and an
-    additional_span_attributes dict carrying the Langfuse session id + tags.
-
-    Asserted by AST/source introspection.
-    """
+    'Catches Pitfall 4 + PIPE-05: PipelineWorker (not the deprecated PipelineTask) is used, with enable_tracing=True and an additional_span_attributes dict carrying the Langfuse session id + tags.'
 
     def test_pipeline_worker_used_not_pipeline_task(self):
         source = _server_source()
@@ -424,13 +370,7 @@ class TestPipelineWorkerTracing:
 
 
 class TestLangfuseTraceIO:
-    """Catches LANGFUSE-TRACE-IO / LANGFUSE-INGESTION-VERSION: the trace-level
-    input/output patch and the OTEL ingestion-version header (per the official
-    Langfuse Pipecat doc, "Add Trace Input and Output").
-
-    Asserted by AST/source introspection — keyless, no live Langfuse creds or
-    network — consistent with the other wiring tests in this file.
-    """
+    'Catches LANGFUSE-TRACE-IO / LANGFUSE-INGESTION-VERSION: the trace-level input/output patch and the OTEL ingestion-version header (per the official Langfuse Pipecat doc, "Add Trace Input and Output").'
 
     def test_patch_function_defined(self):
         """patch_trace_input_output is defined as a module-level function."""
@@ -442,12 +382,7 @@ class TestLangfuseTraceIO:
         ), "expected a patch_trace_input_output function definition in pipecat_server.py"
 
     def test_patch_called_before_setup_tracing(self):
-        """The patch is invoked before setup_tracing(...) in source order.
-
-        Mirrors the wiring-test style; the runtime guarantee is "called before
-        setup_tracing" so the wrapped add_llm_span_attributes is installed before
-        tracing starts emitting spans.
-        """
+        'The patch is invoked before setup_tracing(...) in source order.'
         source = _server_source()
         assert "patch_trace_input_output()" in source, (
             "patch_trace_input_output() must be called inside the Langfuse block"
@@ -472,13 +407,8 @@ class TestLangfuseTraceIO:
         )
 
 
-# --- Phase 2 speech-model wiring tests (SPCH-06 / D-06) ---------------------
-#
 # These keyless, no-network tests pin every Phase 2 speech-model change so a
 # regression in the model swap is caught in CI. The behavioural acceptance
-# evidence (multi-language conversation, the zh Aura-2->ElevenLabs fallback, and
-# a >8-min Nova Sonic 2 session) is the documented manual live smoke test in the
-# README — CI wiring is not the sole evidence (threat T-02-07/08).
 
 
 class TestDeepgramSTTSettingsMigration:
@@ -562,13 +492,7 @@ class TestPerLanguageTTSRouting:
         )
 
     def test_zh_elevenlabs_uses_streaming_compatible_model(self):
-        """UAT (test 2): the zh ElevenLabs fallback must use a STREAMING-compatible
-        model. pipecat's websocket ElevenLabsTTSService uses the multi-stream-input
-        endpoint, which only serves ELEVENLABS_MULTILINGUAL_MODELS
-        (eleven_flash_v2_5 / eleven_turbo_v2_5). eleven_multilingual_v2 is NOT a
-        streaming model — that endpoint returns a final message with NO audio (silent
-        failure observed in UAT). The preset must select a streaming model, and the
-        constructor must thread the preset model through (not hard-code one)."""
+        "UAT (test 2): the zh ElevenLabs fallback must use a STREAMING-compatible model. pipecat's websocket ElevenLabsTTSService uses the multi-stream-input endpoint, which only serves ELEVENLABS_MULTILINGUAL_MODELS (eleven_flash_v2_5 / eleven_turbo_v2_5). eleven_multilingual_v2 is NOT a streaming model — that endpoint returns a final message with NO audio (silent failure observed in UAT)."
         from pipecat_server import LANGUAGE_PRESETS
 
         # The streaming models pipecat's websocket service supports (and which accept
@@ -642,12 +566,7 @@ class TestNovaSonic2Wiring:
         )
 
     def test_nova_sonic2_bootstrap_does_not_use_v1_trigger(self):
-        """UAT (test 3): Nova Sonic 2 is kicked off with a plain LLMRunFrame(), NOT
-        the Nova Sonic 1 'await-trigger' pattern. On amazon.nova-2-sonic-v1:0,
-        trigger_assistant_response() is a NO-OP (pipecat logs 'Assistant response
-        trigger not needed'), and injecting AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION
-        makes the model wait for a 'ready' cue that never arrives — so it never greets
-        or responds. Assert the v1 trigger pattern is gone and LLMRunFrame() remains."""
+        "UAT (test 3): Nova Sonic 2 is kicked off with a plain LLMRunFrame(), NOT the Nova Sonic 1 'await-trigger' pattern. On amazon.nova-2-sonic-v1:0, trigger_assistant_response() is a NO-OP (pipecat logs 'Assistant response trigger not needed'), and injecting AWAIT_TRIGGER_ASSISTANT_RESPONSE_INSTRUCTION makes the model wait for a 'ready' cue that never arrives — so it never greets or responds."
         source = _server_source()
         assert "trigger_assistant_response" not in source, (
             "Nova Sonic 2 must NOT call trigger_assistant_response() — it is a no-op on "
@@ -662,12 +581,7 @@ class TestNovaSonic2Wiring:
         )
 
     def test_nova_sonic_credentials_resolved_via_chain_not_only_env(self):
-        """UAT (test 3): Nova Sonic builds a static smithy credentials resolver and
-        does NOT walk the AWS credential chain itself. Reading only os.getenv for the
-        access key/secret fails (SmithyIdentityError 'credentials weren't configured')
-        whenever auth lives in ~/.aws/credentials / a profile / SSO. Assert the
-        constructor's credential kwargs are fed by resolve_aws_static_credentials()
-        (the botocore-chain resolver), not by a bare os.getenv() alone."""
+        "UAT (test 3): Nova Sonic builds a static smithy credentials resolver and does NOT walk the AWS credential chain itself. Reading only os.getenv for the access key/secret fails (SmithyIdentityError 'credentials weren't configured') whenever auth lives in ~/.aws/credentials / a profile / SSO. Assert the constructor's credential kwargs are fed by resolve_aws_static_credentials() (the botocore-chain resolver), not by a bare os.getenv() alone."
         source = _server_source()
         assert "resolve_aws_static_credentials" in source, (
             "pipecat_server must resolve AWS creds through the botocore default chain "
@@ -768,14 +682,7 @@ class TestNovaSonic2Wiring:
 
 
 class TestNovaSonicToolSchemaSanitization:
-    """SPCH-04: Nova Sonic's tool validator rejects the raw MCP/FastMCP tool schemas
-    (anyOf/null for Optional params, default, additionalProperties) with "Invalid
-    input request, please fix your input and try again." at session setup. The
-    speech_to_speech+aws path must coerce schemas to Nova Sonic's restricted shape
-    BEFORE building the LLMContext, without disturbing the cascaded Claude path
-    (which tolerates the raw schemas). Behavioural unit tests on the sanitizer +
-    AST guard that it is applied on the s2s path.
-    """
+    'SPCH-04: Nova Sonic\'s tool validator rejects the raw MCP/FastMCP tool schemas (anyOf/null for Optional params, default, additionalProperties) with "Invalid input request, please fix your input and try again." at session setup. The speech_to_speech+aws path must coerce schemas to Nova Sonic\'s restricted shape BEFORE building the LLMContext, without disturbing the cascaded Claude path (which tolerates the raw schemas).'
 
     def _server_module(self):
         import importlib
@@ -886,14 +793,7 @@ class TestNovaSonicToolSchemaSanitization:
 
 
 class TestNovaSonicToolResultObject:
-    """SPCH-04: function-call results pass through two serialization layers — the
-    universal aggregator json.dumps(frame.result) then Nova Sonic forwards it. Nova
-    Sonic's Bedrock side REJECTS a tool result whose top-level JSON is not an object
-    ("Unsupported JSON type in Tool Result. Please provide the Tool Result as a JSON
-    object"). The MCP tool wrapper must therefore hand the result_callback a dict so
-    the top-level JSON the model sees is always an object. Behavioural unit tests on
-    the coercion helper + the two-layer round-trip.
-    """
+    'SPCH-04: function-call results pass through two serialization layers — the universal aggregator json.dumps(frame.result) then Nova Sonic forwards it. Nova Sonic\'s Bedrock side REJECTS a tool result whose top-level JSON is not an object ("Unsupported JSON type in Tool Result. Please provide the Tool Result as a JSON object").'
 
     def _server_module(self):
         import importlib
@@ -1007,12 +907,7 @@ class TestNovaSonicToolResultObject:
 
 
 class TestSageMakerBackendSelector:
-    """SPCH-05 / D-05: the DUME_DEEPGRAM_BACKEND=sagemaker path is WIRED but the
-    endpoint is NOT deployed this milestone — it raises ValueError on a missing
-    endpoint (never silently falls back to hosted), and references the
-    Deepgram-on-SageMaker services. Pattern D (behavioural, via run_jarvis) +
-    Pattern B (AST/source).
-    """
+    'SPCH-05 / D-05: the DUME_DEEPGRAM_BACKEND=sagemaker path is WIRED but the endpoint is NOT deployed this milestone — it raises ValueError on a missing endpoint (never silently falls back to hosted), and references the Deepgram-on-SageMaker services. Pattern D (behavioural, via run_jarvis) + Pattern B (AST/source).'
 
     def test_sagemaker_stt_service_referenced(self):
         """Pattern B: the SageMaker STT service is referenced (wired) in source."""
@@ -1064,14 +959,7 @@ class TestSageMakerBackendSelector:
         )
 
     def test_sagemaker_branch_honors_elevenlabs_routing(self):
-        """CR-01 regression: the sagemaker TTS branch must honor the same
-        per-language `tts_engine == "elevenlabs"` routing as the hosted path.
-        Aura-2 (Deepgram TTS, hosted or SageMaker) has no Mandarin voice, so a
-        `zh` request under the sagemaker backend must route to ElevenLabs — NOT
-        fall back to an English aura2_voice. Assert structurally that BOTH the
-        hosted and sagemaker branches gate on tts_engine == "elevenlabs" (two
-        occurrences), proving the SageMaker branch is no longer
-        unconditionally Aura-2."""
+        'CR-01 regression: the sagemaker TTS branch must honor the same per-language `tts_engine == "elevenlabs"` routing as the hosted path. Aura-2 (Deepgram TTS, hosted or SageMaker) has no Mandarin voice, so a `zh` request under the sagemaker backend must route to ElevenLabs — NOT fall back to an English aura2_voice.'
         from pipecat_server import LANGUAGE_PRESETS
 
         source = _server_source()

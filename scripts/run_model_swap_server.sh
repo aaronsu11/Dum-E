@@ -2,13 +2,9 @@
 set -euo pipefail
 profile="${1:?Usage: run_model_swap_server.sh pi05-base|pi05-so101|molmoact2-so101|groot-so101 [image]}"
 case "$profile" in pi05-base|pi05-so101|molmoact2-so101|groot-so101) ;; *) echo "Unknown profile" >&2; exit 1;; esac
-if [[ "$profile" == pi05-so101 ]]; then
-  image="${2:-dume-model-swap:pi05-so101-phase10}"
-else
-  image="${2:-dume-model-swap:phase8.1}"
-fi
+image="${2:-dume-model-swap:local}"
 cache="${MODEL_SWAP_CACHE:-$HOME/.cache/huggingface}"
-evidence="${MODEL_SWAP_EVIDENCE:-$PWD/corpus/model-swap-$profile}"
+evidence="${MODEL_SWAP_EVIDENCE:-$PWD/outputs/model-swap-$profile}"
 mkdir -p "$cache" "$evidence"
 gpu_users="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)"
 [[ -z "$gpu_users" ]] || { echo "GPU already has a compute process; stop the previous model before switching." >&2; exit 1; }

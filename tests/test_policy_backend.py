@@ -1,20 +1,4 @@
-"""Policy-backend seam tests.
-
-Covers the policy-backend selection seam:
-- ``IPolicyBackend`` covers every existing policy call site.
-- Omitting ``DUME_POLICY_BACKEND`` selects ``lerobot``.
-- An unknown value RAISES (never warn-and-fall-back).
-- ``lerobot`` is CONSTRUCTIBLE and is an ``IPolicyBackend`` — it stopped raising
-  "not implemented yet" in phase 06 plan 04; the wire-level contract for that
-  backend lives in ``tests/test_lerobot_backend.py``.
-- ``groot-native`` stays selectable AND functional — proven end to end
-  against the real ``scripts/mock_policy_server.py`` over a real loopback ZMQ
-  socket, not a mocked transport.
-
-Every test here is KEYLESS, GPU-FREE and HARDWARE-FREE: no policy server, no
-checkpoint, no SO101 arm, no serial port. The only network use is 127.0.0.1 on
-an ephemeral port.
-"""
+'Policy-backend seam tests.'
 
 import os
 import socket
@@ -84,12 +68,7 @@ def _wait_for_port(port: int, host: str = "127.0.0.1", timeout: float = 5.0) -> 
 
 
 def _synthetic_observation(height: int = 64, width: int = 64) -> dict:
-    """A single raw observation dict shaped exactly as the controller expects.
-
-    Flat ``{cam_key: HxWx3 uint8, "<joint>.pos": float}``. Values are arbitrary —
-    this exercises the seam and the wire path, not policy quality. Frames are
-    small so the msgpack payload stays fast over loopback.
-    """
+    'A single raw observation dict shaped exactly as the controller expects.'
     obs: dict = {
         k: np.random.randint(0, 255, (height, width, 3), dtype=np.uint8)
         for k in CAMERA_KEYS
@@ -101,12 +80,7 @@ def _synthetic_observation(height: int = 64, width: int = 64) -> dict:
 
 @pytest.fixture
 def mock_server():
-    """Run ``scripts/mock_policy_server.serve_mock`` on an ephemeral loopback port.
-
-    Yields the port. The server runs in a daemon thread bound to 127.0.0.1 so it
-    cannot leak beyond the test host and a stray loop cannot wedge interpreter
-    shutdown; the contract's "kill" endpoint stops the loop in teardown.
-    """
+    'Run ``scripts/mock_policy_server.serve_mock`` on an ephemeral loopback port.'
     port = _free_port()
     thread = threading.Thread(
         target=serve_mock, kwargs={"port": port, "host": "127.0.0.1"}, daemon=True
@@ -137,12 +111,7 @@ def mock_server():
 
 
 def test_groot_native_end_to_end_over_real_socket(mock_server):
-    """DUME_POLICY_BACKEND=groot-native -> one action chunk off a real socket.
-
-    The whole slice in one check: env selector -> make_policy_backend() ->
-    IPolicyBackend -> Gr00tRobotInferenceClient -> real ZMQ REQ/REP over loopback
-    -> the v1.0 modality contract flattened back into per-step joint dicts.
-    """
+    'DUME_POLICY_BACKEND=groot-native -> one action chunk off a real socket.'
     port = mock_server
     instruction = "Grab a banana and put it on the plate"
 
@@ -181,13 +150,7 @@ def test_groot_native_end_to_end_over_real_socket(mock_server):
 
 
 def test_unknown_backend_raises_with_value_and_allowlist():
-    """An unknown value RAISES; it never warns and falls back.
-
-    Deliberate divergence from the DUME_DEEPGRAM_BACKEND analog, which warns and
-    defaults to 'hosted'. Silently swapping which neural network commands a
-    physical arm is worse than a crash. The message must name the offending value
-    AND the full allowlist so the operator can fix it without reading the source.
-    """
+    'An unknown value RAISES; it never warns and falls back.'
     with mock.patch.dict(
         os.environ, {"DUME_POLICY_BACKEND": "nonsense"}, clear=True
     ):
@@ -200,39 +163,26 @@ def test_unknown_backend_raises_with_value_and_allowlist():
         assert allowed in message
 
 
-def test_default_backend_is_lerobot():
-    """With DUME_POLICY_BACKEND unset, the selected backend is 'lerobot'.
-
-    Observable through the TYPE the factory returns — proving the CODE-level
-    default rather than a config-file default. Until phase 06 plan 04 this was
-    observable through the lerobot branch's own raise; that raise is gone, so the
-    default is now asserted on the constructed object instead. clear=True
-    guarantees no inherited DUME_POLICY_BACKEND leaks in from the runner
-    environment.
-    """
-    assert DEFAULT_POLICY_BACKEND == "lerobot"
+def test_default_backend_matches_launcher_and_example():
+    "Unconfigured factory and launcher select the same native backend."
+    import yaml
+    assert DEFAULT_POLICY_BACKEND == "groot-native"
+    config = yaml.safe_load((Path(__file__).parents[1] / "config.example.yaml").read_text())
+    assert config["controller"]["policy_backend"] == DEFAULT_POLICY_BACKEND
 
     with mock.patch.dict(os.environ, {}, clear=True):
         assert os.getenv("DUME_POLICY_BACKEND") is None
         backend = make_policy_backend(host="127.0.0.1", port=_free_port())
 
     try:
-        assert type(backend).__name__ == "LeRobotPolicyBackend"
+        assert type(backend).__name__ == "Gr00tRobotInferenceClient"
         assert isinstance(backend, IPolicyBackend)
     finally:
         backend.close()
 
 
 def test_lerobot_backend_is_constructible_and_is_an_ipolicybackend():
-    """'lerobot' returns a backend, and CONSTRUCTION does not connect.
-
-    Two claims. (1) The branch no longer raises: the single not-implemented
-    ``raise`` this whole phase existed to replace is gone. (2) Construction opens a
-    channel but calls nothing — a gRPC channel is lazy — so a backend built
-    against an unbound port must come back cleanly and report ``ping() is False``
-    rather than raising. A ``ping()`` that returned True against an unbound port
-    would mean it is not probing the socket at all.
-    """
+    "'lerobot' returns a backend, and CONSTRUCTION does not connect."
     port = _free_port()
     with mock.patch.dict(
         os.environ, {"DUME_POLICY_BACKEND": "lerobot"}, clear=True
@@ -247,12 +197,7 @@ def test_lerobot_backend_is_constructible_and_is_an_ipolicybackend():
 
 
 def test_factory_module_import_pulls_no_torch_or_lerobot():
-    """Lazy-import discipline: importing the factory stays torch-free.
-
-    Run in a SUBPROCESS so the assertion is unaffected by whatever the rest of
-    the suite already imported. The groot-native path must not pay for the
-    LeRobot/GPU stack that the lerobot branch will pull in once it is wired.
-    """
+    'Lazy-import discipline: importing the factory stays torch-free.'
     probe = (
         "import sys; import policy.factory; "
         "forbidden = sorted(m for m in sys.modules "
@@ -311,14 +256,7 @@ def test_language_instruction_is_readonly_property():
 
 
 def test_get_action_without_any_instruction_raises(mock_server):
-    """Empty edge: no argument instruction AND no stored one -> raise.
-
-    A null `annotation.human.task_description` on the wire is silent garbage-in
-    that would surface downstream as apparent checkpoint drift, so it must never
-    be sent. The error names the missing instruction, not a generic failure. The
-    guard fires before any socket send; the positive half then proves the stored
-    instruction really lands under the PINNED key.
-    """
+    'Empty edge: no argument instruction AND no stored one -> raise.'
     client = Gr00tRobotInferenceClient(host="127.0.0.1", port=mock_server)
     try:
         with pytest.raises(ValueError) as excinfo:

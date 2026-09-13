@@ -1,28 +1,4 @@
-"""Calibration-file assertion at connect.
-
-lerobot 0.6.1 consolidated ``so101_follower`` into ``so_follower``, and
-``Robot.__init__`` derives its calibration directory from the robot class's own
-``name``. The rename therefore moves the lookup from
-``<root>/robots/so101_follower/`` to ``<root>/robots/so_follower/``. The locked
-resolution *copies* the calibration file to the new path (pinning
-``config.calibration_dir`` was offered and declined), and accepted the resulting
-two-copies-can-drift tradeoff on the condition that ``connect()`` logs the loaded
-path plus a content checksum so a wrong or missing file is visible.
-
-Why the assertion is load-bearing rather than defensive: ``range_min`` /
-``range_max`` in that file are raw encoder ticks that upstream normalization maps
-onto the numbers fed to the policy, so the calibration file is part of the
-checkpoint's input contract. And ``SOFollower.is_calibrated`` interrogates the
-**motors**, not the file — if the servos still hold calibration in firmware,
-``connect()`` skips calibration and reports success while the in-Python
-calibration mapping stays empty, so the failure surfaces at the first bus read,
-after connect already looked fine. These tests pin the assertion into that
-window.
-
-Every test here is hermetic: a temporary calibration root pointed at by the
-documented environment variable, no serial port, no real robot, no network, no
-dependence on this machine's own calibration file.
-"""
+'Calibration-file assertion at connect.'
 
 import hashlib
 import json
@@ -93,25 +69,14 @@ def test_calibration_root_resolves_from_documented_environment_variable(
 def test_calibration_root_falls_back_to_lerobot_home_plus_calibration(
     tmp_path, monkeypatch
 ):
-    """With no explicit override the root is ``HF_LEROBOT_HOME / "calibration"``.
-
-    This mirrors ``lerobot.utils.constants``' ``default_calibration_path``. The
-    point of resolving it here rather than importing the upstream constant is
-    that the upstream constant is evaluated at import time, so it cannot be
-    redirected by a test (or by anything that sets the variable late).
-    """
+    'With no explicit override the root is ``HF_LEROBOT_HOME / "calibration"``.'
     monkeypatch.delenv("HF_LEROBOT_CALIBRATION", raising=False)
     monkeypatch.setenv("HF_LEROBOT_HOME", str(tmp_path / "lerobot-home"))
     assert resolve_lerobot_calibration_root() == tmp_path / "lerobot-home" / "calibration"
 
 
 def test_calibration_file_path_matches_the_upstream_derivation(calibration_root):
-    """``<root>/robots/<robot class name>/<robot id>.json``, per ``Robot.__init__``.
-
-    Upstream builds ``HF_LEROBOT_CALIBRATION / ROBOTS / self.name`` then appends
-    ``f"{self.id}.json"``. The renamed class's ``name`` is ``so_follower``, which
-    is precisely why the file has to move.
-    """
+    '``<root>/robots/<robot class name>/<robot id>.json``, per ``Robot.__init__``.'
     derived = resolve_calibration_file(SO_FOLLOWER_NAME, ROBOT_ID)
     assert derived == calibration_root / "robots" / SO_FOLLOWER_NAME / f"{ROBOT_ID}.json"
 
@@ -156,14 +121,7 @@ def test_calibration_assertion_raises_naming_the_expected_path_when_absent(
 def test_calibration_assertion_checks_the_file_not_the_containing_directory(
     calibration_root,
 ):
-    """An existing but empty calibration directory is NOT evidence.
-
-    ``Robot.__init__`` calls ``mkdir(parents=True, exist_ok=True)`` on the derived
-    path, so after the rename a directory listing shows a freshly created,
-    provisioned-looking, empty ``so_follower/`` directory. A guard that checked
-    directory existence would pass on exactly the broken state this exists to
-    catch.
-    """
+    'An existing but empty calibration directory is NOT evidence.'
     empty_dir = calibration_root / "robots" / SO_FOLLOWER_NAME
     empty_dir.mkdir(parents=True, exist_ok=True)
     assert empty_dir.is_dir()
@@ -181,12 +139,7 @@ def test_calibration_assertion_checks_the_file_not_the_containing_directory(
 def test_controller_calibration_assertion_prefers_the_robots_own_derived_path(
     calibration_root, tmp_path
 ):
-    """The method uses ``robot.calibration_fpath`` when the robot exposes it.
-
-    That attribute is the authoritative answer to "which file will lerobot
-    load" — it already accounts for a ``config.calibration_dir`` override. Env
-    re-derivation is the fallback for when no robot object is available.
-    """
+    'The method uses ``robot.calibration_fpath`` when the robot exposes it.'
     authoritative_dir = tmp_path / "authoritative" / "robots" / SO_FOLLOWER_NAME
     written = _write_calibration(authoritative_dir)
 
@@ -211,14 +164,7 @@ def test_controller_calibration_assertion_prefers_the_robots_own_derived_path(
 def test_connect_asserts_calibration_before_reading_any_observation(
     calibration_root,
 ):
-    """``connect()`` runs the calibration assertion in the pre-observation window.
-
-    Ordering is the whole point: the robot's own ``is_calibrated`` reads the
-    motors, so ``robot.connect()`` can return successfully with an empty
-    in-Python calibration. The assertion must therefore run after the connect and
-    before anything touches an observation, which is where the ``RuntimeError``
-    would otherwise surface.
-    """
+    '``connect()`` runs the calibration assertion in the pre-observation window.'
     calls: list[str] = []
 
     def _fail_on_observation():

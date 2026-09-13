@@ -1,34 +1,12 @@
 # syntax=docker/dockerfile:1.7
-#
 # ==================== DELIBERATE DIVERGENCE: this repo vendors a Dockerfile ====================
-#
 # scripts/build_gr00t_image.sh's header states the opposite rule — "it never
-# forks docker/build.sh, never vendors a Dockerfile" — and that rule was right
-# THERE for a reason that does not hold HERE: Isaac-GR00T ships its own
-# docker/build.sh, so there was an upstream build to delegate to and delegating
-# was strictly better than reimplementing.
-#
-# LeRobot ships NO policy-server image build. There is nothing to delegate to.
-# And the Cosmos backbone pre-cache needs a layer we own regardless, because
-# _build_n1_7_processor accepts no `revision` argument
-# (processor_groot.py:1369-1381), so a pinned revision can ONLY be enforced by
-# what is in the image's HF cache plus HF_HUB_OFFLINE=1.
-#
-# The reproducibility anchor therefore shifts from a git SHA to A PIP PIN PLUS AN
-# HF REVISION SHA, and both are fail-closed: the pip pin is exact, and the
-# pre-cache layer asserts the snapshot directory it just downloaded actually
-# exists. Do NOT "restore parity" by wrapping this in a fake delegator — there is
-# no upstream script behind it, and a delegator that delegates to itself is a lie
-# in the build graph.
 
 ARG CUDA_BASE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 FROM ${CUDA_BASE}
 
 # lerobot 0.6.1 declares `Requires-Python: >=3.12`, and Ubuntu 24.04 ships
 # Python 3.12 as its system python3 — that is why this base is 24.04 and not
-# 22.04. (The Isaac-GR00T container is Py3.10; this one is Py3.12. Do not
-# conflate them.) torch's own PyPI wheels bundle their CUDA libraries, so the
-# base image only has to be driver-compatible, not a full CUDA devel image.
 ARG LEROBOT_PIN
 ARG BACKBONE_MODEL
 ARG BACKBONE_REVISION
@@ -61,17 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m pip install --no-cache-dir "lerobot[groot,async]==${LEROBOT_PIN}"
 
 # Pre-cache the VLM backbone at the PINNED revision.
-#
 # HF_TOKEN arrives as a BUILD SECRET and is readable only inside this one RUN
-# layer: nvidia/Cosmos-Reason2-2B reports `gated: "auto"`, so the download needs
-# a token. NEVER `ARG HF_TOKEN` and NEVER `ENV HF_TOKEN` — either would persist
-# the secret into an image layer / the image environment, which is exactly the
-# leak `docker image inspect --format '{{json .Config.Env}}'` is asserted against.
-#
-# The assertion in the same RUN is what makes the layer fail-closed: a
-# cache-empty layer and a correctly-cached layer are otherwise indistinguishable
-# later, and under HF_HUB_OFFLINE=1 below a cache miss is FATAL at first
-# inference — far from the build that caused it.
 RUN --mount=type=secret,id=hf_token python3 <<'PY'
 import os
 import sys
@@ -95,20 +63,6 @@ print(f"Cached {model} @ {revision} at {snapshot}")
 
 # ==================== WHY refs/main IS WRITTEN BY HAND ====================
 # snapshot_download(..., revision=<sha>) populates blobs/ and snapshots/<sha>/ but
-# writes NO refs/ entry, because a SHA is not a moving reference. Every consumer
-# downstream, however, asks for the repo by NAME with no revision -
-# _build_n1_7_processor calls AutoTokenizer/Qwen2VLImageProcessor/
-# Qwen3VLVideoProcessor .from_pretrained(model_name) (processor_groot.py:1371-1373)
-# and cannot be given a revision (it takes no such argument). That resolves the
-# revision "main", and resolving "main" under HF_HUB_OFFLINE=1 requires refs/main
-# on disk. Without it the load fails with transformers' generic "couldn't connect
-# ... and couldn't find them in the cached files" - while EVERY FILE IT NEEDS IS
-# ALREADY THERE. The files were never the problem; the ref mapping was.
-#
-# So refs/main is written to point at the PINNED sha. That is deliberately
-# stronger than pre-caching main would be: inside this image "main" now resolves
-# to exactly BACKBONE_REVISION and can never drift to whatever upstream's main
-# becomes later, which is the whole point of D-08's pin.
 refs = snapshot.parent.parent / "refs"
 refs.mkdir(parents=True, exist_ok=True)
 (refs / "main").write_text(revision)
@@ -117,15 +71,6 @@ PY
 
 # Fail the BUILD, not the first inference request, if the cache cannot actually
 # satisfy an offline processor build.
-#
-# The previous assertion checked that the snapshot DIRECTORY existed, which it
-# did - and the load still failed at first inference on the missing refs/main
-# above. "The directory is there" and "the assets resolve offline" are different
-# claims, and only the second one is what HF_HUB_OFFLINE=1 needs to be true. So
-# this asserts the second, by calling the SAME private builder inference calls
-# (processor_groot.py:2072) with offline forced on. It is CPU-only and loads no
-# model weights: a tokenizer plus two image/video processors.
-# tests/test_lerobot_upstream_surface.py pins the symbol.
 RUN HF_HUB_OFFLINE=1 python3 <<'PY'
 import sys
 
@@ -156,34 +101,12 @@ COPY docker/lerobot-policy/*.py /app/docker/lerobot-policy/
 
 # ==================== ONE IMPLEMENTATION, TWO CALL SITES ====================
 # This single COPY is what makes SAFE-01's "one implementation, two call sites"
-# true ACROSS THE PROCESS BOUNDARY. Both in-container call sites — the
-# config-only preflight in entrypoint.py and the post-load hook in server.py —
-# import `policy_guard.groot_guard` from here, and it is byte-identical to the
-# file `tests/test_groot_guard.py` exercises in the Dum-E venv, because it IS
-# that file.
-#
-# The alternative — restating the assertions inside the image — is precisely the
-# "two code paths to keep in sync" cost D-04 option 3 was warned about, and a
-# second copy could silently drift into passing where the first refused. There is
-# deliberately no second copy: an acceptance criterion asserts the in-container
-# module resolves to a path under /app/policy_guard/ (T-06-15).
-#
-# `policy_guard/__init__.py` is 0 bytes on purpose (06-02): importing it must not
-# pull a client-side dependency into the policy container, which is also why the
-# guard does NOT live in `shared/` (whose __init__ imports pydantic at module
-# scope). Adding this COPY also required re-admitting `policy_guard/` in the
-# repo-root `.dockerignore`, whose allowlist denies everything by default — that
-# friction is intended and the decision is recorded there.
 COPY policy_guard/ /app/policy_guard/
 COPY scripts/serve_observed_lerobot.py /app/scripts/serve_observed_lerobot.py
 
 WORKDIR /app
 # So both /app/docker/lerobot-policy/*.py and any process started with an
 # explicit script path (the CMD below, and `--preflight-only` invocations that
-# pass /app/docker/lerobot-policy/entrypoint.py) resolve `policy_guard` from
-# /app. WORKDIR alone is not sufficient: Python prepends the SCRIPT's directory
-# to sys.path, not the cwd, so without this the entrypoint would import
-# policy_guard only by accident of being run from /app.
 ENV PYTHONPATH=/app
 
 CMD ["python3", "/app/scripts/serve_observed_lerobot.py", "--host", "0.0.0.0", "--port", "8080"]

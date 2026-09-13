@@ -1,20 +1,4 @@
-"""
-Comprehensive tests for Dum-E main application (dum_e.py).
-
-This file consolidates all tests for the main application components including:
-- Configuration resolution and priority handling
-- Process spawning (MCP server, Pipecat server, agent worker)
-- Environment variable injection and inheritance
-- End-to-end integration testing with shared memory backends
-- Error handling and edge cases
-
-Test Design Philosophy:
-- Unit tests for individual functions with mocked dependencies
-- Integration tests for multi-component workflows
-- Environment isolation to prevent test interference
-- Comprehensive coverage of configuration priority (args > config > env)
-- Hardware-independent testing using mocks and shared memory
-"""
+'Comprehensive tests for Dum-E main application (dum_e.py).'
 
 import argparse
 import asyncio
@@ -530,12 +514,7 @@ class TestSpawnAgentWorker:
 
     @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_forwards_policy_backend_from_config(self, mock_popen):
-        """controller.policy_backend is forwarded as DUME_POLICY_BACKEND.
-
-        The agent worker is the process that reaches
-        policy.factory.make_policy_backend(), so the YAML selection has to arrive
-        in its environment or the factory falls back to its own default.
-        """
+        'controller.policy_backend is forwarded as DUME_POLICY_BACKEND.'
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
         controller_config = {"policy_backend": "groot-native"}
@@ -552,12 +531,7 @@ class TestSpawnAgentWorker:
 
     @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_policy_backend_default_when_unset(self, mock_popen):
-        """With no controller config key, the shipped default is applied.
-
-        The example config selects the backend that works today, so the launcher
-        default matches it rather than leaving the worker to hit the code-level
-        'lerobot' default (which raises, being unimplemented).
-        """
+        'With no controller config key, the shipped default is applied.'
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
 
@@ -580,12 +554,7 @@ class TestSpawnAgentWorker:
     def test_spawn_agent_worker_shell_env_policy_backend_overrides_config(
         self, mock_popen
     ):
-        """An exported DUME_POLICY_BACKEND must WIN over the config file value.
-
-        Precedence is shell env > config > default (env.setdefault, never
-        env.update). An operator pinning which neural network commands the arm
-        must not be silently overridden by a stale my-dum-e.yaml.
-        """
+        'An exported DUME_POLICY_BACKEND must WIN over the config file value.'
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
         controller_config = {"policy_backend": "lerobot"}
@@ -602,14 +571,7 @@ class TestSpawnAgentWorker:
 
     @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_forwards_use_degrees_from_config(self, mock_popen):
-        """controller.use_degrees is forwarded as DUME_USE_DEGREES.
-
-        The joint-value convention was a constructor default before this, so it
-        could only be changed by editing code — and lerobot 0.6.x independently
-        flipped its OWN default, meaning today's behaviour survived by
-        coincidence. Making it configuration is what lets docs/UNITS-VERDICT.md's
-        verdict be acted on later without a code edit.
-        """
+        'controller.use_degrees is forwarded as DUME_USE_DEGREES.'
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
 
@@ -637,15 +599,7 @@ class TestSpawnAgentWorker:
     def test_spawn_agent_worker_use_degrees_string_false_coerces_to_false(
         self, mock_popen
     ):
-        """A YAML `false` spelling must become a real False, not a truthy string.
-
-        This is the operative edge for the units convention. Env vars are always strings, and
-        every non-empty string is truthy in Python — so `if os.getenv(...)` would
-        read "false" as True and silently select the degrees convention. The
-        launcher forwards a recognised spelling and the controller coerces it
-        explicitly; both halves are asserted here because either alone would let
-        the trap through.
-        """
+        'A YAML `false` spelling must become a real False, not a truthy string.'
         from embodiment.so_arm10x.controller import resolve_use_degrees
 
         config = BackendConfig(namespace="test")
@@ -676,12 +630,7 @@ class TestSpawnAgentWorker:
     def test_spawn_agent_worker_forwards_max_relative_target_from_config(
         self, mock_popen
     ):
-        """controller.max_relative_target is forwarded as a float string.
-
-        The clamp must reach the config as a float — an int raises TypeError
-        inside the clamp helper at the exact moment the clamp would have engaged —
-        so the forwarded string has to parse back as one.
-        """
+        'controller.max_relative_target is forwarded as a float string.'
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
 
@@ -709,15 +658,7 @@ class TestSpawnAgentWorker:
     def test_spawn_agent_worker_forwards_lerobot_handshake_keys_from_config(
         self, mock_popen
     ):
-        """The five D-11 handshake values reach the worker as DUME_LEROBOT_* vars.
-
-        These decide which network endpoint serves the policy, which checkpoint
-        the server resolves, and how many action steps come back — so they must
-        be configuration rather than constructor defaults nobody reads.
-        `actions_per_chunk` is the load-bearing one: 40 is the well-lit wrong
-        value (GrootConfig's default AND the checkpoint's own config.json), and
-        16 is correct.
-        """
+        'The five D-11 handshake values reach the worker as DUME_LEROBOT_* vars.'
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
         controller_config = {
@@ -753,12 +694,7 @@ class TestSpawnAgentWorker:
     def test_spawn_agent_worker_omits_lerobot_keys_the_config_does_not_name(
         self, mock_popen
     ):
-        """A key the config does not name is not forwarded at all.
-
-        Every default lives in exactly ONE place — policy/lerobot/backend.py, the
-        module that owns the handshake — so restating it in the launcher could
-        only drift from the process that actually talks to the policy server.
-        """
+        'A key the config does not name is not forwarded at all.'
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
         lerobot_vars = (
@@ -792,13 +728,7 @@ class TestSpawnAgentWorker:
     def test_spawn_agent_worker_shell_env_lerobot_keys_override_config(
         self, mock_popen
     ):
-        """An exported DUME_LEROBOT_* value must WIN over the config file.
-
-        Precedence is shell env > config > backend default (env.setdefault, never
-        env.update). An operator pinning the action horizon or the checkpoint path
-        for a debugging run must not be silently overridden by a stale
-        my-dum-e.yaml.
-        """
+        'An exported DUME_LEROBOT_* value must WIN over the config file.'
         config = BackendConfig(namespace="test")
         agent_args = {"use_mock": True, "id": "mock_robot"}
         controller_config = {
@@ -945,14 +875,7 @@ class TestEndToEndIntegration:
 
     @pytest.mark.asyncio
     async def test_dum_e_http_progress_integration(self, monkeypatch):
-        """End-to-end HTTP integration with FastMCP client and mock worker.
-
-        This test:
-        - Spawns MCP server (HTTP) and a mock agent worker using dum_e helpers
-        - Connects a FastMCP Client to the HTTP endpoint and calls execute_robot_instruction
-        - Captures progress events via client's progress_handler and validates streaming
-        - Terminates all processes cleanly after assertions
-        """
+        'End-to-end HTTP integration with FastMCP client and mock worker.'
 
         # Build minimal args namespace for config
         class Args:
@@ -1048,6 +971,14 @@ class TestEndToEndIntegration:
                     await client.ping()
                     tools = await client.list_tools()
                     assert any(t.name == "execute_robot_instruction" for t in tools)
+                    # Worker imports/registration are independent of HTTP readiness.
+                    # Wait for the mock worker rather than dispatching to an unknown robot.
+                    async with asyncio.timeout(15):
+                        while True:
+                            registered = await client.call_tool("list_robots", {})
+                            if any(r["robot_id"] == "mock_robot" for r in registered.data.get("robots", [])):
+                                break
+                            await asyncio.sleep(0.05)
                     result = await client.call_tool(
                         "execute_robot_instruction",
                         {"instruction": "pick banana", "robot_id": "mock_robot"},

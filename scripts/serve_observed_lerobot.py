@@ -1,8 +1,4 @@
-"""LeRobot serving with shared off/lightweight/exhaustive telemetry; no parity attestation.
-
-All ordinary entrypoint/SAFE-01 preflight checks remain. This explicitly separate
-mode cannot satisfy the exhaustive Phase 7 physical-run attestation contract.
-"""
+"""LeRobot serving with off/lightweight chunk telemetry and serialized decode."""
 import json
 import os
 from pathlib import Path
@@ -15,14 +11,12 @@ from policy_guard.chunk_observer import ChunkObserver
 def main():
     attestation = os.getenv('DUME_PARITY_ATTESTATION_PATH')
     mode = os.environ.get('DUME_CHUNK_OBSERVER', 'lightweight')
-    if attestation and mode != 'exhaustive':
-        raise RuntimeError('Lightweight telemetry cannot replace exhaustive parity attestation; use the standard entrypoint for that contract')
+    if attestation:
+        raise RuntimeError('Historical parity attestation is archived; unset DUME_PARITY_ATTESTATION_PATH')
     # Validate before importing/starting the server.
     ChunkObserver(mode)
     import torch
     import entrypoint
-    if attestation:
-        return entrypoint.main()
     class ObservedServer(entrypoint.DumEGrootPolicyServer):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -39,8 +33,6 @@ def main():
                 return self._observed_chunk(observation)
 
         def _observed_chunk(self, observation):
-            if getattr(self, '_parity_attestor', None) is not None:
-                raise RuntimeError('Exhaustive attestation cannot be bypassed')
             observer = ChunkObserver(mode, synchronize=torch.cuda.synchronize)
             try:
                 return observer.run(self.policy._groot_model, self._predict_action_chunk_impl, observation)

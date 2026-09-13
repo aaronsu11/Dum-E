@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from policy.lerobot.async_chunks import AsyncChunks,AsyncSettings,ChunkPending,InferenceStopped
-from policy_guard.replay_contract import JOINT_ORDER,sha256_file
+from policy_guard.contracts import JOINT_ORDER,sha256_file
 
 
 def load_settings(path):
@@ -85,18 +85,15 @@ class AsyncPickSkill:
         from contextlib import ExitStack
         protection=ExitStack()
         if getattr(self.controller,'stop',None) is not None:
-            from scripts.run_checkpoint_sanity import armed_stop
+            from embodiment.so_arm10x.safety import armed_stop
             protection.enter_context(armed_stop(self.controller.stop))
         try:
             self.check()
             instruction=language_instruction or self.policy.language_instruction
             # Slow load/handshake occurs in this worker before reset or timed execution.
-            if not self.policy._handshaken:self.policy._handshake()
-            # Warm CUDA kernels before applying the measured *warm* deadline.
-            # This prediction is never sent to the arm.
-            self.policy.get_action(copy.deepcopy(self.controller.get_observation()),instruction)
-            self.policy._session._deadline_s=self.settings.request_deadline_s
-            self.policy._session._max_attempts=1
+            self.policy.prepare_execution(
+                copy.deepcopy(self.controller.get_observation()), instruction,
+                deadline_s=self.settings.request_deadline_s)
             self.check()
             if pose=='initial':
                 self.controller.move_to_initial_pose();self.check();self.controller.move_to_ready_pose()
@@ -137,7 +134,7 @@ class AsyncPickSkill:
             with self._state_lock:self._active=None
             try:
                 if self.trace_directory is not None:
-                    from policy_guard.replay_contract import write_evidence, now
+                    from policy_guard.contracts import write_evidence, now
                     write_evidence(self.trace_directory, 'async-trace-'+uuid.uuid4().hex+'.json', {
                         'recorded_at':now(), 'settings':vars(self.settings), 'events':self.last_events,
                         'state_samples':state_samples, 'fault':self._fault,

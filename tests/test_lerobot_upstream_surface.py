@@ -1,60 +1,4 @@
-"""Keyless pins on the upstream LeRobot surface Dum-E DUPLICATES.
-
-``docker/lerobot-policy/server.py`` takes plan 06-01 Task 2's STATED FALLBACK: it
-reimplements ``PolicyServer.SendPolicyInstructions`` (~25 lines of
-``lerobot/async_inference/policy_server.py:116-171``) and
-``GrootPolicy._create_groot_model`` (~20 lines of
-``lerobot/policies/groot/modeling_groot.py:88-118``) instead of calling
-``super()``, because both values that MUST be correct before the weights
-materialize — the input/output features and the storage dtype — are consumed
-inside the call ``super()`` would have made. See that module's STATED FALLBACK and
-SERVING PRECISION docstring blocks for the full reasoning.
-
-Duplicated upstream lines are exactly the drift this project refuses to carry, so
-this module pins them. **The pins are structural, not textual**: they compare the
-SET of attributes upstream's version assigns, and the SET of config fields
-upstream's version reads, against the sets Dum-E's copies assign and read. A
-version bump that adds one assignment or one config field therefore turns this
-suite RED with a message naming the missing name, rather than leaving a silently
-stale copy that drops a setting on the floor.
-
-Every test here is **keyless, GPU-free and never skips**, in the style of
-``tests/test_units_verdict.py``. Nothing is loaded: the pins read the installed
-wheel's source with ``inspect``/``ast`` and Dum-E's copies as text. The one
-GPU-gated instrument in this phase is ``tests/test_lerobot_serving_live.py`` and
-this module must never become a second one.
-
-Plan 06-06 EXTENDED this module (it was scheduled to create it; the fallback made
-it first). Do not narrow what is pinned here when adding to it. Plan 06-06's
-additions widen the surface from "the two duplications" to **everything plan
-06-01's overrides and its client session bind to**, plus the private symbol plan
-06-02's SAFE-01 guard depends on:
-
-* the eight ``PolicyServer`` attributes ``DumEGrootPolicyServer`` overrides or
-  calls through — a rename un-hooks ``_predict_action_chunk`` with no import
-  error, and blocker 1's relative-action ``NotImplementedError`` reappears at
-  the robot;
-* the exact ``RemotePolicyConfig`` field NAMES, ``TimedObservation.must_go`` and
-  ``TimedAction``'s accessor + field order — the wire payloads
-  ``policy/lerobot/session.py`` builds;
-* the four gRPC method names, asserted on both the service descriptor and the
-  generated stub;
-* the three CONFIG-level facts LRG-04 actually rests on. Never the emitted chunk
-  length: three independent truncations force 16 regardless of configuration
-  (T=16, T=40 and T=50 all decode to ``(1, 16, 6)``), so a chunk-length
-  assertion would pass against a misconfigured server;
-* ``_load_n1_7_checkpoint_processor_assets``, which ``policy_guard/groot_guard.py``
-  CALLS rather than reimplements — a deliberately pinned private surface;
-* the two helpers later plans import (``make_pre_post_processors``, and the
-  albumentations transform plan 06-05's PAR-05 dump hook reads).
-
-**Checkpoint-dependent assertions call ``pytest.fail`` naming the absent
-directory — never a skip**, for the reason in the paragraph above: a skipped
-upstream-surface test is a silent pass on the assumption that the pinned symbols
-still exist. This module declares no skip call, no conditional-skip marker and
-no module-level marker of any kind — asserted by grep in plan 06-06's
-verification, which is why none of those three names is spelled out here.
-"""
+'Keyless pins on the upstream LeRobot surface Dum-E DUPLICATES.'
 
 import ast
 import inspect
@@ -81,7 +25,7 @@ SERVER_PY = Path(__file__).resolve().parent.parent / "docker" / "lerobot-policy"
 
 #: The real fine-tuned checkpoint. Read CONFIG-ONLY (three small JSON sidecars);
 #: no weights, no GPU, no network. Absent -> ``pytest.fail``, never a skip.
-REAL_CHECKPOINT = Path(__file__).resolve().parent.parent / "checkpoints" / "GR00T-N1.7-3B-SO101"
+REAL_CHECKPOINT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "groot-so101"
 
 
 def _parse_server_py() -> ast.Module:
@@ -162,13 +106,7 @@ def test_upstream_send_policy_instructions_still_exists_to_override():
 
 
 def test_dume_copy_assigns_exactly_upstream_send_policy_instructions_state():
-    """The copy must set the SAME server state upstream sets — no more, no fewer.
-
-    This is the drift pin that matters. Upstream's ``SendPolicyInstructions``
-    installs the server's whole per-handshake state; a bump that adds one more
-    assignment would leave Dum-E's copy silently missing it, and the symptom would
-    be a wrong inference rather than an error.
-    """
+    'The copy must set the SAME server state upstream sets — no more, no fewer.'
     upstream = _self_assignments(_upstream_ast(PolicyServer.SendPolicyInstructions))
     ours = _self_assignments(
         _find_function(_parse_server_py(), "DumEGrootPolicyServer", "SendPolicyInstructions")
@@ -230,12 +168,7 @@ def test_upstream_create_groot_model_still_exists_to_override():
 
 
 def test_dume_copy_reads_exactly_upstream_create_groot_model_config_fields():
-    """The copy must forward the SAME config fields upstream forwards.
-
-    A bump that adds a field to upstream's ``model_kwargs`` would otherwise leave
-    Dum-E's copy quietly dropping it — the model would load with a stale knob and
-    nothing would say so.
-    """
+    'The copy must forward the SAME config fields upstream forwards.'
     upstream = _self_config_reads(_upstream_ast(GrootPolicy._create_groot_model))
     ours = _self_config_reads(
         _find_function(_parse_server_py(), "DumEGrootPolicy", "_create_groot_model")
@@ -268,13 +201,7 @@ def test_tie_unused_qwen_lm_head_still_exists():
 
 
 def test_groot_n17_from_pretrained_forwards_unknown_kwargs_downstream():
-    """``dtype`` and ``load_bf16`` reach transformers/GR00TN17Config only via ``**kwargs``.
-
-    ``GR00TN17.from_pretrained`` pops the knobs it handles itself and forwards the
-    REST to ``super().from_pretrained``. That forwarding is the whole delivery
-    mechanism for Dum-E's two injected kwargs: ``dtype`` is popped by transformers
-    as the model dtype, and ``load_bf16`` falls through onto ``GR00TN17Config``.
-    """
+    '``dtype`` and ``load_bf16`` reach transformers/GR00TN17Config only via ``**kwargs``.'
     source = inspect.getsource(GR00TN17.from_pretrained)
     assert "super().from_pretrained(" in source, (
         "GR00TN17.from_pretrained no longer delegates to super().from_pretrained; the dtype "
@@ -293,18 +220,7 @@ def test_groot_n17_from_pretrained_forwards_unknown_kwargs_downstream():
 
 
 def test_load_bf16_is_not_a_lerobot_groot_config_field():
-    """The reason config injection alone cannot force bf16.
-
-    ``load_bf16`` lives on ``GR00TN17Config`` (built from the CHECKPOINT's
-    ``config.json``, which declares ``False``), not on LeRobot's ``GrootConfig``.
-    ``GrootPolicy.from_pretrained``'s kwargs passthrough is guarded by
-    ``if hasattr(config, key)`` (``modeling_groot.py:266-268``), so passing
-    ``load_bf16=True`` there would be dropped WITHOUT a warning.
-
-    If this test goes red because upstream ADDED the field, that is good news: the
-    ``_create_groot_model`` duplication can then be deleted in favour of plain
-    config injection. Delete it deliberately — do not just widen this pin.
-    """
+    'The reason config injection alone cannot force bf16.'
     fields = set(GrootConfig.__dataclass_fields__)
     assert "load_bf16" not in fields, (
         "GrootConfig now HAS a load_bf16 field. DumEGrootPolicy._create_groot_model exists "
@@ -332,12 +248,7 @@ def test_model_params_fp32_defaults_true_and_is_what_casts_weights_up():
 
 
 def test_use_bf16_is_autocast_only_not_storage():
-    """Recorded so nobody 'fixes' the precision by flipping this instead.
-
-    ``use_bf16`` already defaulted True during the fp32 measurement of 11.47 GiB.
-    It gates ``torch.autocast`` at ``modeling_groot.py:458,498`` — compute, not
-    storage — so it can never make the weights fit.
-    """
+    "Recorded so nobody 'fixes' the precision by flipping this instead."
     assert GrootConfig.__dataclass_fields__["use_bf16"].default is True
     source = inspect.getsource(GrootPolicy)
     autocast_lines = [line for line in source.splitlines() if "use_bf16" in line]
@@ -349,14 +260,7 @@ def test_use_bf16_is_autocast_only_not_storage():
 
 
 def test_model_dtype_is_dead_for_groot_under_lerobot():
-    """The checkpoint declares ``model_dtype: 'bfloat16'`` and LeRobot never reads it.
-
-    Pinned because it is load-bearing for the honesty of the bf16 write-up: the
-    checkpoint's own declared intent is bf16, LeRobot ignores that declaration, and
-    the fp32 it uses instead comes from the separate ``dtype: 'float32'`` entry. If
-    upstream ever starts READING ``model_dtype``, the injection may become
-    unnecessary — and this pin is what says so.
-    """
+    "The checkpoint declares ``model_dtype: 'bfloat16'`` and LeRobot never reads it."
     groot_package = Path(inspect.getfile(GrootConfig)).parent
     occurrences = {
         path.name: path.read_text(encoding="utf-8").count("model_dtype")
@@ -376,19 +280,7 @@ def test_model_dtype_is_dead_for_groot_under_lerobot():
 
 
 def test_build_n1_7_processor_takes_no_revision_and_is_what_the_build_asserts():
-    """The pinned-cache mechanism, and the Dockerfile's offline build assertion.
-
-    ``_build_n1_7_processor`` is PRIVATE and is named in two Dum-E artifacts: the
-    Dockerfile asserts an offline build against it, and the pin comment in
-    ``scripts/build_lerobot_policy_image.sh`` cites it. Two properties matter:
-
-    1. It accepts **no** ``revision`` argument, which is why the image's HF cache
-       contents plus ``HF_HUB_OFFLINE=1`` are the ONLY available revision
-       enforcement (D-08) — there is no call-site knob to pass a SHA to.
-    2. It resolves the backbone by NAME, so it asks the hub cache for revision
-       ``main``. That is what makes the hand-written ``refs/main`` in the
-       Dockerfile load-bearing rather than decorative.
-    """
+    "The pinned-cache mechanism, and the Dockerfile's offline build assertion."
     from lerobot.policies.groot.configuration_groot import GROOT_N1_7_BACKBONE_MODEL
     from lerobot.policies.groot.processor_groot import _build_n1_7_processor
 
@@ -414,14 +306,7 @@ def test_build_n1_7_processor_takes_no_revision_and_is_what_the_build_asserts():
 
 
 def test_placeholder_visual_feature_injection_is_guarded_by_config_is_none():
-    """The copy PREVENTS the 224x224 placeholder rather than repairing it.
-
-    ``from_pretrained`` injects a single ``observation.images.camera`` at
-    ``(3, 224, 224)`` only when it had to build the config itself. Dum-E passes a
-    config with correct ``input_features``, so that branch never runs — which is
-    what closes blockers 2 and 3 up front. If the guard changes, the prevention
-    claim in server.py's docstring stops being true.
-    """
+    'The copy PREVENTS the 224x224 placeholder rather than repairing it.'
     source = inspect.getsource(GrootPolicy.from_pretrained)
     assert "if config is None:" in source, (
         "GrootPolicy.from_pretrained no longer guards its default-config construction with "
@@ -464,18 +349,7 @@ ASYNC_INFERENCE_METHODS = frozenset(
 
 
 def test_policy_server_still_exposes_the_overridden_methods():
-    """A rename un-hooks an override with NO import error and no crash.
-
-    This is the pin that stops the worst failure mode in the phase. If upstream
-    renames ``_predict_action_chunk``, ``DumEGrootPolicyServer``'s override stops
-    being called, upstream's per-timestep postprocess loop
-    (``policy_server.py:368-379``) runs instead, and
-    ``GrootN17ActionDecodeStep`` raises ``NotImplementedError`` for that call
-    shape on this native-relative-action checkpoint — inside ``GetActions``,
-    whose blanket ``except Exception`` returns ``Empty()`` from a method declared
-    to return ``Actions``. The client sees a SUCCESSFUL RPC carrying zero bytes.
-    Nothing else in the suite would go red.
-    """
+    'A rename un-hooks an override with NO import error and no crash.'
     missing = [name for name in OVERRIDDEN_POLICY_SERVER_ATTRS if not hasattr(PolicyServer, name)]
     assert not missing, (
         f"lerobot.async_inference.policy_server.PolicyServer no longer has {missing}. "
@@ -487,13 +361,7 @@ def test_policy_server_still_exposes_the_overridden_methods():
 
 
 def test_remote_policy_config_field_names_are_unchanged():
-    """The handshake payload's field names, asserted as an EXACT set.
-
-    Stronger than the subset check above on purpose: ``session.py`` CONSTRUCTS
-    this dataclass by keyword and ``SendPolicyInstructions`` UNPACKS it, so an
-    ADDED required field breaks the client just as surely as a removed one — and
-    a subset check cannot see an addition.
-    """
+    "The handshake payload's field names, asserted as an EXACT set."
     assert set(RemotePolicyConfig.__dataclass_fields__) == {
         "policy_type",
         "pretrained_name_or_path",
@@ -510,16 +378,7 @@ def test_remote_policy_config_field_names_are_unchanged():
 
 
 def test_timed_observation_carries_must_go():
-    """``must_go=True`` on every observation is what makes a single-shot inference work.
-
-    Two independent upstream paths gate on it: the server's queue only admits an
-    observation when it is ``must_go`` or the queue is below threshold, and
-    ``_enqueue_observation`` short-circuits on it. If the field is renamed, the
-    ``TimedObservation(...)`` construction in ``session.py`` raises — but if it
-    silently becomes a NON-default keyword or changes default, a single-shot
-    ``infer()`` hangs instead. ``TimedAction.get_action`` is the accessor the
-    backend's reindex reads every decoded step through.
-    """
+    '``must_go=True`` on every observation is what makes a single-shot inference work.'
     assert "must_go" in TimedObservation.__dataclass_fields__, (
         f"TimedObservation no longer has a must_go field (fields: "
         f"{sorted(TimedObservation.__dataclass_fields__)}). policy/lerobot/session.py passes "
@@ -539,16 +398,7 @@ def test_timed_observation_carries_must_go():
 
 
 def test_timed_action_field_order_and_transfer_begin_are_unchanged():
-    """The two surfaces plan 06-04's gRPC mock reads, pinned at its request.
-
-    ``TimedAction`` inherits ``TimedData``, so its field order is
-    ``(timestamp, timestep, action)``. ``scripts/mock_grpc_policy_server.py``
-    constructs it by KEYWORD for exactly this reason — positional construction
-    against a reordered base would produce a mock that passes while the real
-    server's replies fail — and it reassembles chunked observations by looking
-    for ``TRANSFER_BEGIN``. An upstream reshape of either would make the mock
-    silently disagree with the server it exists to stand in for.
-    """
+    "The two surfaces plan 06-04's gRPC mock reads, pinned at its request."
     assert list(TimedAction.__dataclass_fields__) == ["timestamp", "timestep", "action"], (
         f"TimedAction's field order is now {list(TimedAction.__dataclass_fields__)}. "
         f"scripts/mock_grpc_policy_server.py constructs it by keyword against the "
@@ -563,15 +413,7 @@ def test_timed_action_field_order_and_transfer_begin_are_unchanged():
 
 
 def test_async_inference_service_has_the_four_expected_methods():
-    """The four-method wire, asserted on BOTH the descriptor and the generated stub.
-
-    The descriptor is the declaration; the stub is what ``session.py`` actually
-    calls. Asserting only the descriptor would miss a codegen change, and
-    asserting only the stub would miss a service renamed out from under it. A
-    FIFTH method appearing is also a failure here, deliberately: plan 06-04
-    rejected a sentinel ``"kill"`` RPC on its mock precisely because a fifth
-    method would stop the mock from being this contract.
-    """
+    'The four-method wire, asserted on BOTH the descriptor and the generated stub.'
     service = services_pb2.DESCRIPTOR.services_by_name.get("AsyncInference")
     assert service is not None, (
         f"services_pb2 no longer declares an AsyncInference service (services: "
@@ -605,29 +447,7 @@ def test_async_inference_service_has_the_four_expected_methods():
 
 
 def test_groot_horizon_and_tag_helpers_still_resolve_sixteen():
-    """The three CONFIG-level facts LRG-04 actually rests on.
-
-    Deliberately NOT an assertion about the emitted chunk length: three
-    independent truncations force 16 regardless of whether the configuration is
-    right (``T=16``, ``T=40`` and ``T=50`` all decode to ``(1, 16, 6)``), so a
-    chunk-length check would pass against a server loaded at the wrong horizon.
-    What is load-bearing is the ``embodiment_tag``:
-
-    1. horizon inference with the tag passed EXPLICITLY returns 16 — this
-       checkpoint carries nine tags and only ``new_embodiment``'s
-       ``delta_indices`` are ``[0..15]``;
-    2. tag INFERENCE returns ``None`` for this checkpoint, which is why check 3
-       of the container preflight passes the tag rather than relying on
-       inference;
-    3. ``GrootConfig.embodiment_tag`` DEFAULTS to ``new_embodiment``
-       (``configuration_groot.py:288``) — the default that saves the load, and
-       which ``server.py`` nonetheless sets explicitly per D-11.
-
-    ``EXPECTED_HORIZON``/``EXPECTED_TAG`` are IMPORTED from
-    ``policy_guard.groot_guard`` rather than restated as literals here, so the
-    SAFE-01 guard, the preflight and this pin cannot drift to three different
-    numbers.
-    """
+    'The three CONFIG-level facts LRG-04 actually rests on.'
     from lerobot.policies.groot.configuration_groot import (
         infer_groot_n1_7_action_horizon,
         infer_groot_n1_7_embodiment_tag,
@@ -663,16 +483,7 @@ def test_groot_horizon_and_tag_helpers_still_resolve_sixteen():
 
 
 def test_checkpoint_processor_assets_loader_is_the_pinned_private_surface():
-    """``policy_guard/groot_guard.py`` CALLS this private symbol; pinned at 06-02's request.
-
-    ``assets_present`` is ``_load_n1_7_checkpoint_processor_assets(config) is not
-    None`` and ``stats_non_empty`` is ``bool(assets.raw_stats)`` — the SAME asset
-    table the decoder will use, rather than a second independently-parsed copy of
-    ``statistics.json``. Depending on a private symbol is the deliberate choice
-    there (a rename breaks loudly at import instead of producing a second source
-    of truth); this pin is what makes "breaks loudly" true for the SUITE and not
-    only for the container.
-    """
+    "``policy_guard/groot_guard.py`` CALLS this private symbol; pinned at 06-02's request."
     from lerobot.policies.groot.processor_groot import _load_n1_7_checkpoint_processor_assets
 
     assert callable(_load_n1_7_checkpoint_processor_assets), (
@@ -688,13 +499,7 @@ def test_checkpoint_processor_assets_loader_is_the_pinned_private_surface():
 
 
 def test_albumentations_transform_helper_is_importable():
-    """Plan 06-05's PAR-05 geometry dump hook.
-
-    ``use_albumentations=True`` in this checkpoint's ``processor_config.json``
-    forces the cv2/CPU transform path (``processor_groot.py:2076-2078``), so this
-    private helper — not the torchvision path — is what actually produces the
-    preprocessed image geometry PAR-05 measures.
-    """
+    "Plan 06-05's PAR-05 geometry dump hook."
     from lerobot.policies.groot.processor_groot import (
         _transform_n1_7_image_for_vlm_albumentations,
     )
@@ -707,13 +512,7 @@ def test_albumentations_transform_helper_is_importable():
 
 
 def test_make_pre_post_processors_is_importable():
-    """The public builder BOTH the server and the container preflight call.
-
-    ``docker/lerobot-policy/server.py`` rebuilds the pipelines through it after
-    the feature fixup (which is what makes ``env_action_dim`` 6 instead of 132),
-    and ``entrypoint.py``'s check 5 calls it CONFIG-ONLY to force the lazy
-    backbone processor build at startup.
-    """
+    'The public builder BOTH the server and the container preflight call.'
     assert callable(make_pre_post_processors), (
         "lerobot.policies.make_pre_post_processors is gone or not callable. It is the one "
         "public call that rebuilds the pre/post pipelines against corrected features; "

@@ -3,7 +3,7 @@ set -euo pipefail
 region="${AWS_REGION:-$(aws configure get region)}"
 : "${region:?AWS region required}"
 repo="${MODEL_SWAP_ECR_REPO:-dume/model-swap}"
-image="${1:-dume-model-swap:phase8.1}"
+image="${1:-dume-model-swap:local}"
 tag="${2:?Usage: publish_model_swap_ecr.sh [local-image] immutable-tag}"
 [[ "$tag" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]] || { echo "Invalid tag" >&2; exit 1; }
 account="$(aws sts get-caller-identity --query Account --output text)"

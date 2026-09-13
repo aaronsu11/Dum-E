@@ -332,8 +332,8 @@ async def test_async_agent_mcp_integration(shm_env_and_server,monkeypatch,scenar
     import numpy as np
     from embodiment.so_arm10x.agent import SO10xRobotAgent, _agent_worker_loop
     from embodiment.so_arm10x.async_pick import AsyncPickSkill
-    from policy.lerobot.async_chunks import AsyncSettings
-    from policy_guard.contracts import JOINT_ORDER
+    from policy.execution.asynchronous import AsyncSettings
+    from embodiment.so_arm10x.schema import JOINT_ORDER
     import embodiment.so_arm10x.async_pick as driver
     client=shm_env_and_server['client'];tm=shm_env_and_server['tm'];broker=shm_env_and_server['broker']
     monkeypatch.setenv('DUME_ASYNC_INFERENCE','1')

@@ -9,8 +9,9 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
-from policy_guard.contracts import JOINT_ORDER, now, sha256_file
-from policy_guard.observation import load_observation
+from embodiment.so_arm10x.schema import JOINT_ORDER
+from policy.evidence import now, sha256_file
+from embodiment.so_arm10x.observation import load_observation
 
 
 def http_request(port, path, data=None):
@@ -35,7 +36,7 @@ def serving_identity(container, port):
             env.get("DUME_PARITY_ATTESTATION_PATH") or env.get("DUME_POLICY_SEED") or
             "serve_observed_lerobot.py" not in " ".join([info["Path"], *info["Args"]])):
         raise ValueError("Async timing requires the documented loopback lightweight server with ambient RNG")
-    names = ["scripts/serve_observed_lerobot.py", "policy_guard/chunk_observer.py", "docker/lerobot-policy/server.py"]
+    names = ["policy/backends/lerobot/serve.py", "policy/telemetry.py", "policy/backends/lerobot/server.py"]
     probe = "import hashlib,json,pathlib; names=" + repr(names) + "; print(json.dumps({n:hashlib.sha256(pathlib.Path('/app',n).read_bytes()).hexdigest() for n in names}))"
     hashes = json.loads(subprocess.check_output(["docker", "exec", container, "python3", "-c", probe], text=True, timeout=15))
     root = Path(__file__).resolve().parents[1]
@@ -47,7 +48,7 @@ def serving_identity(container, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", required=True, choices=["g05-so101", "pi05-base", "pi05-so101", "molmoact2-so101", "groot-so101", "lerobot-gr00t"])
+    parser.add_argument("--profile", choices=["g05-so101", "pi05-base", "pi05-so101", "molmoact2-so101", "groot-so101", "lerobot-gr00t"])
     parser.add_argument("--observations", type=Path, nargs="+", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--instruction", required=True)
@@ -58,7 +59,19 @@ def main():
     parser.add_argument("--seed", type=int, default=20265907)
     parser.add_argument("--latency-settings", action="store_true", help="LeRobot: collect at least 100 samples for existing async admission gate")
     parser.add_argument("--server-container", help="Required for local GR00T async admission measurement")
+    parser.add_argument("--deployment", type=Path, help="Explicit deployment YAML; replaces --profile")
     args = parser.parse_args()
+    if args.deployment:
+        from policy.configuration import load_deployment, profile_for_deployment
+        if args.profile is not None:
+            parser.error("Use --deployment or --profile, not both")
+        deployment = load_deployment(args.deployment)
+        args.profile = profile_for_deployment(deployment)
+        if deployment.execution == "rtc":
+            parser.error("Use check_pi05_rtc_scheduler.py for RTC; this benchmark measures complete chunks")
+    if not args.profile:
+        parser.error("--profile or --deployment is required")
+
     if not 1 <= args.samples <= 1000 or not 0 <= args.warmups <= 10 or not args.instruction.strip():
         parser.error("Positive bounded sample count, 0–10 warmups and instruction required")
     if args.latency_settings and (args.profile != "lerobot-gr00t" or args.samples < 100 or not args.server_container):
@@ -71,29 +84,25 @@ def main():
     policy = None
     expected = {"g05-so101": (32, 6), "pi05-base": (50, 32), "pi05-so101": (50, 6),
                 "molmoact2-so101": (30, 6), "groot-so101": (16, 6), "lerobot-gr00t": (16, 6)}[args.profile]
-    if args.profile == "g05-so101":
-        from policy.galaxea.backend import GalaxeaPolicyBackend
-        policy = GalaxeaPolicyBackend(port=port)
-    elif args.profile == "lerobot-gr00t":
-        if not args.calibration:
-            parser.error("GR00T requires --calibration to map recorded degrees into normalized units")
-        from policy.lerobot.serialized_backend import SerializedLeRobotPolicyBackend
-        from policy.so101_contract import to_model_frame
-        policy = SerializedLeRobotPolicyBackend(port=port)
-        for obs in observations:
-            state = to_model_frame([obs[k] for k in JOINT_ORDER], "groot-so101", calibration_path=args.calibration)
-            obs.update(zip(JOINT_ORDER, map(float, state)))
-    elif args.profile == "groot-so101":
-        if not args.calibration:
-            parser.error("GR00T requires --calibration")
-        from policy.groot_trial_backend import GrootTrialBackend
-        policy = GrootTrialBackend(port=port, calibration_path=args.calibration)
-    elif args.profile == "pi05-so101":
-        from policy.pi05_backend import Pi05SO101PolicyBackend
-        policy = Pi05SO101PolicyBackend(port=port)
-    elif args.profile == "molmoact2-so101":
-        from policy.molmo_backend import MolmoPolicyBackend
-        policy = MolmoPolicyBackend(port=port)
+    if args.profile != "pi05-base":
+        from policy.configuration import deployment_for_profile
+        from policy.factory import make_policy_backend
+        deployment = deployment_for_profile(args.profile)
+        kwargs = {"port": port}
+        if args.profile in ("groot-so101", "lerobot-gr00t"):
+            if not args.calibration:
+                parser.error("GR00T requires --calibration")
+            if args.profile == "groot-so101":
+                kwargs["calibration_path"] = args.calibration
+            else:
+                from embodiment.so_arm10x.mappings.frames import to_model_frame
+                for obs in observations:
+                    state = to_model_frame([obs[k] for k in JOINT_ORDER], "groot-so101",
+                                           calibration_path=args.calibration)
+                    obs.update(zip(JOINT_ORDER, map(float, state)))
+                # Serialized exchange is required for the admission benchmark.
+                deployment = deployment_for_profile(args.profile, execution="async")
+        policy = make_policy_backend(deployment=deployment, **kwargs)
     args.output.mkdir(parents=True, exist_ok=False)
     report = {"status": "failed", "profile": args.profile, "motor_commands_sent": 0,
               "started_at": now(), "endpoint": f"127.0.0.1:{port}",
@@ -108,8 +117,8 @@ def main():
             obs = observations[max(0, index - args.warmups) % len(observations)]
             started = time.perf_counter()
             if policy is None:
-                from policy_lab.profiles import get_profile
-                from policy_lab.protocol import encode_image
+                from policy.checkpoints import get_profile
+                from policy.backends.lerobot.transports.http import encode_image
                 reply = http_request(port, "/infer", {"state": [obs[k] for k in JOINT_ORDER],
                     "front": encode_image(obs["front"]), "wrist": encode_image(obs["wrist"]),
                     "task": args.instruction, "seed": args.seed})
@@ -136,11 +145,11 @@ def main():
         if args.latency_settings:
             if serving_identity(args.server_container, port) != binding:
                 raise ValueError("Server changed during latency measurement")
-            from policy.lerobot.async_chunks import AsyncSettings
+            from policy.execution.asynchronous import AsyncSettings
             p99 = float(np.percentile(samples, 99, method="higher"))
             root = Path(__file__).resolve().parents[1]
-            sources = ["scripts/serve_observed_lerobot.py", "policy_guard/chunk_observer.py",
-                       "policy/lerobot/serialized_backend.py", "docker/lerobot-policy/server.py"]
+            sources = ["policy/backends/lerobot/serve.py", "policy/telemetry.py",
+                       "policy/backends/lerobot/serialized_backend.py", "policy/backends/lerobot/server.py"]
             latency = {"kind": "async_request_latency", "status": "complete", "sample_count": len(samples),
                        "samples_s": samples, "request_p99_s": p99, "settings": vars(AsyncSettings(p99)),
                        "observer_mode": "lightweight", "policy_device": "cuda",

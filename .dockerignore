@@ -1,29 +1,10 @@
-# Build context allowlist for `docker build .` at this repo root.
-# DENY EVERYTHING, then re-admit only what a Dockerfile in this repo actually
+# Only application source and build recipes enter the Docker context.
 *
-
-!docker/lerobot-policy/
-
-# Admitted by plan 06-03, which added `COPY policy_guard/ /app/policy_guard/` to
-# docker/lerobot-policy/Dockerfile so the SAFE-01 guard has ONE implementation
-!policy_guard/
-
-# Normal serving uses the shared lightweight observer; admit only its launcher.
+!docker/
+!docker/**
+!policy/
+!policy/**
 !scripts/
-scripts/*
 !scripts/serve_observed_lerobot.py
-!scripts/serve_observed_native.py
-
-# Evaluation-only model server: no credentials, checkpoints or user outputs.
-!docker/model-swap/
-!policy_lab/
-policy_lab/**/__pycache__/
-policy_lab/**/*.pyc
 **/__pycache__/
 **/*.pyc
-!docker/galaxea-policy/
-!policy/
-policy/*
-!policy/galaxea/
-policy/galaxea/**/__pycache__/
-policy/galaxea/**/*.pyc

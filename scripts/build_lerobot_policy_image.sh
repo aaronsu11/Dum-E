@@ -21,7 +21,7 @@ BACKBONE_REVISION="9ce19a195e423419c349abfc86fd07178b230561"
 
 IMAGE_TAG="lerobot-policy"
 
-DOCKERFILE="docker/lerobot-policy/Dockerfile"
+DOCKERFILE="docker/lerobot/Dockerfile"
 
 # == FREEZE THE ANCHOR BEFORE ANYTHING ELSE CAN TOUCH IT.
 # `readonly` here is load-bearing, not tidiness. The dotenv fallback below used to

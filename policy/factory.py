@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 from shared import IPolicyBackend
+from policy.configuration import PolicyDeployment
 
 #: Name of the environment variable that selects the backend.
 POLICY_BACKEND_ENV_VAR = "DUME_POLICY_BACKEND"
@@ -15,8 +16,35 @@ POLICY_BACKENDS = ("lerobot", "groot-native", "galaxea", "pi05-so101")
 DEFAULT_POLICY_BACKEND = "groot-native"
 
 
-def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
+def make_policy_backend(*, deployment: PolicyDeployment | None = None, **kwargs: Any) -> IPolicyBackend:
     'Build the policy backend selected by ``DUME_POLICY_BACKEND``.'
+    if deployment is not None:
+        deployment.validate()
+        # The explicit deployment cannot be silently changed by ambient flags.
+        if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1" and deployment.execution != "async":
+            raise ValueError("Explicit execution conflicts with async DUME_ASYNC_INFERENCE")
+        if deployment.backend == "isaac_groot":
+            from policy.backends.isaac_groot.client import Gr00tRobotInferenceClient
+            return Gr00tRobotInferenceClient(**kwargs)
+        if deployment.backend == "galaxea":
+            from policy.backends.galaxea.backend import GalaxeaPolicyBackend
+            from embodiment.so_arm10x.mappings import galaxea as mapping
+            return GalaxeaPolicyBackend(mapping=mapping, **kwargs)
+        if deployment.backend == "lerobot" and deployment.transport == "grpc":
+            if deployment.execution == "async":
+                from policy.backends.lerobot.serialized_backend import SerializedLeRobotPolicyBackend
+                return SerializedLeRobotPolicyBackend(**kwargs)
+            from policy.backends.lerobot.backend import LeRobotPolicyBackend
+            return LeRobotPolicyBackend(**kwargs)
+        from embodiment.so_arm10x.mappings.lerobot import SO101Mapping
+        mapping = SO101Mapping(deployment.checkpoint, calibration_path=kwargs.pop("calibration_path", None))
+        if deployment.policy == "pi05":
+            from policy.backends.lerobot.pi05_client import Pi05SO101PolicyBackend
+            return Pi05SO101PolicyBackend(mapping=mapping, **kwargs)
+        from policy.backends.lerobot.http_client import HTTPPolicyBackend
+        if deployment.policy == "groot":
+            kwargs.setdefault("port", 8081)
+        return HTTPPolicyBackend(profile=deployment.checkpoint, mapping=mapping, **kwargs)
     backend = os.getenv(POLICY_BACKEND_ENV_VAR, DEFAULT_POLICY_BACKEND)
 
     if backend not in POLICY_BACKENDS:
@@ -36,29 +64,27 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
         # Lazy-import INSIDE the branch, and this is the branch that proves why the
         # discipline exists: this import DOES pull the LeRobot policy stack (torch
         if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
-            from policy.lerobot.serialized_backend import SerializedLeRobotPolicyBackend
+            from policy.backends.lerobot.serialized_backend import SerializedLeRobotPolicyBackend
             return SerializedLeRobotPolicyBackend(**kwargs)
-        from policy.lerobot.backend import LeRobotPolicyBackend
+        from policy.backends.lerobot.backend import LeRobotPolicyBackend
 
         return LeRobotPolicyBackend(**kwargs)
 
     if backend == "pi05-so101":
-        from policy.pi05_backend import Pi05SO101PolicyBackend
-        return Pi05SO101PolicyBackend(**kwargs)
+        return make_policy_backend(deployment=PolicyDeployment(
+            "so_arm10x", "lerobot", "pi05", "pi05-so101", transport="http"), **kwargs)
 
     if backend == "galaxea":
-        if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
-            raise ValueError("Galaxea uses its native chunk protocol; LeRobot async mode is not supported")
-        from policy.galaxea.backend import GalaxeaPolicyBackend
-        return GalaxeaPolicyBackend(**kwargs)
+        return make_policy_backend(deployment=PolicyDeployment(
+            "so_arm10x", "galaxea", "g05", "g05-so101"), **kwargs)
 
     if backend == "groot-native":
         if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
             raise ValueError("Async picking currently requires the LeRobot backend")
         # Lazy-import inside the branch, for the same reason as above: the GR00T
-        # transport (policy/gr00t/service.py) depends only on msgpack/numpy/zmq and
+        # transport (policy/backends/isaac_groot/service.py) depends only on msgpack/numpy/zmq and
         # must not be dragged in by a lerobot selection either.
-        from embodiment.so_arm10x.controller import Gr00tRobotInferenceClient
+        from policy.backends.isaac_groot.client import Gr00tRobotInferenceClient
 
         return Gr00tRobotInferenceClient(**kwargs)
 

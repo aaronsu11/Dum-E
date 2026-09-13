@@ -24,7 +24,7 @@ The model runtime and profile metadata are authoritative when changing a checkpo
 
 ## Checkpoints and pins
 
-`policy_lab/profiles.py` is authoritative for HTTP profiles. `policy_lab/pi05-so101-manifest.json` and `docker/galaxea-policy/checkpoint-manifest.json` additionally verify exact runtime artifacts.
+`policy/checkpoints.py` is authoritative for HTTP profiles. `policy/backends/lerobot/models/pi05_so101_manifest.json` and `policy/backends/galaxea/checkpoint_manifest.json` additionally verify exact runtime artifacts.
 
 | Model | Repository | Revision / identity |
 |---|---|---|
@@ -48,7 +48,7 @@ uv sync --locked
 bash scripts/build_lerobot_policy_image.sh
 bash scripts/build_model_swap_image.sh dume-model-swap:local
 # Galaxea has a separate Python/CUDA stack, pinned in its Dockerfile.
-docker build -f docker/galaxea-policy/Dockerfile -t dume-g05:local .
+docker build -f docker/galaxea/Dockerfile -t dume-g05:local .
 ```
 
 The model-swap wrapper builds the GR00T base from source by default. To reuse a published dependency base, set `MODEL_SWAP_BASE_IMAGE=REGISTRY/IMAGE@sha256:DIGEST`; mutable tag overrides are rejected. Registry authentication is the operator's responsibility. No dated local image ID or host tokenizer cache is required. Rebuilding can require substantial disk space for layers, backbone and checkpoints. Record the resulting image digest and `pip freeze` alongside measurements: top-level pins and source recipes do not promise bit-identical transitive resolution across future builds.
@@ -80,6 +80,8 @@ G05_CHECKPOINT_ROOT=/absolute/path/G05-snapshot \
   bash scripts/run_galaxea_server.sh dume-g05:local
 ```
 
-HTTP health is `GET /health`; it reports the profile, runtime timing/memory and faults. A ready server does not authorize motion. Checkpoint/startup failure must not fall back to another model or CPU inference. For native GR00T use the existing `build_gr00t_image.sh` workflow in the README. Its optional `serve_observed_native.py` launcher requires this repository's `policy_guard` and scripts mounted on its Python path, plus the pinned Cosmos cache.
+HTTP health is `GET /health`; it reports the profile, runtime timing/memory and faults. A ready server does not authorize motion. Checkpoint/startup failure must not fall back to another model or CPU inference. For native GR00T use the existing `build_gr00t_image.sh` workflow in the README. Its optional `serve_observed_native.py` launcher requires this repository's `policy` package and scripts mounted on its Python path, plus the pinned Cosmos cache.
 
 Continue with [validation](POLICY-VALIDATION.md), [SO101 mappings](SO101-POLICY-CONTRACTS.md), [async execution](ASYNC-INFERENCE.md), or [EC2](EC2-INFERENCE.md).
+
+Deployment selection and package ownership are documented in [ARCHITECTURE.md](ARCHITECTURE.md).

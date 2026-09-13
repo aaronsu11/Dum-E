@@ -8,12 +8,14 @@ The extension points are deliberately separate:
 |---|---|---|
 | Robot IO and ownership | `shared.IRobotController`; `embodiment/so_arm10x/controller.py` | Connect/read/command/disconnect; actual calibration, limits, units and resource ownership |
 | Policy transport | `shared.IPolicyBackend`; `policy/factory.py` | Explicit backend selection, health, task instruction, reset/close and complete validated chunks |
-| Observation/action mapping | `policy/so101_contract.py`, `policy/galaxea/modalities.py` | Named sensor roles, frame conventions and reversible model↔robot conversions |
-| GPU model runtime | `policy_lab/profiles.py`, `runtime.py`, `protocol.py`; `docker/galaxea-policy/` | Pinned checkpoint, processor, native horizon/action groups, request schema and model identity |
+| Observation/action mapping | `embodiment/so_arm10x/mappings/frames.py`, `embodiment/so_arm10x/mappings/galaxea.py` | Named sensor roles, frame conventions and reversible model↔robot conversions |
+| GPU model runtime | `policy/checkpoints.py`, `policy/backends/<runtime>/`; `docker/<runtime>/` | Pinned checkpoint, processor, native horizon/action groups, request schema and model identity |
 | Execution lifecycle | SO101 `agent.py`, `skills.py`, `safety.py` | Suitable skills, reset poses, serial/SDK ownership, stop/hold behavior and failure publication |
-| Scheduling | `policy/lerobot/async_chunks.py`, `policy_guard/rtc_trial.py` | Explicit supported timing/chunk contract; model-specific prefix semantics if applicable |
+| Scheduling | `policy/execution/asynchronous.py`, `policy/execution/rtc.py` | Explicit supported timing/chunk contract; model-specific prefix semantics if applicable |
 
-`policy_lab` is a maintained inference-server package despite its historical name. The HTTP bridge's shared class is `SO101HTTPPolicyBackend`: its transport is shared across current models, but its six-joint/camera contract remains explicit. Do not subclass it for a robot with different action groups and merely change the model name.
+`policy/backends/lerobot/http_client.py` receives a `shared.IPolicyMapping` from the factory. Implement that interface in the embodiment and keep saved model normalization in the server processor. The current HTTP request schema still requires six state values and front/wrist images; a different robot needs an explicitly supported wire schema, not just a new mapping object. Galaxea's grouped protocol uses an injected encoder/decoder with its own schema.
+
+See [architecture and naming](ARCHITECTURE.md) for the package hierarchy and deployment format.
 
 ## Implementation order
 

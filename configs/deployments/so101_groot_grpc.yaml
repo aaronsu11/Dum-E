@@ -1,0 +1,6 @@
+embodiment: so_arm10x
+backend: lerobot
+policy: groot
+checkpoint: groot-so101
+transport: grpc
+execution: async

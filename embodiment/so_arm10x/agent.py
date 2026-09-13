@@ -20,7 +20,6 @@ from strands.telemetry import StrandsTelemetry
 
 
 from embodiment.so_arm10x.controller import (
-    Gr00tRobotInferenceClient,
     SO10xArmController,
 )
 from embodiment.so_arm10x.skills import (
@@ -30,6 +29,7 @@ from embodiment.so_arm10x.skills import (
 )
 from policy.factory import make_policy_backend
 from shared import (
+    IPolicyBackend,
     ITaskManager,
     IMessageBroker,
     IRobotAgent,
@@ -81,7 +81,7 @@ async def hardware_session(controller):
 
 def create_robot_tools(
     robot_controller: SO10xArmController,
-    gr00t_client_instance: Gr00tRobotInferenceClient,
+    gr00t_client_instance: IPolicyBackend,
     async_pick=None,
 ):
     'Create robot tools that use the specific robot instance.'
@@ -204,7 +204,7 @@ class SO10xRobotAgent(IRobotAgent):
     def __init__(
         self,
         robot_controller: SO10xArmController,
-        gr00t_client_instance: Gr00tRobotInferenceClient,
+        gr00t_client_instance: IPolicyBackend,
         task_manager: Optional[ITaskManager] = None,
         profile: Literal["default", "aws"] = "default",
         message_broker: Optional[IMessageBroker] = None,

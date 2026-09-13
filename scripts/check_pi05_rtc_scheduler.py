@@ -8,10 +8,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
 
-from policy.galaxea.modalities import JOINTS
-from policy.pi05_backend import Pi05SO101PolicyBackend
-from policy_guard.integration_trial import joint_limits
-from policy_guard.rtc_trial import run_rtc_trial
+from embodiment.so_arm10x.mappings.galaxea import JOINTS
+from policy.factory import make_policy_backend
+from policy.configuration import deployment_for_profile
+from functools import partial
+Pi05SO101PolicyBackend = partial(make_policy_backend, deployment=deployment_for_profile("pi05-so101"))
+from embodiment.so_arm10x.validation import joint_limits
+from embodiment.so_arm10x.rtc import run_rtc_trial
 
 
 class Stop:

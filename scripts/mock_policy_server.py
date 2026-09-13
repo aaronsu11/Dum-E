@@ -5,7 +5,7 @@ Speaks the EXACT ``MsgSerializer`` :5555 wire contract that the real Isaac-GR00T
 n1.7-release inference server emits, with NO GPU, NO model, and NO checkpoint.
 Reusable two ways:
 
-  * imported by ``tests/test_container_contract.py`` via ``serve_mock(port)`` for
+  * imported by ``tests/policy/test_container_contract.py`` via ``serve_mock(port)`` for
     an in-process real-socket round trip (the container-boundary probe);
   * run standalone by an operator to exercise a client against a fake server.
 
@@ -18,7 +18,7 @@ Usage:
     # then, in another shell:
     uv run python scripts/test_live_policy_server.py --port 5556 --skip-unreachable
 
-Contract served (see policy/gr00t/service.py):
+Contract served (see policy/backends/isaac_groot/service.py):
     request  {"endpoint": <name>, "data"?: {...}, "api_token"?: <str>}
     ping        -> {"status": "ok", "message": "Server is running"}
     get_action  -> [action_chunk, info]
@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Mirror the wire contract from Dum-E's client-side serializer — NOT the
 # server-only upstream ``gr00t`` package (not installed in the client uv env).
-from policy.gr00t.service import MsgSerializer  # noqa: E402
+from policy.backends.isaac_groot.service import MsgSerializer  # noqa: E402
 
 # N1.7 action horizon for the SO101 fruit-picking checkpoint (T=16).
 _ACTION_HORIZON = 16

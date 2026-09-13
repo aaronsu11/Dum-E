@@ -17,4 +17,4 @@ fi
 export HF_TOKEN
 docker build --build-arg "BASE_IMAGE=$base" --secret id=hf_token,env=HF_TOKEN \
   --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
-  -f docker/model-swap/Dockerfile -t "${1:-dume-model-swap:local}" .
+  -f docker/lerobot/Dockerfile.multi_policy -t "${1:-dume-model-swap:local}" .

@@ -7,7 +7,7 @@ from loguru import logger
 from lerobot.motors.feetech import FeetechMotorsBus
 from lerobot.robots.so_follower import SOFollower
 from embodiment.so_arm10x.controller import CLAMP_WARNING_TEXT, SO10xArmController
-from policy_guard.contracts import require, now as utc_now, fingerprint_configuration as digest, sha256_file
+from policy.evidence import require, now as utc_now, fingerprint_configuration as digest, sha256_file
 
 AUDITED_SOURCES = {
     "lerobot.robots.utils": "eb6a5039cd553a15e5a5c6888d2ce4989afc3e38103e89f9b913276110f30a42",

@@ -143,7 +143,7 @@ def _spawn_agent_worker(
 
     # The five LeRobot handshake values (D-11), forwarded on exactly the same
     # terms: only when the config names the key, so every default lives solely in
-    # policy/lerobot/backend.py and cannot drift between the launcher and the
+    # policy/backends/lerobot/backend.py and cannot drift between the launcher and the
     # process that owns inference. The backend int()-coerces the two numeric ones,
     # so str() here is the whole stringification contract.
     for config_key, env_key in (

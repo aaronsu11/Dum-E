@@ -34,7 +34,7 @@ uv run python scripts/benchmark_policy.py --profile pi05-so101 \
 
 Supported profiles are listed in `--help`; GR00T requires `--calibration /absolute/path/calibration.json`. Supply 12 distinct recordings to reproduce the one-per-episode sampling design; one supplied file is cycled and represents only that observation. The report records hashes, profile, seed, warmups, client RPC, server metadata and complete finite output arrays. The base Pi0.5 profile deliberately uses padded input and does not return robot-ready actions. Report warm medians/maxima, not statistical tail guarantees or accuracy.
 
-A live gRPC smoke can also run with `DUME_RUN_LIVE_LEROBOT_TESTS=1 uv run pytest tests/test_lerobot_serving_live.py -q`. It sends two synthetic observations to the provisioned loopback server and neither starts nor replaces containers. Wrong-horizon/failure guard cases are tested with isolated fake pipelines by default.
+A live gRPC smoke can also run with `DUME_RUN_LIVE_LEROBOT_TESTS=1 uv run pytest tests/policy/test_lerobot_serving_live.py -q`. It sends two synthetic observations to the provisioned loopback server and neither starts nor replaces containers. Wrong-horizon/failure guard cases are tested with isolated fake pipelines by default.
 
 ## One bounded physical trial
 
@@ -78,3 +78,9 @@ G0.5's generation field and other models' generation fields have different inter
 The full pre-consolidation source and narratives are preserved at `archive/pr13-before-consolidation`, commit `0c08e405a33e7567152f2aa808625cb6536e7343`. Example: `git show archive/pr13-before-consolidation:docs/PHASE10-INFERENCE-TRIAL-SUMMARY.md`. Raw recordings/checkpoints remain local, ignored assets; do not claim a fresh clone contains them.
 
 Still open: coherent G0.5 task motion; dataset-specific starting-pose/all-joint qualification; sustained runs and physical RTC fault qualification; explicit second-serial-owner rejection; startup reuse optimization and unexplained latency outliers. The post-trial RTC expiration fix has software regression coverage but was not part of physical trial14's executed source. No old physical result certifies the newly refactored code without another attended trial.
+
+## Deployment configuration
+
+The bounded runner and benchmark accept `--deployment configs/deployments/<name>.yaml` instead of `--profile`. An RTC deployment also selects the RTC scheduler; a conflicting `--scheduler` is rejected. Full-chunk benchmarks reject RTC deployments because they do not exercise prefix scheduling. Examples and package ownership are in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+The hardware runner implementation is `embodiment/so_arm10x/trial.py`; `scripts/run_policy_trial.py` remains its command. Source-bound approvals and GR00T async admission files must be regenerated after the package refactor. Historical captures/trials were not rerun by moving these files.

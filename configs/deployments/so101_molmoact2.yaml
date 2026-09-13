@@ -1,0 +1,6 @@
+embodiment: so_arm10x
+backend: lerobot
+policy: molmoact2
+checkpoint: molmoact2-so101
+transport: http
+execution: sync

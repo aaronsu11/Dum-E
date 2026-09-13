@@ -129,7 +129,7 @@ are mounted at runtime, never baked into the image.
         -v ~/.cache/huggingface:/root/.cache/huggingface:ro \
         -e HF_TOKEN="$HF_TOKEN" \
         -v "$(pwd)/scripts:/app/scripts:ro" \
-        -v "$(pwd)/policy_guard:/app/policy_guard:ro" \
+        -v "$(pwd)/policy:/app/policy:ro" \
         --name gr00t-server \
         gr00t \
         uv run python /app/scripts/serve_observed_native.py \
@@ -398,3 +398,5 @@ This project builds on top of the following open-source projects:
 *Built with ❤️ for the future of robotics*
 
 </div>
+
+See [architecture and deployment configuration](docs/ARCHITECTURE.md) for the embodiment/policy boundaries and extension rules.

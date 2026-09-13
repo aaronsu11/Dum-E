@@ -12,7 +12,7 @@ Both camera inputs are RGB `uint8` arrays of shape `(480,640,3)`. OpenCV capture
 | GR00T SO101 | front + wrist, preserving checkpoint-declared order | Five joints RANGE_M100_100; gripper 0–100. Calibrated HTTP bridge converts centered degrees to/from normalized points |
 | Pi0.5 base | Two images and a declared zero third-camera placeholder | Six input values padded to 32 for smoke only; no verified SO101 output mapping |
 
-`policy/so101_contract.py` owns explicit conversions. GR00T degrees per normalized point are `(range_max-range_min)*360/(4095*200)` per joint; gripper scale is 1. Never infer units from observed numerical magnitude. The original native/gRPC backend preserves its existing controller convention; the new HTTP bridge does not silently change that production path.
+`embodiment/so_arm10x/mappings/frames.py` owns explicit conversions. GR00T degrees per normalized point are `(range_max-range_min)*360/(4095*200)` per joint; gripper scale is 1. Never infer units from observed numerical magnitude. The original native/gRPC backend preserves its existing controller convention; the new HTTP bridge does not silently change that production path.
 
 Pi0.5 checkpoint `008000` declares six named absolute actions, 50 steps, no relative actions and no empty cameras. Its padded internal representation is not permission to reinterpret the base model's first six outputs as motor targets. G0.5 drains one native 32-action cache per observation; Molmo returns 30 actions; GR00T decodes 16.
 

@@ -3,7 +3,7 @@
 
 import argparse
 import os
-import pickle  # nosec B403 - the wire is pickle by upstream design; see policy/lerobot/session.py
+import pickle  # nosec B403 - the wire is pickle by upstream design; see policy/backends/lerobot/session.py
 import sys
 from concurrent import futures
 

@@ -64,12 +64,48 @@ anonymous 32-dimensional base output is not automatically a six-joint command.
 ## Current preflight findings
 
 - Host devices exist: arm `/dev/ttyACM0`, configured front `/dev/video2`, wrist
-  `/dev/video0`. Camera0 currently returns a nearly black image; physical motion
-  is paused pending correction.
+  `/dev/video0`. The initial black wrist feed was corrected before trial1.
+  A transient camera-open failure then cleared in a fresh capture process.
 - The current controller loads `so_follower/my_awesome_follower_arm.json`,
   not the older `so101_follower` file audited in Phase9. See the correction in
   `MODEL-MODALITY-COMPATIBILITY.md`. No calibration was changed.
-- No physical trial has run yet. G0.5 server loading does not connect hardware.
+- Trial1 has completed as a partial integration result, described below.
+  G0.5 server loading itself does not connect hardware.
 
 Keep trials sequential and bounded. Observe the first trial before choosing
 the next backend/mode; do not run a success-rate matrix or fine-tune a model.
+
+## Trial1 result — partial integration
+
+Aaron confirmed the camera correction and presence and authorized one trial.
+The prepared configuration, source hashes and actual loaded calibration matched.
+The controller pre-armed its goals to the current pose and verified PID settings.
+
+| Measurement | Result |
+|---|---:|
+| Bounded commands dispatched | 32 |
+| Live-observation chunk RPC | 1262.205 ms |
+| Server inference | 1187.614 ms |
+| Median / maximum command interval | 50.154 / 50.284 ms |
+| Controller clamp warnings | 0 |
+| Recorded joint excursion, all six channels | 0 |
+
+Aaron's observation: **“No visible movement; held safely.”**
+
+Live camera/state input, inference and bounded command dispatch were exercised.
+Actual joint movement was **not demonstrated**. Task accuracy was not scored.
+The trace contains 32 varying targets within 0.25°/point of the unchanged measured
+pose. The feedback-relative limit prevents a command from building beyond that
+small window while feedback remains stationary. Deadband, quantization or small
+model actions are possible explanations; a hardware cause has not been proved.
+
+Before another trial, review separate command slew-rate and tracking-error
+allowances while retaining calibrated limits, the 5°/point total envelope and
+latched stop. Do not silently widen the limit or reuse trial1 authorization.
+No second trial was run.
+
+Evidence: `corpus/phase10-integration-20260913/trial-1-candidate/`, including
+`result.json`, `live-observation.npz`, `raw-actions.json`, `summary.json`,
+`no-motion-diagnostic.json`, `operator-observation.json` and `assessment.json`.
+The raw runner's `physical_motion` field records that targets were sent, not
+measured movement; the encoder trace and final assessment establish the latter.

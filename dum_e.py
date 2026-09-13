@@ -160,6 +160,7 @@ def _spawn_agent_worker(
     # so str() here is the whole stringification contract.
     for config_key, env_key in (
         ("lerobot_policy_port", "DUME_LEROBOT_POLICY_PORT"),
+        ("galaxea_policy_port", "DUME_GALAXEA_POLICY_PORT"),
         ("lerobot_policy_type", "DUME_LEROBOT_POLICY_TYPE"),
         ("lerobot_checkpoint_path", "DUME_LEROBOT_CHECKPOINT_PATH"),
         ("lerobot_actions_per_chunk", "DUME_LEROBOT_ACTIONS_PER_CHUNK"),

@@ -97,6 +97,9 @@ controller:
   # of keys exists to avoid -- pointing a gRPC client at a zmq.REP socket fails
   # in a way that looks like a dead server rather than a misconfiguration.
   lerobot_policy_port: 8080
+  # Galaxea native WebSocket transport. Requires backend=galaxea and async mode off.
+  # Physical use additionally requires the model-specific calibration/camera checks.
+  galaxea_policy_port: 8765
 
   # Which lerobot policy class the server loads. Forwarded as
   # DUME_LEROBOT_POLICY_TYPE. The value must be a member of lerobot's own

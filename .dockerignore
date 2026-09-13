@@ -43,3 +43,9 @@ policy_lab/**/__pycache__/
 policy_lab/**/*.pyc
 **/__pycache__/
 **/*.pyc
+!docker/galaxea-policy/
+!policy/
+policy/*
+!policy/galaxea/
+policy/galaxea/**/__pycache__/
+policy/galaxea/**/*.pyc

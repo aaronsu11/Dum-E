@@ -1,0 +1,66 @@
+{
+  "repo": "OpenGalaxea/G05",
+  "revision": "e312be81e90c56a55bcb26b57429bd39a335b449",
+  "files": [
+    {
+      "path": "action_tokenizer.pt",
+      "bytes": 506886775,
+      "sha256": "5088f64a5452a60bbc8cac90ee7d79c156f1d14540bc3139aa7060f862dddace"
+    },
+    {
+      "path": "g05-so101/.hydra/config.yaml",
+      "bytes": 22913,
+      "sha256": "ef67bff36ea49d2da8b7998412ea68f678a1c92cbdff5a2a8812230741d81ae4"
+    },
+    {
+      "path": "g05-so101/checkpoints/model_state_dict.pt",
+      "bytes": 11440372444,
+      "sha256": "e65cbc06932151d650b6ae623b3cb617e750745bd43ef61d466c393fc18c425e"
+    },
+    {
+      "path": "g05-so101/dataset_stats.json",
+      "bytes": 317018,
+      "sha256": "d93f097a50ed7d983eab1933ad88fe39ba53ce30e1bb709a9641f70302228b70"
+    },
+    {
+      "path": "qwen3_5_2b_base_processor/config.json",
+      "bytes": 2908,
+      "sha256": "ed1c1723241f23f7f4e23430759cbd7dcfb4103cbdfe052bfe7626b57c2615b4"
+    },
+    {
+      "path": "qwen3_5_2b_base_processor/configuration.json",
+      "bytes": 51,
+      "sha256": "2d4464e2ead06bc9bc718c781309ad1e7baded626d66e8dcdc8b469ba185faf0"
+    },
+    {
+      "path": "qwen3_5_2b_base_processor/merges.txt",
+      "bytes": 3353259,
+      "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+    },
+    {
+      "path": "qwen3_5_2b_base_processor/preprocessor_config.json",
+      "bytes": 390,
+      "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+    },
+    {
+      "path": "qwen3_5_2b_base_processor/tokenizer.json",
+      "bytes": 12807196,
+      "sha256": "fe000e3ed39ed12b8d2481d527d44f93c65d37e87645d2dcc80d1bf9d50d2927"
+    },
+    {
+      "path": "qwen3_5_2b_base_processor/tokenizer_config.json",
+      "bytes": 16712,
+      "sha256": "e611fbccc7c29ef3b1cafb1cb7ea548d189968632901d678fd62be68c47885de"
+    },
+    {
+      "path": "qwen3_5_2b_base_processor/video_preprocessor_config.json",
+      "bytes": 386,
+      "sha256": "d039cd7d88b3502a99edd455496b75b44ecf7dd3b3669748bafac37e6cecc085"
+    },
+    {
+      "path": "qwen3_5_2b_base_processor/vocab.json",
+      "bytes": 6722759,
+      "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    }
+  ]
+}

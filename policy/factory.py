@@ -5,7 +5,7 @@ environment variable into a concrete :class:`shared.IPolicyBackend`. This is the
 ONLY way production code reaches inference; there is no remaining hardcoded path
 to a specific policy stack.
 
-Selection is an explicit two-member allowlist plus explicit branches. A backend
+Selection is an explicit three-member allowlist plus explicit branches. A backend
 name is never used to build an import path, a module attribute lookup or a class
 name, and is never ``eval``'d — the allowlist IS the whole validation surface
 (ASVS V5).
@@ -23,7 +23,7 @@ from shared import IPolicyBackend
 POLICY_BACKEND_ENV_VAR = "DUME_POLICY_BACKEND"
 
 #: The allowlist. Anything not in here is rejected — never defaulted.
-POLICY_BACKENDS = ("lerobot", "groot-native")
+POLICY_BACKENDS = ("lerobot", "groot-native", "galaxea")
 
 #: Code-level default when the environment variable is unset. Deliberately the
 #: target backend rather than the one that works today, so an unset variable
@@ -38,7 +38,7 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
         **kwargs: Forwarded verbatim to the selected backend's constructor
             (``host``, ``port``, ``camera_keys``, ``robot_state_keys``,
             ``show_images``, ``language_instruction`` — the SAME keyword set for
-            both backends), so every constructor default stays reachable.
+            all backends), so every constructor default stays reachable.
 
     Returns:
         A concrete :class:`shared.IPolicyBackend`.
@@ -74,6 +74,12 @@ def make_policy_backend(**kwargs: Any) -> IPolicyBackend:
         from policy.lerobot.backend import LeRobotPolicyBackend
 
         return LeRobotPolicyBackend(**kwargs)
+
+    if backend == "galaxea":
+        if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
+            raise ValueError("Galaxea uses its native chunk protocol; LeRobot async mode is not supported")
+        from policy.galaxea.backend import GalaxeaPolicyBackend
+        return GalaxeaPolicyBackend(**kwargs)
 
     if backend == "groot-native":
         if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":

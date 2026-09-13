@@ -283,7 +283,7 @@ def test_factory_never_builds_an_import_from_the_env_value():
     assert "importlib" not in source
     assert "__import__" not in source
     # The allowlist is a literal tuple, not something derived at runtime.
-    assert POLICY_BACKENDS == ("lerobot", "groot-native")
+    assert POLICY_BACKENDS == ("lerobot", "groot-native", "galaxea")
 
 
 # --- IPolicyBackend edge cases: adjacency / empty / ordering -----------------

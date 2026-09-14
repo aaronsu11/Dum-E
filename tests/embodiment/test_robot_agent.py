@@ -1,20 +1,4 @@
-"""
-Mocked-wiring async tests for the SO10x robot agent.
-
-These tests are keyless and hardware-free. They pin three client surfaces:
-
-1. Robot ``@tool`` adapters offload the blocking ``Skill`` via
-   ``asyncio.to_thread`` (the event-loop-responsiveness fix).
-2. ``get_available_tools()`` returns a real ``List[ToolDefinition]``.
-3. ``get_status()`` does NOT await the synchronous ``is_connected()``.
-
-Import note: ``embodiment.so_arm10x.controller`` imports
-``policy.gr00t.service.ExternalRobotInferenceClient`` which transitively imports
-the external ``gr00t`` package (only present on the policy-server host). To keep
-this suite runnable in CI we stub those modules in ``sys.modules`` BEFORE
-importing the agent. This is mocked-wiring, not a behavioral change to
-production code.
-"""
+'Mocked-wiring async tests for the SO10x robot agent.'
 
 import sys
 import types
@@ -23,36 +7,32 @@ from unittest.mock import Mock
 import pytest
 
 
-# ---------------------------------------------------------------------------
 # Stub the unavailable external/parallel-plan import chain before importing the
-# agent. `controller.py` does `from policy.gr00t.service import
-# ExternalRobotInferenceClient`, which imports `gr00t.*`. Neither is available
-# in a keyless/no-hardware CI env.
-# ---------------------------------------------------------------------------
+# agent. `controller.py` does `from policy.backends.isaac_groot.service import
 def _install_import_stubs():
-    # Stub the gr00t package tree used by policy.gr00t.service.
+    # Stub the gr00t package tree used by policy.backends.isaac_groot.service.
     for mod_name in ("gr00t", "gr00t.data", "gr00t.data.types", "gr00t.data.utils"):
         if mod_name not in sys.modules:
             sys.modules[mod_name] = types.ModuleType(mod_name)
     sys.modules["gr00t.data.types"].ModalityConfig = object
     sys.modules["gr00t.data.utils"].to_json_serializable = lambda x: x
 
-    # Ensure policy.gr00t.service exposes ExternalRobotInferenceClient even if
+    # Ensure policy.backends.isaac_groot.service exposes ExternalRobotInferenceClient even if
     # the real module fails to import (gr00t missing) or the symbol is not yet
     # present in this worktree.
     try:
-        import policy.gr00t.service as svc  # noqa: F401
+        import policy.backends.isaac_groot.service as svc  # noqa: F401
 
         if not hasattr(svc, "ExternalRobotInferenceClient"):
             svc.ExternalRobotInferenceClient = Mock
     except Exception:
-        svc = types.ModuleType("policy.gr00t.service")
+        svc = types.ModuleType("policy.backends.isaac_groot.service")
         svc.ExternalRobotInferenceClient = Mock
         # Make sure parent packages exist for the dotted import to resolve.
-        for parent in ("policy", "policy.gr00t"):
+        for parent in ("policy", "policy.backends.isaac_groot"):
             if parent not in sys.modules:
                 sys.modules[parent] = types.ModuleType(parent)
-        sys.modules["policy.gr00t.service"] = svc
+        sys.modules["policy.backends.isaac_groot.service"] = svc
 
 
 _install_import_stubs()
@@ -104,9 +84,9 @@ async def test_start_pick_offloads_to_thread(mocker):
     # Invoke the underlying async tool function directly.
     result = await start_pick._tool_func(item="a banana")
 
-    assert spy.await_count == 1 or spy.call_count == 1
+    assert spy.await_count == 2  # skill and JPEG encoding both leave the event loop
     # The Skill bound in the offloaded call is the PickSkill.
-    offloaded_callable = spy.call_args.args[0]
+    offloaded_callable = spy.call_args_list[0].args[0]
     assert offloaded_callable.__self__.__class__ is PickSkill
     # The adapter still builds the preserved response shape from the raw images.
     assert result["status"] == "success"
@@ -171,3 +151,39 @@ async def test_get_status_does_not_await_is_connected():
     # The genuinely-async deps were awaited.
     task_manager.list_tasks.assert_awaited_once()
     message_broker.get_message_history.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_async_fault_reaches_broker_even_if_task_storage_fails(monkeypatch):
+    from unittest.mock import AsyncMock
+    from shared import MessageType
+    monkeypatch.delenv('DUME_ASYNC_INFERENCE',raising=False)
+    controller=_make_controller_mock();broker=Mock();broker.publish=AsyncMock()
+    tasks=Mock();tasks.get_task=AsyncMock(return_value=None);tasks.update_task=AsyncMock(side_effect=RuntimeError('storage failed'))
+    agent=SO10xRobotAgent(controller,Mock(),task_manager=tasks,message_broker=broker)
+    agent._active_task_id='active'
+    await agent._publish_async_failure('Policy server disconnected')
+    message=broker.publish.call_args.args[0]
+    assert message.message_type==MessageType.TASK_FAILED
+    assert message.task_id=='active' and 'disconnected' in message.data['error']
+
+
+@pytest.mark.asyncio
+async def test_control_listener_retargets_and_cancels_active_pick():
+    from unittest.mock import AsyncMock
+    from shared import Message,MessageType
+    from datetime import datetime
+    from embodiment.so_arm10x.agent import _control_updates
+    class Broker:
+        def __init__(self):self.messages=[]
+        async def subscribe(self,**kwargs):
+            assert kwargs['task_id']=='active'
+            for data in ({'source':'mcp_server','action':'retarget','instruction':'apple'},
+                         {'source':'mcp_server','status':'cancelled'}):
+                yield Message(message_type=MessageType.STATUS_UPDATE,task_id='active',timestamp=datetime.now(),data=data)
+        async def publish(self,message):self.messages.append(message)
+    pick=Mock();broker=Broker();agent=Mock();agent.async_pick=pick
+    await _control_updates(agent,broker,'active')
+    pick.set_task.assert_called_once_with('apple')
+    pick.stop.assert_called_once()
+    assert len(broker.messages)==2

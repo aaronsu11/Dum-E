@@ -1,6 +1,6 @@
 """Mocked-wiring tests for the GR00T policy-client transport.
 
-This file pins the ``policy/gr00t/service.py`` :5555 wire contract and the
+This file pins the ``policy/backends/isaac_groot/service.py`` :5555 wire contract and the
 ZMQ socket-lifecycle / bounded-retry hardening.
 
 Like ``tests/test_pipecat_server.py``, every test here is CI-runnable with NO
@@ -32,13 +32,13 @@ import numpy as np
 import pytest
 import zmq
 
-from policy.gr00t.service import (
+from policy.backends.isaac_groot.service import (
     BaseInferenceClient,
     ExternalRobotInferenceClient,
     MsgSerializer,
 )
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # --- Helpers ----------------------------------------------------------------

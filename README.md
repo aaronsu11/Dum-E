@@ -91,9 +91,18 @@ are mounted at runtime, never baked into the image.
     export HF_TOKEN=<your-hf-token>
     # SO101 fruit-picking checkpoint (mounted :ro at runtime)
     uv run hf download aaronsu11/GR00T-N1.7-3B-SO101-FruitPicking \
+        --revision 26b179c37f35168359ccdf2e51fed6c2690186cf \
         --local-dir ./checkpoints/GR00T-N1.7-3B-SO101 --exclude "optimizer.pt"
     # Gated backbone (read from the mounted HF cache at runtime)
-    uv run hf download nvidia/Cosmos-Reason2-2B
+    uv run python - <<'PYCODE'
+    from pathlib import Path
+    from huggingface_hub import snapshot_download
+    revision = "9ce19a195e423419c349abfc86fd07178b230561"
+    snapshot = Path(snapshot_download("nvidia/Cosmos-Reason2-2B", revision=revision))
+    refs = snapshot.parent.parent / "refs"
+    refs.mkdir(parents=True, exist_ok=True)
+    (refs / "main").write_text(revision)
+    PYCODE
     ```
 
 3. Build the image at the pinned commit. The wrapper delegates to the upstream
@@ -115,27 +124,44 @@ are mounted at runtime, never baked into the image.
     docker rm -f gr00t-server 2>/dev/null || true
     docker run -d \
         --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
-        -p 5555:5555 \
+        -p 127.0.0.1:5555:5555 \
         -v "$(pwd)/checkpoints/GR00T-N1.7-3B-SO101:/checkpoints/model:ro" \
         -v ~/.cache/huggingface:/root/.cache/huggingface:ro \
         -e HF_TOKEN="$HF_TOKEN" \
+        -v "$(pwd)/scripts:/app/scripts:ro" \
+        -v "$(pwd)/policy:/app/policy:ro" \
         --name gr00t-server \
         gr00t \
-        uv run python gr00t/eval/run_gr00t_server.py \
+        uv run python /app/scripts/serve_observed_native.py \
             --model-path /checkpoints/model \
-            --embodiment-tag new_embodiment --host 0.0.0.0 --port 5555
+            --host 0.0.0.0 --port 5555 --observer-mode lightweight
     ```
 
     The server is ready once port `5555` is listening and the model has finished
     loading (GPU memory settles). Keep the container running while you use the policy
     for inference. Note the server's IP (`<policy_host>`) and make sure port 5555 is
-    reachable from the client.
+    reachable through a loopback tunnel from a remote client.
 
 > [!NOTE]
 > **Security:** the server has no auth by default. Publish/bind `:5555` to `localhost`
 > or a trusted subnet only — do not expose it to untrusted networks. Always build via
 > `scripts/build_gr00t_image.sh` (SHA-pinned), never an ad-hoc `docker build`, so the
 > image provenance stays locked to the verified upstream commit.
+
+#### Additional policy servers and validation
+
+Dum-E includes LeRobot GR00T, native G0.5, mapped Pi0.5 and MolmoAct 2 serving.
+The launcher defaults to native GR00T; choose another backend explicitly.
+
+- [Build, checkpoints and supported routes](docs/POLICY-SERVING.md)
+- [SO101 cameras, calibration and joint mapping](docs/SO101-POLICY-CONTRACTS.md)
+- [Reproduce tests, benchmarks and bounded trials](docs/POLICY-VALIDATION.md)
+- [GR00T async and Pi0.5 RTC](docs/ASYNC-INFERENCE.md)
+- [EC2 deployment and network measurements](docs/EC2-INFERENCE.md)
+- [Add another embodiment, including a future R1 Pro integration](docs/EXTENDING-EMBODIMENTS.md)
+
+The additional policies have bounded plumbing validation, not general task-accuracy
+qualification. Model support does not imply a matching robot/embodiment mapping.
 
 #### On Single Workstation or Client
 
@@ -162,7 +188,7 @@ are mounted at runtime, never baked into the image.
 > If you have never set up SO-ARM before:
 > - Find the `wrist_cam_idx` and `front_cam_idx` by running `lerobot-find-cameras`
 > - Find the `robot_port` of by running `lerobot-find-port`
-> - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `robot_id`. For example with SO-101, run: `lerobot-calibrate --robot.type=so101_follower --robot.port=<robot_port> --robot.id=<robot_id>`
+> - Calibrate the robot following the instructions for [SO-100](https://huggingface.co/docs/lerobot/en/so100#calibrate) or [SO-101](https://huggingface.co/docs/lerobot/en/so101#calibrate) and note down your `robot_id`. For example with SO-101, run: `lerobot-calibrate --robot.type=so_follower --robot.port=<robot_port> --robot.id=<robot_id>`
     
 
 4. Configure Dum-E
@@ -371,4 +397,6 @@ This project builds on top of the following open-source projects:
 
 *Built with ❤️ for the future of robotics*
 
-</div> 
+</div>
+
+See [architecture and deployment configuration](docs/ARCHITECTURE.md) for the embodiment/policy boundaries and extension rules.

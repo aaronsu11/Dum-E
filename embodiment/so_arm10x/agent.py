@@ -1,27 +1,7 @@
-"""
-Refactored robot agent implementing the IRobotAgent interface.
-
-This module provides an SO10x robot agent that implements the abstract
-interfaces while maintaining compatibility with the existing voice assistant
-streaming pattern. Key improvements include:
-- Implements IRobotAgent interface for modularity
-- Message publishing for real-time progress updates
-- Enhanced error handling and recovery
-- Task lifecycle management
-- Tool registry integration
-
-Example usage (from the root directory):
-python -m embodiment.so_arm10x.agent \
-    --port /dev/ttyACM0 \
-    --id so101_follower_arm \
-    --wrist_cam_idx 0 \
-    --front_cam_idx 1 \
-    --policy_host localhost \
-    --profile aws \
-    --instruction "I want one banana and one apple on the plate"
-"""
+'Refactored robot agent implementing the IRobotAgent interface.'
 
 import asyncio
+from contextlib import asynccontextmanager, suppress
 import base64
 import os
 import time
@@ -40,7 +20,6 @@ from strands.telemetry import StrandsTelemetry
 
 
 from embodiment.so_arm10x.controller import (
-    Gr00tRobotInferenceClient,
     SO10xArmController,
 )
 from embodiment.so_arm10x.skills import (
@@ -48,7 +27,9 @@ from embodiment.so_arm10x.skills import (
     PlaceSkill,
     ResetPoseSkill,
 )
+from policy.factory import make_policy_backend
 from shared import (
+    IPolicyBackend,
     ITaskManager,
     IMessageBroker,
     IRobotAgent,
@@ -89,33 +70,42 @@ def image_to_jpeg_bytes(
     return buffer.tobytes()
 
 
+@asynccontextmanager
+async def hardware_session(controller):
+    await asyncio.to_thread(controller.connect)
+    try:
+        yield controller
+    finally:
+        await asyncio.to_thread(controller.disconnect)
+
+
 def create_robot_tools(
     robot_controller: SO10xArmController,
-    gr00t_client_instance: Gr00tRobotInferenceClient,
+    gr00t_client_instance: IPolicyBackend,
+    async_pick=None,
 ):
-    """Create robot tools that use the specific robot instance.
-
-    Each blocking robot operation lives in a synchronous ``Skill`` (skills.py).
-    The robot ``@tool`` functions below are thin ASYNC adapters that offload the
-    Skill's ``run()`` onto a worker thread via ``asyncio.to_thread``, so
-    the event loop stays responsive during multi-minute N1.7 inference. The
-    adapters preserve the exact ``{"status", "content": [...]}`` response shape
-    and the ``image_to_jpeg_bytes`` post-processing; the Skill returns raw images.
-
-    Strands 1.12.0 accepts ``async def`` functions decorated with ``@tool``
-    (confirmed via ``Agent(tools=[async_tool]).tool_names``), so the adapters are
-    registered directly without a sync bridge.
-    """
+    'Create robot tools that use the specific robot instance.'
 
     # Construct the synchronous Skills bound to this controller + policy client.
-    pick_skill = PickSkill(robot_controller, gr00t_client_instance)
+    pick_skill = async_pick or PickSkill(robot_controller, gr00t_client_instance)
     place_skill = PlaceSkill(robot_controller, gr00t_client_instance)
     reset_pose_skill = ResetPoseSkill(robot_controller, gr00t_client_instance)
+
+    async def run_pick(*args, **kwargs):
+        try:
+            return await asyncio.to_thread(pick_skill.run, *args, **kwargs)
+        except asyncio.CancelledError:
+            if async_pick is not None:
+                await asyncio.to_thread(async_pick.stop, "Pick task cancelled")
+            raise
 
     @tool
     async def reset_pose():
         """Reset the robot to the initial pose to make the workspace clear and visible."""
-        await asyncio.to_thread(reset_pose_skill.run)
+        if async_pick is not None:
+            await asyncio.to_thread(async_pick.other_motion, reset_pose_skill.run)
+        else:
+            await asyncio.to_thread(reset_pose_skill.run)
         return {
             "status": "success",
             "content": [
@@ -149,23 +139,15 @@ def create_robot_tools(
 
     @tool
     async def start_pick(item: str) -> dict:
-        """Start picking up an item and put it on the plate
-
-        Args:
-            item: The item to pick up, e.g. "a banana", "an apple", "an orange"
-
-        Returns:
-            A dictionary containing the status of the pick operation
-        """
+        'Start picking up an item and put it on the plate'
         language_instruction = f"Grab {item} and put it on the plate"
         gr00t_client_instance.set_lang_instruction(language_instruction)
-        latest_images = await asyncio.to_thread(
-            pick_skill.run,
+        latest_images = await run_pick(
             item=item,
             pose="initial",
             language_instruction=language_instruction,
         )
-        image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
+        image_bytes = await asyncio.to_thread(image_to_jpeg_bytes, latest_images["front"], verbose=False)
 
         return {
             "status": "success",
@@ -180,10 +162,9 @@ def create_robot_tools(
     @tool
     async def resume_pick():
         """Resume picking up an item from a given location"""
-        latest_images = await asyncio.to_thread(
-            pick_skill.run, actions_to_execute=15, pose="resume"
+        latest_images = await run_pick( actions_to_execute=15, pose="resume"
         )
-        image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
+        image_bytes = await asyncio.to_thread(image_to_jpeg_bytes, latest_images["front"], verbose=False)
 
         return {
             "status": "success",
@@ -198,8 +179,11 @@ def create_robot_tools(
     @tool
     async def place(location: Literal["left", "right"]):
         """Place an item at a given location"""
-        latest_images = await asyncio.to_thread(place_skill.run, location=location)
-        image_bytes = image_to_jpeg_bytes(latest_images["front"], verbose=False)
+        if async_pick is not None:
+            latest_images = await asyncio.to_thread(async_pick.other_motion, place_skill.run, location=location)
+        else:
+            latest_images = await asyncio.to_thread(place_skill.run, location=location)
+        image_bytes = await asyncio.to_thread(image_to_jpeg_bytes, latest_images["front"], verbose=False)
 
         return {
             "status": "success",
@@ -215,34 +199,18 @@ def create_robot_tools(
 
 
 class SO10xRobotAgent(IRobotAgent):
-    """
-    SO10x robot agent implementing the IRobotAgent interface.
-
-    Maintains compatibility with existing voice assistant integration while
-    adding enhanced features for task management, event streaming, and
-    modular tool management.
-    """
+    'SO10x robot agent implementing the IRobotAgent interface.'
 
     def __init__(
         self,
         robot_controller: SO10xArmController,
-        gr00t_client_instance: Gr00tRobotInferenceClient,
+        gr00t_client_instance: IPolicyBackend,
         task_manager: Optional[ITaskManager] = None,
         profile: Literal["default", "aws"] = "default",
         message_broker: Optional[IMessageBroker] = None,
         callback_handler: Callable = None,
     ):
-        """
-        Initialize the SO10x robot agent with explicit dependency injection.
-
-        Args:
-            robot_controller: Required SO100Robot instance for hardware control
-            gr00t_client_instance: Required Gr00t client instance
-            profile: The model provider profile
-            task_manager: task manager instance
-            message_broker: optional message broker instance
-            callback_handler: optional callback handler for agent events
-        """
+        'Initialize the SO10x robot agent with explicit dependency injection.'
         # Required controller and policy client
         self.robot_controller = robot_controller
         self.gr00t_client_instance = gr00t_client_instance
@@ -257,15 +225,52 @@ class SO10xRobotAgent(IRobotAgent):
         # Agent events handler for custom logging
         self.callback_handler = callback_handler or create_clean_callback_handler()
 
+        self.async_pick = None
+        self._active_task_id = None
+        self._event_loop = None
+        if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
+            from embodiment.so_arm10x.async_pick import AsyncPickSkill, load_settings
+            settings = load_settings(os.environ["DUME_ASYNC_LATENCY_PATH"])
+            self.async_pick = AsyncPickSkill(robot_controller, gr00t_client_instance, settings,
+                                            on_failure=self._notify_async_failure,
+                                            trace_directory=os.getenv("DUME_ASYNC_TRACE_DIRECTORY"))
+
         # Create robot-specific tools
         self._robot_tools = create_robot_tools(
-            self.robot_controller, self.gr00t_client_instance
+            self.robot_controller, self.gr00t_client_instance, async_pick=self.async_pick
         )
 
         # Initialize the underlying Strands agent
         self.profile = profile
         self._strands_agent = None
         self._agent_lock = asyncio.Lock()
+
+    def _notify_async_failure(self, reason):
+        if self._event_loop is not None:
+            asyncio.run_coroutine_threadsafe(self._publish_async_failure(reason), self._event_loop)
+
+    async def _record_failed_task(self, task_id, reason):
+        task = await self.task_manager.get_task(task_id)
+        if task is not None and task.status == TaskStatus.CANCELLED:
+            return TaskStatus.CANCELLED
+        await self.task_manager.update_task(task_id, TaskStatus.FAILED, reason)
+        return TaskStatus.FAILED
+
+    async def _publish_async_failure(self, reason):
+        notifications = []
+        if self.task_manager is not None and self._active_task_id is not None:
+            notifications.append(self._record_failed_task(self._active_task_id, reason))
+        if self.message_broker is not None:
+            notifications.append(self.message_broker.publish(Message(
+                message_type=MessageType.TASK_FAILED, task_id=self._active_task_id,
+                timestamp=datetime.now(), data={"error": reason, "source": self.id})))
+        for result in await asyncio.gather(*notifications, return_exceptions=True):
+            if isinstance(result, BaseException):
+                logger.error("Async failure notification failed: {}", result)
+
+    def _check_async(self):
+        if self.async_pick is not None:
+            self.async_pick.check()
 
     async def _get_strands_agent(self) -> Agent:
         """Get or create the underlying Strands agent (lazy initialization)."""
@@ -363,17 +368,21 @@ Note: Colors in images may appear different due to reflections.""",
                     task_id = await self.task_manager.create_task(instruction)
                 await self.task_manager.update_task(task_id, TaskStatus.RUNNING)
 
+            self._active_task_id = task_id
+            self._event_loop = asyncio.get_running_loop()
+            self._check_async()
             # Get the Strands agent and execute
             agent = await self._get_strands_agent()
 
             # Execute with robot hardware context
-            with self.robot_controller.activate():
+            async with hardware_session(self.robot_controller):
                 # Warm up cameras for 1 second
                 for _ in range(5):
-                    self.robot_controller.get_current_images()
+                    await asyncio.to_thread(self.robot_controller.get_current_images)
                     await asyncio.sleep(0.2)
 
-                result = agent(instruction)
+                result = await asyncio.to_thread(agent, instruction)
+                self._check_async()
 
                 # Reset to initial pose after completion — offload the blocking
                 # move (it sleeps internally) so the event loop stays free.
@@ -396,18 +405,19 @@ Note: Colors in images may appear different due to reflections.""",
                     logger.warning(
                         f"⚠️  Error during execution, disconnecting robot: {e}"
                     )
-                    self.robot_controller.disconnect()
+                    await asyncio.to_thread(self.robot_controller.disconnect)
             except Exception as disconnect_error:
                 logger.error(
                     f"❌ Failed to disconnect robot after error: {disconnect_error}"
                 )
 
+            terminal_status = TaskStatus.FAILED
             if self.task_manager is not None and task_id is not None:
-                await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
+                terminal_status = await self._record_failed_task(task_id, str(e))
 
             return {
                 "task_id": task_id,
-                "status": "failed",
+                "status": terminal_status.value,
                 "error": str(e),
                 "timestamp": datetime.now().isoformat(),
             }
@@ -415,12 +425,7 @@ Note: Colors in images may appear different due to reflections.""",
     async def astream(
         self, instruction: str, task_id: Optional[str] = None
     ) -> AsyncIterator[Dict[str, Any]]:
-        """
-        Execute instruction with streaming progress updates.
-
-        Maintains compatibility with existing voice assistant while adding
-        enhanced progress tracking and message publishing.
-        """
+        'Execute instruction with streaming progress updates.'
         try:
             # Create task if not provided and manager exists
             if self.task_manager is not None:
@@ -439,14 +444,17 @@ Note: Colors in images may appear different due to reflections.""",
                     )
                 )
 
+            self._active_task_id = task_id
+            self._event_loop = asyncio.get_running_loop()
+            self._check_async()
             # Get the Strands agent with robot-specific tools
             agent = await self._get_strands_agent()
 
             # Execute with robot hardware context and streaming
-            with self.robot_controller.activate():
+            async with hardware_session(self.robot_controller):
                 # Warm up cameras with progress updates
                 for i in range(5):
-                    self.robot_controller.get_current_images()
+                    await asyncio.to_thread(self.robot_controller.get_current_images)
                     await asyncio.sleep(0.2)
 
                     # Yield camera warmup progress
@@ -463,6 +471,7 @@ Note: Colors in images may appear different due to reflections.""",
                 # See https://strandsagents.com/latest/documentation/docs/user-guide/concepts/streaming/async-iterators/
                 # for more information
                 async for event in agent.stream_async(instruction):
+                    self._check_async()
                     if (
                         "message" in event
                         and isinstance(event["message"], dict)
@@ -522,9 +531,11 @@ Note: Colors in images may appear different due to reflections.""",
                 # Reset to initial pose after completion — offload the blocking
                 # move and use async sleep so the event loop stays responsive.
                 try:
+                    self._check_async()
                     await asyncio.to_thread(self.robot_controller.move_to_initial_pose)
                     await asyncio.sleep(1.0)
                 except Exception as pose_error:
+                    self._check_async()
                     # Log the error but don't fail the task - it already completed successfully
                     logger.warning(
                         f"⚠️  Failed to reset to initial pose in time after task completion: {pose_error}"
@@ -537,14 +548,14 @@ Note: Colors in images may appear different due to reflections.""",
                     logger.warning(
                         f"⚠️  Error during execution, disconnecting robot: {e}"
                     )
-                    self.robot_controller.disconnect()
+                    await asyncio.to_thread(self.robot_controller.disconnect)
             except Exception as disconnect_error:
                 logger.error(
                     f"❌ Failed to disconnect robot after error: {disconnect_error}"
                 )
 
             if self.task_manager is not None and task_id is not None:
-                await self.task_manager.update_task(task_id, TaskStatus.FAILED, str(e))
+                await self._record_failed_task(task_id, str(e))
 
                 if self.message_broker:
                     # Publish failure message
@@ -569,13 +580,7 @@ Note: Colors in images may appear different due to reflections.""",
             }
 
     async def get_available_tools(self) -> List[ToolDefinition]:
-        """Get list of tools available to this agent.
-
-        Builds a real ``List[ToolDefinition]`` from the Strands ``@tool`` specs.
-        Each decorated tool exposes its spec via ``.tool_spec`` (a dict with
-        ``name``/``description``/``inputSchema``); the JSON parameter schema lives
-        at ``tool_spec["inputSchema"]["json"]``.
-        """
+        'Get list of tools available to this agent.'
         tool_definitions: List[ToolDefinition] = []
         for fn in self._robot_tools:
             spec = getattr(fn, "tool_spec", None)
@@ -641,33 +646,29 @@ def create_robot_agent(
     task_manager: Optional[ITaskManager] = None,
     message_broker: Optional[IMessageBroker] = None,
 ) -> SO10xRobotAgent:
-    """
-    Create a robot agent with customizable hardware configuration.
-
-    This creates fresh instances with specified hardware settings, ideal for
-    multiple agents with different camera configurations.
-
-    Args:
-        robot_type: Robot type (so100_follower or so101_follower)
-        robot_port: Serial port for the arm
-        robot_id: Robot ID
-        wrist_cam_idx: Wrist camera index
-        front_cam_idx: Front camera index
-        policy_host: Host for the GR00T policy server
-        profile: The model provider profile
-        callback_handler: Optional callback handler for agent events
-    """
+    'Create a robot agent with customizable hardware configuration.'
     if robot_port is None:
         raise ValueError("`robot_port` is required for create_robot_agent")
 
-    robot_controller = SO10xArmController(
+    controller_class = SO10xArmController
+    controller_options = {}
+    if os.getenv("DUME_ASYNC_INFERENCE", "0") == "1":
+        from embodiment.so_arm10x.safety import StopGuardedController, StopLatch
+        controller_class = StopGuardedController
+        controller_options["stop"] = StopLatch()
+    robot_controller = controller_class(
+        **controller_options,
         robot_type=robot_type,
         robot_port=robot_port,
         robot_id=robot_id,
         wrist_cam_idx=wrist_cam_idx,
         front_cam_idx=front_cam_idx,
     )
-    gr00t_instance = Gr00tRobotInferenceClient(host=policy_host)
+    # Policy backend is SELECTED, never hardcoded: the factory
+    # validates DUME_POLICY_BACKEND and raises here — before
+    # `SO10xArmController.connect()` (driven by `IRobotController.activate()`)
+    # ever touches the serial bus.
+    gr00t_instance = make_policy_backend(host=policy_host)
 
     return SO10xRobotAgent(
         robot_controller=robot_controller,
@@ -677,6 +678,30 @@ def create_robot_agent(
         task_manager=task_manager,
         message_broker=message_broker,
     )
+
+
+async def _control_updates(agent, message_broker, task_id):
+    async for message in message_broker.subscribe(message_types=[MessageType.STATUS_UPDATE], task_id=task_id):
+        data = message.data
+        if not isinstance(data, dict) or data.get("source") != "mcp_server":
+            continue
+        try:
+            if agent.async_pick is None:
+                raise RuntimeError("Current task does not support async retargeting")
+            if data.get("action") == "retarget":
+                await asyncio.to_thread(agent.async_pick.set_task, data["instruction"])
+                text = "Retargeted the running pick: " + data["instruction"]
+            elif data.get("status") == "cancelled":
+                await asyncio.to_thread(agent.async_pick.stop, "Operator cancelled task")
+                text = "Stopped the running pick."
+            else:
+                continue
+        except Exception as exc:
+            text = "Could not apply task control: " + str(exc)
+        await message_broker.publish(Message(
+            message_type=MessageType.TASK_PROGRESS, task_id=task_id,
+            timestamp=datetime.now(), data={"type": "assistant_message", "message": {
+                "role": "assistant", "content": [{"text": text}]}}))
 
 
 async def _agent_worker_loop(
@@ -715,10 +740,14 @@ async def _agent_worker_loop(
 
             # Execute with streaming. The agent will publish streaming updates
             # and final status via the provided message_broker.
-            async for _ in agent.astream(instruction, task_id=task_id):
-                # We rely on the agent to publish TASK_PROGRESS
-                # Optional logging can be added here if needed
-                pass
+            controls = asyncio.create_task(_control_updates(agent, message_broker, task_id))
+            try:
+                async for _ in agent.astream(instruction, task_id=task_id):
+                    pass
+            finally:
+                controls.cancel()
+                with suppress(asyncio.CancelledError):
+                    await controls
         except Exception as exec_error:
             # Best-effort failure reporting
             try:

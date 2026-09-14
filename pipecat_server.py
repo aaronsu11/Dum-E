@@ -85,17 +85,9 @@ LANGUAGE_PRESETS = {
         "elevenlabs": {
             # Sarah — a PREMADE voice (free-tier usable). eleven_turbo_v2_5 is
             # multilingual, so with language_code "zh" it speaks Mandarin. Library/
-            # professional voices (e.g. the dedicated Mandarin "Stacy"
-            # hkfHEbBvdQFNX4uWHqRF) require a PAID ElevenLabs plan — on free tier the
-            # API returns 402 payment_required and the websocket path fails silently
-            # (no audio). Use a premade voice unless the deployment has a paid plan.
             "voice_id": "EXAVITQu4vr4xnSDxMaL",  # Sarah (premade, multilingual via turbo)
             # eleven_turbo_v2_5 is required for the streaming websocket path pipecat
             # uses (the multi-stream-input endpoint only serves the streaming models
-            # eleven_flash_v2_5 / eleven_turbo_v2_5). eleven_multilingual_v2 is NOT a
-            # streaming model — the endpoint returns a final message with no audio.
-            # turbo_v2_5 is also in ELEVENLABS_MULTILINGUAL_MODELS, so the zh language
-            # code below IS applied (Language.ZH -> "zh", which the model accepts).
             "model": "eleven_turbo_v2_5",
             "language": Language.ZH,
         },
@@ -168,24 +160,7 @@ transport_params = {
 
 
 def _as_tool_result_object(response: str):
-    """Coerce a tool's concatenated text response into a JSON-object result.
-
-    Function-call results flow through two serialization layers — the
-    universal aggregator does ``json.dumps(frame.result)`` and stores the string,
-    then Nova Sonic forwards it verbatim. Nova Sonic's Bedrock side REJECTS a
-    tool result whose top-level JSON is not an object:
-    "Unsupported JSON type in Tool Result. Please provide the Tool Result as a JSON
-    object." Returning a bare string therefore double-encodes to a JSON *string
-    literal* and fails. Returning a dict makes the aggregator emit a JSON *object*,
-    which Nova Sonic accepts and the cascaded Bedrock/Anthropic adapters handle
-    identically (Bedrock already json.loads object-looking content; Anthropic
-    re-dumps the dict to the same text).
-
-    - Empty response -> a benign object (never the old "could not call" sentinel,
-      which some tools legitimately return empty for).
-    - Response that is already a JSON object -> that object (pass-through).
-    - Any other text (incl. JSON arrays/scalars) -> wrapped as {"result": <text>}.
-    """
+    "Coerce a tool's concatenated text response into a JSON-object result."
     if not response:
         return {"result": "Sorry, could not call the mcp tool"}
     try:
@@ -249,21 +224,12 @@ class AsyncMCPClient(MCPClient):
     # function_call_timeout_secs flipped to None, so without an explicit bound a
     # stalled normal tool would hang the voice loop forever.
     NORMAL_TOOL_TIMEOUT_SECS: float = 30.0
+    # None inherits the global 30s timeout in the pinned runtime. Allow the
+    # MCP execution handler its default 900s deadline plus transport cleanup.
+    LONG_TOOL_TIMEOUT_SECS: float = 960.0
 
     async def register_tools_schema(self, tools_schema, llm):
-        """Register MCP tools, deriving cancel_on_interruption + timeout_secs from long_running metadata.
-
-        Replaces the dead per-transport list-tools override (which never ran under 0.0.104 or 1.x).
-        The 1.x parent `register_tools_schema(self, tools_schema, llm)` receives a
-        ToolsSchema of FunctionSchema objects that no longer carry the FastMCP `.meta`
-        flag, so we re-list tools from the live session to recover the `long_running`
-        flag, then register each tool with the parent's `self._tool_wrapper`.
-
-        - long_running tools: cancel_on_interruption=False, timeout_secs=None (exempt —
-          legitimate multi-minute robot tasks must not be killed).
-        - normal tools: cancel_on_interruption=True, timeout_secs=NORMAL_TOOL_TIMEOUT_SECS
-          (true hangs are bounded).
-        """
+        'Register MCP tools, deriving cancel_on_interruption + timeout_secs from long_running metadata.'
         # Recover the long_running flag per tool name from the live MCP session.
         long_running_by_name: dict[str, bool] = {}
         try:
@@ -280,7 +246,7 @@ class AsyncMCPClient(MCPClient):
             is_long_running = long_running_by_name.get(tool_name, False)
             # If the tool is long running, we don't want to interrupt it on new voice input.
             cancel_on_interruption = not is_long_running
-            timeout_secs = None if is_long_running else self.NORMAL_TOOL_TIMEOUT_SECS
+            timeout_secs = self.LONG_TOOL_TIMEOUT_SECS if is_long_running else self.NORMAL_TOOL_TIMEOUT_SECS
             logger.debug(
                 f"Registering function handler for '{tool_name}' with "
                 f"cancel_on_interruption={cancel_on_interruption}, timeout_secs={timeout_secs}"
@@ -299,23 +265,7 @@ class AsyncMCPClient(MCPClient):
 
 
 def resolve_aws_static_credentials():
-    """Resolve AWS credentials via the botocore default provider chain.
-
-    AWSNovaSonicLLMService builds a smithy StaticCredentialsResolver from
-    the access_key_id/secret_access_key/session_token it is handed and does NOT walk
-    the AWS credential chain itself. Reading only os.getenv("AWS_ACCESS_KEY_ID")/
-    ("AWS_SECRET_ACCESS_KEY") therefore fails (SmithyIdentityError "credentials weren't
-    configured") whenever auth lives in ~/.aws/credentials, a named AWS_PROFILE, or SSO
-    rather than in those two env vars — even though the boto3-based cascaded services
-    (Transcribe/Polly/Bedrock) resolve fine. Resolve once here through botocore (which
-    honors env vars, shared credentials files, profiles, and SSO) and hand the frozen
-    static creds to Nova Sonic.
-
-    Returns:
-        Tuple of (access_key_id, secret_access_key, session_token). session_token is
-        None for long-lived IAM-user keys. Returns (None, None, None) if the chain
-        resolves nothing, so the caller can fall back to explicit env vars.
-    """
+    'Resolve AWS credentials via the botocore default provider chain.'
     try:
         import botocore.session
 
@@ -330,21 +280,7 @@ def resolve_aws_static_credentials():
 
 
 def _sanitize_schema_for_nova_sonic(node):
-    """Recursively coerce a JSON-Schema fragment into the restricted shape that
-    Nova Sonic's Bedrock tool validator accepts.
-
-    Nova Sonic (amazon.nova-*-sonic) rejects tool inputSchemas that use
-    constructs its bidirectional-streaming tool validator does not support —
-    surfacing as "Invalid input request, please fix your input and try again."
-    the instant the tool-bearing prompt-start event is sent — even though the
-    boto3/Converse path (Claude) tolerates them. The MCP tool schemas emitted by
-    FastMCP/Pydantic use exactly those constructs for optional params:
-      - ``anyOf: [<T>, {"type": "null"}]`` (Optional[...] fields)
-      - ``default`` keys
-      - ``additionalProperties`` / ``title``
-    Collapse ``anyOf``/``oneOf`` to the first non-null branch and strip the
-    unsupported keys. The result remains a valid schema for every other model.
-    """
+    "Recursively coerce a JSON-Schema fragment into the restricted shape that Nova Sonic's Bedrock tool validator accepts."
     if isinstance(node, list):
         return [_sanitize_schema_for_nova_sonic(n) for n in node]
     if not isinstance(node, dict):
@@ -381,14 +317,7 @@ def _sanitize_schema_for_nova_sonic(node):
 
 
 def sanitize_tools_for_nova_sonic(tools):
-    """Return a ToolsSchema whose FunctionSchema properties are coerced to the
-    restricted JSON-Schema shape Nova Sonic accepts (see
-    _sanitize_schema_for_nova_sonic).
-
-    Tool NAMES and required lists are preserved so handler dispatch is unaffected.
-    Returns ``tools`` unchanged if it is falsy. Only the Nova Sonic speech-to-speech
-    path needs this — the cascaded Claude/Converse path tolerates the raw MCP schemas.
-    """
+    'Return a ToolsSchema whose FunctionSchema properties are coerced to the restricted JSON-Schema shape Nova Sonic accepts (see _sanitize_schema_for_nova_sonic).'
     if not tools:
         return tools
     sanitized = []
@@ -409,26 +338,7 @@ def sanitize_tools_for_nova_sonic(tools):
 
 
 def patch_trace_input_output():
-    """Promote the first LLM input and latest LLM output to the Langfuse TRACE level.
-
-    Per the official Langfuse Pipecat integration doc ("Add Trace Input and Output",
-    https://langfuse.com/integrations/frameworks/pipecat). Without this patch, live
-    traces show ``input:null, output:null`` at the TRACE level — the conversation
-    transcript and LLM responses are only captured on child ``llm`` GENERATION spans.
-
-    This wraps ``pipecat.utils.tracing.service_decorators.add_llm_span_attributes``
-    so that:
-    - On the FIRST call where the ``messages`` kwarg is truthy, it sets the span
-      attribute ``langfuse.trace.input`` to that ``messages`` value.
-    - ``span.set_attribute`` is wrapped so any ``"output"`` key also mirrors to
-      ``langfuse.trace.output`` (last write wins).
-
-    Note: installed Pipecat 1.3.0 passes ``messages`` as a JSON-serialized STRING
-    kwarg (not a list). The patch is value-agnostic and sets whatever the kwarg
-    holds, so no coercion or re-parsing is needed.
-
-    Idempotent / value-agnostic: must be called before ``setup_tracing(...)``.
-    """
+    'Promote the first LLM input and latest LLM output to the Langfuse TRACE level.'
     from pipecat.utils.tracing import service_decorators
 
     original = service_decorators.add_llm_span_attributes
@@ -466,6 +376,12 @@ CRITICAL RULES FOR VOICE OUTPUT:
 - No lists or bullet points - speak in flowing sentences
 - Keep responses to 1-3 short sentences maximum
 
+TASK CONTROL:
+- Use exact robot IDs returned by list_robots; never invent IDs from names.
+- Before retargeting or cancelling a running task, call list_tasks with status running and use the returned task_id. A tool-call ID is never a robot task ID.
+- If several running tasks match, ask which one. An unknown task ID does not mean a task completed; look it up before describing its state.
+- Report retargeting as applied only after task progress confirms it; requested is not yet applied.
+
 RESPONSE STYLE:
 - Be direct and conversational
 - Skip explanations of what you're doing - just give results
@@ -482,19 +398,7 @@ async def run_jarvis(
     language: str = "en",
     backend: Literal["hosted", "sagemaker"] = "hosted",
 ):
-    """
-    Run JARVIS voice agent with the given transport, runner arguments, mode, and profile.
-
-    Args:
-        transport: The transport to use for the bot
-        runner_args: The runner arguments to use for the bot
-        mode: The mode to use for the bot. Voice status update is only supported in cascaded mode.
-        profile: The profile to use for the bot
-        language: Language code for voice interface (en, zh, ja, es)
-        backend: Deepgram backend for the default profile. "hosted" (default) uses the
-            hosted Deepgram STT/TTS; "sagemaker" uses the Deepgram-on-SageMaker services
-            (wired but NOT yet deployed — raises ValueError if no endpoint is set).
-    """
+    'Run JARVIS voice agent with the given transport, runner arguments, mode, and profile.'
 
     logger.info(f"Starting bot")
 
@@ -683,12 +587,6 @@ async def run_jarvis(
         if profile == "aws":
             # Nova Sonic 2 (amazon.nova-2-sonic-v1:0) bootstrap. The OLD Nova Sonic 1
             # pattern appended an "await-trigger" instruction ("start speaking when you
-            # hear 'ready'") and sent a synthetic "ready" audio cue. On NS2 that audio
-            # cue is a NO-OP (pipecat logs "Assistant response trigger not needed"), so
-            # the model would sit waiting for a 'ready' cue that never arrives and never
-            # greet. NS2 is kicked off with a plain LLMRunFrame() instead (see
-            # on_client_connected), so we must NOT inject the await-trigger instruction
-            # here — keep only the greeting instruction.
             if mode == "speech_to_speech":
                 # Nova Sonic's tool validator rejects the raw MCP schemas
                 # (anyOf/null, default, additionalProperties) with "Invalid input

@@ -2,12 +2,14 @@
 
 The shared module defines transport-agnostic interfaces for Dum‑E components and their implementations for efficient cross‑process communication.
 
-### Interfaces (`shared/__init__.py`)
+### Interfaces (`shared/interfaces.py`)
 
 - `IRobotAgent`: async agent contract with `arun`, `astream`, `get_available_tools`, `get_status`.
 - `ITaskManager`: task lifecycle with `create_task`, `get_task`, `update_task`, `list_tasks`, `cancel_task`, `claim_task`.
 - `IMessageBroker`: pub/sub for streaming events with `publish`, `subscribe`, `get_message_history`.
-- Data models: `TaskInfo`, `TaskStatus`, `Message`, `MessageType`, `ToolDefinition`, `BackendConfig`.
+- `IPolicyBackend`: complete action chunks, health and episode lifecycle.
+- `IPolicyMapping`: embodiment-owned coordinate conversion, named joints/cameras and calibration validation.
+- Data models (`shared/types.py`; re-exported from `shared`): `TaskInfo`, `TaskStatus`, `Message`, `MessageType`, `ToolDefinition`, `BackendConfig`.
 
 These abstractions decouple the Dum‑E MCP server and agent so they can run in different processes or machines while sharing the same contract.
 

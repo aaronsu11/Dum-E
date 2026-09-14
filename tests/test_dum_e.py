@@ -1,20 +1,4 @@
-"""
-Comprehensive tests for Dum-E main application (dum_e.py).
-
-This file consolidates all tests for the main application components including:
-- Configuration resolution and priority handling
-- Process spawning (MCP server, Pipecat server, agent worker)
-- Environment variable injection and inheritance
-- End-to-end integration testing with shared memory backends
-- Error handling and edge cases
-
-Test Design Philosophy:
-- Unit tests for individual functions with mocked dependencies
-- Integration tests for multi-component workflows
-- Environment isolation to prevent test interference
-- Comprehensive coverage of configuration priority (args > config > env)
-- Hardware-independent testing using mocks and shared memory
-"""
+'Comprehensive tests for Dum-E main application (dum_e.py).'
 
 import argparse
 import asyncio
@@ -241,7 +225,7 @@ class TestSpawnPipecatServer:
     @mock.patch("subprocess.Popen")
     def test_spawn_pipecat_server_shell_env_overrides_config(self, mock_popen):
         """UAT gap (test 2): an inherited DUME_VOICE_* shell env var must win over
-        the my-dum-e.yaml config default. The README D-06 smoke-test gate tells
+        the my-dum-e.yaml config default. The README smoke-test gate tells
         operators to run `DUME_VOICE_LANGUAGE=zh python dum_e.py ...`; the launcher
         previously overwrote that with the yaml default ('en'), so the zh preset was
         never selected. Env-wins precedence is required for all three voice vars."""
@@ -529,6 +513,252 @@ class TestSpawnAgentWorker:
             dum_e._spawn_agent_worker(config, agent_args)
 
     @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_forwards_policy_backend_from_config(self, mock_popen):
+        'controller.policy_backend is forwarded as DUME_POLICY_BACKEND.'
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        controller_config = {"policy_backend": "groot-native"}
+
+        # clear=True guarantees no inherited DUME_POLICY_BACKEND leaks in from
+        # the runner env and masks a missing forward.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config=controller_config
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_POLICY_BACKEND"] == "groot-native"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_policy_backend_default_when_unset(self, mock_popen):
+        'With no controller config key, the shipped default is applied.'
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(config, agent_args)  # no controller_config
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_POLICY_BACKEND"] == "groot-native"
+
+        # Same when the controller block exists but omits the key.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"robot_id": "arm"}
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_POLICY_BACKEND"] == "groot-native"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_shell_env_policy_backend_overrides_config(
+        self, mock_popen
+    ):
+        'An exported DUME_POLICY_BACKEND must WIN over the config file value.'
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        controller_config = {"policy_backend": "lerobot"}
+
+        with mock.patch.dict(
+            os.environ, {"DUME_POLICY_BACKEND": "groot-native"}, clear=True
+        ):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config=controller_config
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_POLICY_BACKEND"] == "groot-native"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_forwards_use_degrees_from_config(self, mock_popen):
+        'controller.use_degrees is forwarded as DUME_USE_DEGREES.'
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+
+        # clear=True guarantees no inherited DUME_USE_DEGREES leaks in.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"use_degrees": True}
+            )
+        assert mock_popen.call_args[1]["env"]["DUME_USE_DEGREES"] == "true"
+
+        # Absent from the config, the key is not forwarded at all: the default
+        # lives in the controller, so restating it here could only drift.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(config, agent_args, controller_config={})
+        assert "DUME_USE_DEGREES" not in mock_popen.call_args[1]["env"]
+
+        # And an exported shell value wins over the config file (env.setdefault).
+        with mock.patch.dict(os.environ, {"DUME_USE_DEGREES": "false"}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"use_degrees": True}
+            )
+        assert mock_popen.call_args[1]["env"]["DUME_USE_DEGREES"] == "false"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_use_degrees_string_false_coerces_to_false(
+        self, mock_popen
+    ):
+        'A YAML `false` spelling must become a real False, not a truthy string.'
+        from embodiment.so_arm10x.controller import resolve_use_degrees
+
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+
+        for config_value in (False, "false", "False"):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                dum_e._spawn_agent_worker(
+                    config, agent_args, controller_config={"use_degrees": config_value}
+                )
+            forwarded = mock_popen.call_args[1]["env"]["DUME_USE_DEGREES"]
+            assert forwarded == "false", (config_value, forwarded)
+
+            # The truthiness trap, stated plainly: the forwarded value IS truthy.
+            assert bool(forwarded) is True
+            # ...and the controller nonetheless resolves it to a real False.
+            with mock.patch.dict(
+                os.environ, {"DUME_USE_DEGREES": forwarded}, clear=True
+            ):
+                assert resolve_use_degrees(None) is False
+
+        # An unrecognised spelling raises rather than defaulting to True.
+        with mock.patch.dict(os.environ, {"DUME_USE_DEGREES": "maybe"}, clear=True):
+            with pytest.raises(ValueError):
+                resolve_use_degrees(None)
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_forwards_max_relative_target_from_config(
+        self, mock_popen
+    ):
+        'controller.max_relative_target is forwarded as a float string.'
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"max_relative_target": 160.0}
+            )
+        forwarded = mock_popen.call_args[1]["env"]["DUME_MAX_RELATIVE_TARGET"]
+        assert float(forwarded) == 160.0
+        assert isinstance(float(forwarded), float)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(config, agent_args, controller_config={})
+        assert "DUME_MAX_RELATIVE_TARGET" not in mock_popen.call_args[1]["env"]
+
+        with mock.patch.dict(
+            os.environ, {"DUME_MAX_RELATIVE_TARGET": "12.5"}, clear=True
+        ):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config={"max_relative_target": 160.0}
+            )
+        assert mock_popen.call_args[1]["env"]["DUME_MAX_RELATIVE_TARGET"] == "12.5"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_forwards_lerobot_handshake_keys_from_config(
+        self, mock_popen
+    ):
+        'The five D-11 handshake values reach the worker as DUME_LEROBOT_* vars.'
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        controller_config = {
+            "lerobot_policy_port": 8080,
+            "lerobot_policy_type": "groot",
+            "lerobot_checkpoint_path": "/checkpoints/model",
+            "lerobot_actions_per_chunk": 16,
+            "lerobot_policy_device": "cuda",
+        }
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config=controller_config
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_LEROBOT_POLICY_PORT"] == "8080"
+        assert env["DUME_LEROBOT_POLICY_TYPE"] == "groot"
+        assert env["DUME_LEROBOT_CHECKPOINT_PATH"] == "/checkpoints/model"
+        assert env["DUME_LEROBOT_ACTIONS_PER_CHUNK"] == "16"
+        assert env["DUME_LEROBOT_POLICY_DEVICE"] == "cuda"
+
+        # Env vars are strings; the backend int()-coerces both numeric ones, so
+        # the forwarded spellings have to parse back.
+        assert int(env["DUME_LEROBOT_POLICY_PORT"]) == 8080
+        assert int(env["DUME_LEROBOT_ACTIONS_PER_CHUNK"]) == 16
+
+        # The LeRobot port is DISTINCT from the GR00T-native ZMQ port. Reusing one
+        # key for both backends is exactly the wrong-port trap the pair avoids.
+        assert "DUME_LEROBOT_POLICY_PORT" != "DUME_POLICY_PORT"
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_omits_lerobot_keys_the_config_does_not_name(
+        self, mock_popen
+    ):
+        'A key the config does not name is not forwarded at all.'
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        lerobot_vars = (
+            "DUME_LEROBOT_POLICY_PORT",
+            "DUME_LEROBOT_POLICY_TYPE",
+            "DUME_LEROBOT_CHECKPOINT_PATH",
+            "DUME_LEROBOT_ACTIONS_PER_CHUNK",
+            "DUME_LEROBOT_POLICY_DEVICE",
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(config, agent_args, controller_config={})
+        env = mock_popen.call_args[1]["env"]
+        for name in lerobot_vars:
+            assert name not in env, name
+
+        # Naming ONE key forwards only that key.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            dum_e._spawn_agent_worker(
+                config,
+                agent_args,
+                controller_config={"lerobot_actions_per_chunk": 16},
+            )
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_LEROBOT_ACTIONS_PER_CHUNK"] == "16"
+        for name in lerobot_vars:
+            if name != "DUME_LEROBOT_ACTIONS_PER_CHUNK":
+                assert name not in env, name
+
+    @mock.patch("subprocess.Popen")
+    def test_spawn_agent_worker_shell_env_lerobot_keys_override_config(
+        self, mock_popen
+    ):
+        'An exported DUME_LEROBOT_* value must WIN over the config file.'
+        config = BackendConfig(namespace="test")
+        agent_args = {"use_mock": True, "id": "mock_robot"}
+        controller_config = {
+            "lerobot_actions_per_chunk": 16,
+            "lerobot_policy_port": 8080,
+            # NOT exported below, so this key proves the test is non-vacuous: with
+            # no forwarding at all, an exported value survives trivially, and only
+            # a config-sourced value can distinguish setdefault from no-op.
+            "lerobot_policy_device": "cuda",
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DUME_LEROBOT_ACTIONS_PER_CHUNK": "40",
+                "DUME_LEROBOT_POLICY_PORT": "9099",
+            },
+            clear=True,
+        ):
+            dum_e._spawn_agent_worker(
+                config, agent_args, controller_config=controller_config
+            )
+
+        env = mock_popen.call_args[1]["env"]
+        assert env["DUME_LEROBOT_ACTIONS_PER_CHUNK"] == "40"
+        assert env["DUME_LEROBOT_POLICY_PORT"] == "9099"
+        # The un-exported key still comes from the config file.
+        assert env["DUME_LEROBOT_POLICY_DEVICE"] == "cuda"
+
+    @mock.patch("subprocess.Popen")
     def test_spawn_agent_worker_env_inheritance(self, mock_popen):
         """Test that agent worker inherits current environment."""
         config = BackendConfig(namespace="test")
@@ -645,14 +875,7 @@ class TestEndToEndIntegration:
 
     @pytest.mark.asyncio
     async def test_dum_e_http_progress_integration(self, monkeypatch):
-        """End-to-end HTTP integration with FastMCP client and mock worker.
-
-        This test:
-        - Spawns MCP server (HTTP) and a mock agent worker using dum_e helpers
-        - Connects a FastMCP Client to the HTTP endpoint and calls execute_robot_instruction
-        - Captures progress events via client's progress_handler and validates streaming
-        - Terminates all processes cleanly after assertions
-        """
+        'End-to-end HTTP integration with FastMCP client and mock worker.'
 
         # Build minimal args namespace for config
         class Args:
@@ -748,6 +971,14 @@ class TestEndToEndIntegration:
                     await client.ping()
                     tools = await client.list_tools()
                     assert any(t.name == "execute_robot_instruction" for t in tools)
+                    # Worker imports/registration are independent of HTTP readiness.
+                    # Wait for the mock worker rather than dispatching to an unknown robot.
+                    async with asyncio.timeout(15):
+                        while True:
+                            registered = await client.call_tool("list_robots", {})
+                            if any(r["robot_id"] == "mock_robot" for r in registered.data.get("robots", [])):
+                                break
+                            await asyncio.sleep(0.05)
                     result = await client.call_tool(
                         "execute_robot_instruction",
                         {"instruction": "pick banana", "robot_id": "mock_robot"},

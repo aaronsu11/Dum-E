@@ -106,6 +106,7 @@ def _spawn_agent_worker(
     agent_args: Dict[str, Any],
     config_path: Optional[str] = None,
     extra_env: Optional[Dict[str, str]] = None,
+    controller_config: Optional[Dict[str, Any]] = None,
 ):
     env = os.environ.copy()
     env.update(
@@ -113,6 +114,54 @@ def _spawn_agent_worker(
             "DUME_NAMESPACE": config.namespace,
         }
     )
+
+    # Pass policy configuration via environment variables for the agent worker,
+    # which is the process that reaches policy.factory.make_policy_backend().
+    controller_cfg = controller_config or {}
+    policy_env_defaults = {
+        "DUME_POLICY_BACKEND": controller_cfg.get("policy_backend", "groot-native"),
+    }
+
+    if "async_inference" in controller_cfg:
+        policy_env_defaults["DUME_ASYNC_INFERENCE"] = "1" if controller_cfg["async_inference"] is True else "0"
+    if controller_cfg.get("async_latency_path"):
+        policy_env_defaults["DUME_ASYNC_LATENCY_PATH"] = str(controller_cfg["async_latency_path"])
+
+    if controller_cfg.get("async_trace_directory"):
+        policy_env_defaults["DUME_ASYNC_TRACE_DIRECTORY"] = str(controller_cfg["async_trace_directory"])
+
+    # The joint-value convention and the per-step motion clamp are forwarded
+    # only when the config actually names them, so their
+    if "use_degrees" in controller_cfg:
+        policy_env_defaults["DUME_USE_DEGREES"] = str(
+            controller_cfg["use_degrees"]
+        ).lower()
+    if "max_relative_target" in controller_cfg:
+        policy_env_defaults["DUME_MAX_RELATIVE_TARGET"] = str(
+            controller_cfg["max_relative_target"]
+        )
+
+    # The five LeRobot handshake values (D-11), forwarded on exactly the same
+    # terms: only when the config names the key, so every default lives solely in
+    # policy/backends/lerobot/backend.py and cannot drift between the launcher and the
+    # process that owns inference. The backend int()-coerces the two numeric ones,
+    # so str() here is the whole stringification contract.
+    for config_key, env_key in (
+        ("lerobot_policy_port", "DUME_LEROBOT_POLICY_PORT"),
+        ("galaxea_policy_port", "DUME_GALAXEA_POLICY_PORT"),
+        ("lerobot_policy_type", "DUME_LEROBOT_POLICY_TYPE"),
+        ("lerobot_checkpoint_path", "DUME_LEROBOT_CHECKPOINT_PATH"),
+        ("lerobot_actions_per_chunk", "DUME_LEROBOT_ACTIONS_PER_CHUNK"),
+        ("lerobot_policy_device", "DUME_LEROBOT_POLICY_DEVICE"),
+    ):
+        if config_key in controller_cfg:
+            policy_env_defaults[env_key] = str(controller_cfg[config_key])
+
+    for env_key, config_value in policy_env_defaults.items():
+        # setdefault: only apply the config/default value when the operator has
+        # not already exported the variable in the shell environment.
+        env.setdefault(env_key, config_value)
+
     if extra_env:
         env.update(extra_env)
 
@@ -158,11 +207,35 @@ def _spawn_agent_worker(
                 ]
             )
 
+    policy_backend_display = env.get("DUME_POLICY_BACKEND", "groot-native")
+    # "controller default" rather than a restated literal: the authoritative
+    # effective value is logged by the controller itself at construction, and
+    # duplicating the default here is how the two drift apart.
+    use_degrees_display = env.get("DUME_USE_DEGREES", "controller default")
+    clamp_display = env.get("DUME_MAX_RELATIVE_TARGET", "controller default")
     logger.info(
-        "Starting agent worker with namespace={} and args={}",
+        "Starting agent worker with namespace={} policy_backend={} "
+        "use_degrees={} max_relative_target={} and args={}",
         config.namespace,
+        policy_backend_display,
+        use_degrees_display,
+        clamp_display,
         agent_args,
     )
+    if policy_backend_display == "lerobot":
+        # D-11: actions_per_chunk must be readable from a log line without
+        # reading code, because 40 is the well-lit wrong value. "backend default"
+        # rather than a restated literal — the authoritative effective value is
+        # logged by the backend itself at construction.
+        logger.info(
+            "LeRobot handshake (effective) port={} policy_type={} "
+            "checkpoint_path={} actions_per_chunk={} device={}",
+            env.get("DUME_LEROBOT_POLICY_PORT", "backend default"),
+            env.get("DUME_LEROBOT_POLICY_TYPE", "backend default"),
+            env.get("DUME_LEROBOT_CHECKPOINT_PATH", "backend default"),
+            env.get("DUME_LEROBOT_ACTIONS_PER_CHUNK", "backend default"),
+            env.get("DUME_LEROBOT_POLICY_DEVICE", "backend default"),
+        )
     return subprocess.Popen(cmd, env=env)
 
 
@@ -297,6 +370,7 @@ def main():
                     agent_args,
                     config_path=args.config,
                     extra_env=env_common,
+                    controller_config=ctrl_cfg,
                 )
                 procs.append(agent_proc)
 

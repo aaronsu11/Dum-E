@@ -1,11 +1,5 @@
 # Dum-E configuration file (YAML)
 #
-# Copy this file to your own config (e.g. my-dum-e.yaml) and edit values.
-# CLI flags override values in this file when provided.
-#
-# Two common scenarios are shown below:
-# 1) Mock agent (no hardware required) -> set agent.use_mock: true
-# 2) Real robot (hardware required)     -> set agent.use_mock: false and fill controller fields
 
 voice:
   # Voice processing mode
@@ -52,7 +46,60 @@ controller:
   front_cam_idx: 1 # the OpenCV index of the front camera
   show_images: false # show camera images for debugging (may slow down the robot)
 
+  # Joint-value convention fed to the policy and used for this module's
+  # hardcoded poses. Forwarded to the agent worker as DUME_USE_DEGREES; an
+  use_degrees: true
+
+  # Per-step motion clamp, in the same units as the joint values above.
+  # Any commanded per-joint delta larger than this is clipped toward the present
+  max_relative_target: 160.0
+
   # Policy server settings
   policy_host: "localhost" # the host IP of the policy server
   policy_port: 5555 # the port of the policy server
-  action_horizon: 8 # the number of action steps to generate each time
+  # Number of action steps to execute from each predicted chunk. Pinned to 16,
+  # the checkpoint's real action horizon (the legacy value of 8 truncated the
+  # learned chunk, and the checkpoint's own config.json advertises 40, which is
+  # a trap). Read by this module's offline eval entrypoint.
+  action_horizon: 16
+
+  # ---- LeRobot policy backend handshake (only read when policy_backend is
+  # ---- "lerobot"). Each key is forwarded to the agent worker as the named
+
+  # The gRPC port of the lerobot-policy container. Forwarded as
+  # DUME_LEROBOT_POLICY_PORT. Allowed values: any TCP port (int).
+  lerobot_policy_port: 8080
+  # Galaxea native WebSocket transport. Requires backend=galaxea and async mode off.
+  # Physical use additionally requires the model-specific calibration/camera checks.
+  galaxea_policy_port: 8765
+
+  # Which lerobot policy class the server loads. Forwarded as
+  # DUME_LEROBOT_POLICY_TYPE. The value must be a member of lerobot's own
+  # SUPPORTED_POLICIES; "groot" is the one this checkpoint needs.
+  lerobot_policy_type: "groot"
+
+  # The checkpoint path, as seen INSIDE the container. Forwarded as
+  # DUME_LEROBOT_CHECKPOINT_PATH. Allowed values: any absolute in-container path.
+  lerobot_checkpoint_path: "/checkpoints/model"
+
+  # How many action steps the server returns per chunk. Forwarded as
+  # DUME_LEROBOT_ACTIONS_PER_CHUNK. Allowed values: a positive int.
+  lerobot_actions_per_chunk: 16
+
+  # The device the SERVER puts the policy on. Forwarded as
+  # DUME_LEROBOT_POLICY_DEVICE. Allowed values: "cuda", "cuda:N", "cpu".
+  lerobot_policy_device: "cuda"
+
+  # NOT config keys, deliberately:
+  #   * lerobot_features -- DERIVED, never configured. Upstream's
+
+  # Which inference backend serves the policy. Forwarded to the agent worker as
+  # DUME_POLICY_BACKEND; an exported shell value wins over this file.
+  policy_backend: "groot-native"
+
+  # Opt-in until Phase 8 physical/voice verification. Requires backend lerobot.
+  async_inference: false
+  # A measured request-latency artifact; no guessed timeout default.
+  # async_latency_path: "outputs/gr00t-latency-01/latency.json"
+  # Optional per-action measured state/command traces for physical verification.
+  # async_trace_directory: "outputs/physical-traces"

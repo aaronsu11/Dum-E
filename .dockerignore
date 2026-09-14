@@ -1,0 +1,10 @@
+# Only application source and build recipes enter the Docker context.
+*
+!docker/
+!docker/**
+!policy/
+!policy/**
+!scripts/
+!scripts/serve_observed_lerobot.py
+**/__pycache__/
+**/*.pyc

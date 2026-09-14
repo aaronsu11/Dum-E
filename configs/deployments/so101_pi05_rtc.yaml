@@ -1,0 +1,6 @@
+embodiment: so_arm10x
+backend: lerobot
+policy: pi05
+checkpoint: pi05-so101
+transport: http
+execution: rtc

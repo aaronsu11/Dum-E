@@ -1,14 +1,6 @@
-"""
-Standardized run-time and logging configuration for Dum-E.
+'Standardized run-time and logging configuration for Dum-E.'
 
-This module provides:
-- Clean, structured logging without verbose output using loguru
-- Custom callback handler that filters out binary data and signatures
-- Configurable log levels and formatters
-- Integration with voice assistant for clean terminal output
-- Config file loading utilities
-"""
-
+import inspect
 import json
 import logging
 import sys
@@ -42,42 +34,17 @@ class CleanFormatter(logging.Formatter):
 
 
 class RobotCallbackHandler:
-    """
-    Clean callback handler for robot agent that filters out verbose content.
-
-    This handler follows the same pattern as PrintingCallbackHandler but provides:
-    - Filters out binary data (images, signatures)
-    - Structured, readable output with emojis
-    - Integrates cleanly with voice assistant
-    - Focuses on task progress and completion
-    """
+    'Clean callback handler for robot agent that filters out verbose content.'
 
     def __init__(self, log_level: str = "INFO", show_thinking: bool = False):
-        """
-        Initialize the clean callback handler.
-
-        Args:
-            log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-            show_thinking: Whether to show reasoning content (default: False)
-        """
+        'Initialize the clean callback handler.'
         self.log_level = log_level.upper()
         self.show_thinking = show_thinking
         self.tool_count = 0
         self.previous_tool_use = None
 
     def __call__(self, **kwargs: Any) -> None:
-        """
-        Main callback method that processes strands agent events.
-
-        This follows the same signature as PrintingCallbackHandler but with clean filtering.
-
-        Args:
-            **kwargs: Callback event data including:
-            - reasoningText (Optional[str]): Reasoning text (filtered unless show_thinking=True)
-            - data (str): Text content to display
-            - complete (bool): Whether this is the final chunk of a response
-            - current_tool_use (dict): Information about the current tool being used
-        """
+        'Main callback method that processes strands agent events.'
         reasoning_text = kwargs.get("reasoningText", "")
         data = kwargs.get("data", "")
         complete = kwargs.get("complete", False)
@@ -157,21 +124,53 @@ class RobotCallbackHandler:
         return False
 
 
+class InterceptHandler(logging.Handler):
+    'Forward stdlib ``logging`` records into loguru.'
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Map the stdlib level onto loguru's, falling back to the numeric level
+        # for custom levels loguru does not know by name.
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        # Walk out of the logging machinery so loguru reports the ORIGINATING
+        # frame rather than this handler or a `logging/__init__.py` internal.
+        frame, depth = inspect.currentframe(), 0
+        while frame is not None and (
+            depth == 0 or frame.f_code.co_filename == logging.__file__
+        ):
+            frame = frame.f_back
+            depth += 1
+
+        logger.opt(depth=depth, exception=record.exc_info).log(
+            level, record.getMessage()
+        )
+
+
+def install_stdlib_to_loguru_bridge() -> bool:
+    'Install :class:`InterceptHandler` on the stdlib ROOT logger, idempotently.'
+    root = logging.getLogger()
+    if any(isinstance(handler, InterceptHandler) for handler in root.handlers):
+        return False
+
+    root.addHandler(InterceptHandler())
+    # Root defaults to WARNING, which is already low enough for the clamp
+    # warning. Only raise the floor when root was left at NOTSET or higher than
+    # WARNING, which would drop the very record this bridge exists to carry.
+    if root.level == logging.NOTSET or root.level > logging.WARNING:
+        root.setLevel(logging.WARNING)
+    return True
+
+
 _logging_configured = False
 
 
 def setup_robot_logging(
     log_level: str = "INFO", include_timestamps: bool = True
 ) -> None:
-    """
-    Setup standardized logging for the robot system using loguru.
-
-    If loguru already has handlers (e.g., from pipecat), skip custom setup.
-
-    Args:
-        log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        include_timestamps: Whether to include timestamps in console output
-    """
+    'Setup standardized logging for the robot system using loguru.'
     global _logging_configured
 
     # Only configure once to avoid duplicate handlers
@@ -195,6 +194,12 @@ def setup_robot_logging(
         logger.add(
             sys.stdout, format=format_string, level=log_level.upper(), colorize=True
         )
+
+    # Bridge stdlib logging into loguru BEFORE the per-library level tuning
+    # below. The named loggers below are noise suppression; this is the opposite
+    # concern — the ROOT logger, which nothing here touches and which is where
+    # LeRobot's motion-clamp warning lands.
+    install_stdlib_to_loguru_bridge()
 
     # Suppress verbose logs from external libraries (always do this)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -223,15 +228,7 @@ def setup_logging(log_level: str = "INFO", include_timestamps: bool = True) -> N
 
 
 def create_clean_callback_handler(show_thinking: bool = False) -> RobotCallbackHandler:
-    """
-    Create a clean callback handler for robot agents.
-
-    Args:
-        show_thinking: Whether to show model reasoning (default: False for clean output)
-
-    Returns:
-        Configured callback handler
-    """
+    'Create a clean callback handler for robot agents.'
     return RobotCallbackHandler(show_thinking=show_thinking)
 
 

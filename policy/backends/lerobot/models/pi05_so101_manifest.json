@@ -1,0 +1,26 @@
+{
+  "config.json": {
+    "sha256": "35a40737c29d5b757d8d8fd2fa6873731a677fc5e5eb2161d2a17d4b6835f07b",
+    "size": 2398
+  },
+  "model.safetensors": {
+    "sha256": "7f8056e0cebbd8767a93c0f51bf5e20751baad455cf4b9965c07efca2df0fdef",
+    "size": 16573760064
+  },
+  "policy_postprocessor.json": {
+    "sha256": "70cea566affc4277cf3f2223427cf4b337574571f0bf2f32c1138c07370115dc",
+    "size": 777
+  },
+  "policy_postprocessor_step_0_unnormalizer_processor.safetensors": {
+    "sha256": "fca5ea3ee588bd54dda530744e2818ec6f727237d866c6dde057f40866e0fa12",
+    "size": 7640
+  },
+  "policy_preprocessor.json": {
+    "sha256": "2681c4d567c3d9d05a8d75585bdb29f88376b8bac1899ff6cb1b8ce2a4b2b9fa",
+    "size": 1934
+  },
+  "policy_preprocessor_step_3_normalizer_processor.safetensors": {
+    "sha256": "2d91485adb4e1b4097a97eb002e23e7ce095c1aa52d6766488a12e98e1b13f11",
+    "size": 7648
+  }
+}

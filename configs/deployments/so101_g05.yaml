@@ -1,0 +1,6 @@
+embodiment: so_arm10x
+backend: galaxea
+policy: g05
+checkpoint: g05-so101
+transport: native
+execution: sync

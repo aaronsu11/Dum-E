@@ -36,7 +36,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import the project client wrapper.
-from embodiment.so_arm10x.controller import Gr00tRobotInferenceClient  # noqa: E402
+from policy.backends.isaac_groot.client import Gr00tRobotInferenceClient  # noqa: E402
 
 ROBOT_STATE_KEYS = [
     "shoulder_pan.pos",

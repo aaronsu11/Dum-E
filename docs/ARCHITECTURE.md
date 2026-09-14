@@ -4,6 +4,42 @@ Dum-E composes an embodiment with a policy through `shared.IRobotController`, `s
 
 ## Ownership
 
+The arrows below show composition and runtime communication. The factory supplies the embodiment mapping to the client; runtime packages do not import the concrete embodiment.
+
+```mermaid
+flowchart TB
+    Config["Deployment configuration"] --> Factory["policy/factory.py<br/>Validate supported combination"]
+    Shared["shared/interfaces.py<br/>Controller, policy and mapping contracts"]
+
+    subgraph Local["Client machine"]
+        Entry["Agent / benchmark / attended trial"]
+        Mapping["embodiment/so_arm10x/mappings<br/>Coordinates and sensor bindings"]
+        Client["policy/backends<br/>LeRobot / Isaac GR00T / Galaxea client"]
+        Executor["Embodiment skill or trial executor"]
+        Queue["policy/execution<br/>Async or RTC queue when selected"]
+        Controller["Embodiment controller and safety<br/>Calibration, limits and stop behavior"]
+    end
+
+    Factory -->|"constructs and binds"| Client
+    Mapping -->|"injected mapping where required"| Client
+    Shared -.->|"IPolicyBackend"| Client
+    Shared -.->|"IPolicyMapping for HTTP"| Mapping
+    Shared -.->|"IRobotController"| Controller
+    Entry -->|"requests inference"| Client
+    Entry -->|"physical execution only"| Executor
+    Executor <-->|"optional scheduling"| Queue
+    Executor -->|"read state / send bounded targets"| Controller
+    Controller <-->|"device IO"| Hardware["Arm and cameras"]
+
+    subgraph Serving["Inference host: local GPU or EC2"]
+        Server["Runtime server<br/>HTTP / gRPC / ZMQ / WebSocket"]
+        Processor["Checkpoint processors and model"]
+        Server <--> Processor
+    end
+    Client <-->|"observations and action chunks<br/>loopback or tunnel"| Server
+    Docker["docker/runtime<br/>Dependency environment and packaging"] -.->|"packages"| Server
+```
+
 | Location | Owns | Must not own |
 |---|---|---|
 | `shared/interfaces.py`, `shared/types.py` | Public interfaces, task and fleet data | Concrete robot or model implementations |
@@ -25,6 +61,45 @@ LeRobot's `models/` contains the GR00T contract/loader, Pi0.5 loader and pinned 
 `HTTPPolicyBackend` receives an `IPolicyMapping`; it does not import SO101. The SO101 implementation checks calibration identity, converts centered degrees into checkpoint coordinates where required, and reverses the transform on returned chunks. MolmoAct2 and HTTP GR00T need no separate client subclass. Pi0.5 has an additional client for its explicit RTC prefix protocol. The Galaxea client receives its grouped observation/action mapping from the factory. Native GR00T and LeRobot gRPC retain their existing named-feature interfaces and normalized-state conventions.
 
 The current HTTP wire schema remains six state values and front/wrist RGB images. Injecting a mapping does **not** qualify arbitrary dimensions or another embodiment. A different schema must be explicit at both ends. Model normalization runs once in the saved processor; physical calibration and safety projection stay with the embodiment.
+
+## Observation-to-action interaction
+
+This sequence follows one synchronous HTTP chunk after preparation and approval. Galaxea uses its grouped native mapping, while native GR00T and LeRobot gRPC retain their named-feature conventions. A recorded benchmark substitutes a recording for controller observations and never dispatches targets.
+
+```mermaid
+sequenceDiagram
+    participant E as Embodiment executor
+    participant C as Controller and safety
+    participant P as HTTP policy client
+    participant B as Embodiment mapping
+    participant S as GPU runtime server
+
+    E->>C: Read current state and camera images
+    C-->>E: Named observation
+    E->>P: get_action(observation, instruction)
+    P->>B: Validate calibration identity and map state coordinates
+    B-->>P: Model-coordinate state
+    P->>S: Check health and pinned profile
+    S-->>P: Ready profile identity
+    P->>S: Infer from state, front/wrist RGB and instruction
+    S->>S: Preprocess and normalize using saved processors
+    S->>S: Generate complete action chunk on GPU
+    S->>S: Decode and unnormalize using saved processors
+    S-->>P: Model-coordinate targets, identity and timings
+    P->>P: Validate reply identity, shape and finite values
+    P->>B: Map targets to arm coordinates and recheck calibration
+    B-->>P: Arm-coordinate targets
+    P-->>E: Validated complete chunk
+    loop Each permitted execution tick
+        E->>C: Read feedback and check stop state
+        E->>E: Bound target using current feedback and limits
+        E->>C: set_target_state(bounded target)
+        C-->>E: Targets actually sent
+    end
+    Note over E,C: A failed safety or execution check stops further dispatch
+```
+
+Async execution overlaps inference with playback of previously queued targets. See [async and RTC interactions](ASYNC-INFERENCE.md#execution-interactions) for the two supported scheduling paths.
 
 ## Configuration
 
